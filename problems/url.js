@@ -1,0 +1,284 @@
+window.DATA = window.DATA || {};
+window.DATA['url'] = {
+  cat:"IDs · caching · reads",
+  title:"Design a URL shortener (TinyURL / bit.ly)",
+  blurb:"Shorten long URLs, redirect in <100ms, scale to billions of reads at ~100:1 read/write.",
+  prompt:"Let's design a URL shortener like bit.ly. It takes a long URL and returns a short one, redirects users who hit the short link, and must scale to billions of URLs with a very high read-to-write ratio. Start with the high-level architecture and rough numbers, then we'll drill into components — and I'll be throwing failure scenarios at you.",
+  opening:"Let me frame it before drawing boxes.<br><br><strong>Functional:</strong> create a short URL, redirect, optional custom alias + expiry, basic click analytics. <strong>Non-functional:</strong> redirect p99 < 100ms, ~100:1 read:write, high availability (a dead redirect breaks a link on someone else's site), and keys that are unique and not trivially guessable.<br><br><strong>Back-of-envelope:</strong> ~100M new URLs/day → ~1,160 writes/s, ~116K reads/s at 100:1, peak 3-5x. Storage: 100M/day x 365 x 5y ≈ 180B URLs; ~500 bytes each ≈ 90 TB — a sharded KV store, not one box.<br><br>I'll start deliberately minimal: <strong>client → load balancer → stateless shortener service → database</strong>. That's the skeleton that satisfies correctness. As we hit scale and failure pressure I'll grow it — caching, key generation, replicas, analytics. Pick a box and let's push on it.",
+  nodes:[
+    {id:"client",name:"Client",sub:"browser / app",x:40,y:150},
+    {id:"lb",name:"LB + gateway",sub:"edge",x:210,y:150},
+    {id:"svc",name:"Shortener svc",sub:"stateless",x:380,y:150},
+    {id:"db",name:"Database",sub:"KV store",x:550,y:150},
+    {id:"cache",name:"Cache",sub:"Redis",x:380,y:40},
+    {id:"key",name:"Key generation",sub:"unique IDs",x:380,y:260},
+    {id:"replica",name:"DB replicas",sub:"read + failover",x:550,y:40},
+    {id:"analytics",name:"Analytics",sub:"async clicks",x:550,y:260},
+  ],
+  edges:[["client","lb"],["lb","svc"],["svc","db"],["svc","cache"],["cache","db"],["svc","key"],["db","replica"],["svc","analytics"]],
+  core:["client","lb","svc","db"],
+  basic:["client","lb","svc","db"],
+  requirements:{
+    functional:[
+      "Create a short URL from a long one, with optional custom alias and expiry",
+      "Redirect a short link to its original long URL",
+      "Basic per-link click analytics (counts, geo, referrer)",
+    ],
+    nonFunctional:[
+      "Redirect p99 &lt; 100ms; read-heavy at ~100:1 read:write",
+      "High availability — a dead redirect breaks a link on someone else's site",
+      "Scale to billions of URLs (~180B mappings, ~90TB) with peak 3-5x spikes",
+      "Keys are unique and not trivially guessable",
+    ],
+  },
+  reqBuild:[
+    {req:"Create a short URL (adds key generation)",reveal:["key"],turns:[
+      {who:"intv",text:"Start with requirement one: a user sends <code>POST /shorten {url: https://example.com/very/long/path}</code> and wants a short link back. What's the minimal path?"},
+      {who:"cand",text:"The <strong>client</strong> hits the <strong>LB + gateway</strong>, which routes to the stateless <strong>shortener service</strong>. The service validates the URL, obtains a <strong>unique key</strong>, persists <code>key → {longURL, userId, createdAt, expiry}</code> in the <strong>database</strong>, and returns <code>https://sho.rt/aX9bQ</code>. The one piece that isn't trivial is minting that key without collisions across many instances, so let me add a <strong>key-generation</strong> component. Concretely I take a unique 64-bit integer and <strong>base62</strong>-encode it.<span class='eg'>1000000007 base62 ≈ \"15ftgG\" (6 chars); 62^7 ≈ 3.5 trillion keys</span>"},
+      {who:"intv",text:"Why break key generation into its own box instead of a simple auto-increment column on the DB?"},
+      {who:"cand",text:"A single auto-increment row becomes a lock-contention hotspot and a single point of failure — every create across every instance serializes on it. Isolating key-gen lets me hand each service instance a <em>block</em> of IDs to burn locally, or mint Snowflake-style IDs with no coordination at all. The real design work (avoiding a central bottleneck) deserves its own component, so I'll draw it now and drill into the allocation scheme later."},
+      {who:"intv",text:"Why base62 of an integer rather than a UUID or a hash of the long URL?"},
+      {who:"cand",text:"A UUID is 36 chars — far too long for a <em>short</em> URL, and its entropy is wasted here. Hashing the long URL invites collisions I'd have to detect and resolve, and it leaks nothing useful. Base62 of a compact integer is the sweet spot: short, URL-safe (no <code>+ / =</code> like base64), and collision-free by construction because the integer is already unique. That satisfies requirement one; next I'd make the redirect fast."},
+    ],resources:[
+      {title:"System Design Primer — generating unique IDs",url:"https://github.com/donnemartin/system-design-primer#use-good-indices"},
+      {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+    ]},
+    {req:"Redirect to the long URL fast",turns:[
+      {who:"intv",text:"Requirement two: someone clicks <code>sho.rt/aX9bQ</code>. Walk me through the redirect path with what you already have."},
+      {who:"cand",text:"A <code>GET /aX9bQ</code> goes through the <strong>LB + gateway</strong> to the <strong>shortener service</strong>, which looks up the key in the <strong>database</strong> and returns an HTTP redirect to the long URL. No new component — my four core boxes cover it. The important property is that the mapping is <strong>immutable</strong>: <code>key → longURL</code> never changes once created, which makes this path trivial to make fast later."},
+      {who:"intv",text:"Do you return a 301 or a 302, and does it matter?"},
+      {who:"cand",text:"It's a real lever. A <strong>301</strong> is cacheable by browsers and CDNs, so after the first hit most clicks never reach me — great for latency. A <strong>302</strong> forces every click back to my origin — worse for load but necessary if I want to <em>count</em> every click. So the choice is coupled to whether analytics matters for that link; I'd default to 302 when counting is the product and 301 when raw redirect speed wins."},
+      {who:"intv",text:"Reading the mapping straight from the DB on every redirect — does that hold up?"},
+      {who:"cand",text:"For <em>correctness</em> it's fine — the DB is the source of truth. For <em>load</em> it won't hold up at ~116K reads/s, but I'll deliberately defer that: right now I'm satisfying the functional requirement with the simplest correct design, and I'll add a cache and read replicas in the deep-dive phase. Both requirements are now met with just the core; time to harden it under load and failure."},
+    ],resources:[
+      {title:"MDN: 301 vs 302 redirects",url:"https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections"},
+      {title:"System Design Primer — application layer",url:"https://github.com/donnemartin/system-design-primer#application-layer"},
+    ]},
+  ],
+  systemDives:[
+    {title:"Reads are hammering the DB",tag:"scaling",reveal:["cache"],turns:[
+      {who:"intv",text:"<span class='scenario'><b>Scenario:</b> you launch with just the service + DB. At <b>116K</b> redirects/s the DB's p99 read latency climbs to 300ms and CPU pegs at 95%. Redirects are timing out. The DB can't take it. What's your move?</span>"},
+      {who:"cand",text:"Put a <strong>cache</strong> in front — Redis — and serve redirects from it. This is the highest-leverage change because the workload is read-dominated (100:1) and access is <em>heavily skewed</em>: a small set of links gets most clicks. A cache with a high hit ratio absorbs almost all reads, and the DB only sees misses plus writes. Let me add the cache.<span class='eg'>At a 95% hit ratio the DB read load drops from 116K/s to ~5.8K/s — comfortably within one shard</span>"},
+      {who:"intv",text:"Cache added. What's the read path now, and what happens on a miss?"},
+      {who:"cand",text:"Read-through: check cache; on hit, redirect immediately; on miss, read the DB, populate the cache, then redirect. Because mappings are <strong>immutable</strong>, cached entries never go stale — I use long TTLs and need no invalidation logic. Eviction is <strong>LRU</strong>, which matches the skewed access: hot links stay resident, cold links fall out. Writes warm the cache best-effort, but the DB is always the source of truth."},
+      {who:"intv",text:"Suppose that cache node restarts and comes back empty mid-day. Now what?"},
+      {who:"cand",text:"That's a <strong>cold-cache thundering herd</strong> — the DB instantly sees 100% of reads instead of ~5%. I contain it with <strong>request coalescing / single-flight</strong> so only one miss per key hits the DB while concurrent requests share the result, <strong>jittered TTLs</strong> so entries don't all expire together, and a <strong>replicated Redis cluster</strong> so a single node restart fails over to a replica that still holds the data rather than emptying the tier. Pre-warming the top-N hottest keys on cold start blunts recovery further."},
+    ],resources:[
+      {title:"System Design Primer — caching",url:"https://github.com/donnemartin/system-design-primer#cache"},
+      {title:"Redis: eviction policies",url:"https://redis.io/docs/latest/operate/oss_and_stack/management/config/"},
+    ]},
+    {title:"A DB shard dies — is data lost?",tag:"durability",reveal:["replica"],turns:[
+      {who:"intv",text:"<span class='scenario'><b>Scenario:</b> the single node holding shard 7 has a disk failure and won't come back. That shard held ~<b>22B</b> mappings. Are those links gone forever? Walk me through your durability story.</span>"},
+      {who:"cand",text:"If shard 7 were a single node, yes — catastrophic, and unacceptable for links that live on other people's sites. The fix is <strong>replication</strong>: every shard is a replica group of, say, 3 nodes across failure domains (AZs), with writes acknowledged by a <strong>quorum</strong> before I return success. Let me add DB replicas. A disk failure on one replica loses nothing — the other two hold the data and a fresh replica rebuilds from them."},
+      {who:"intv",text:"Quorum writes add latency to every create. And do you read from replicas too?"},
+      {who:"cand",text:"Create latency isn't on the hot path — reads are — so a quorum write of a few ms is fine, and durability here is non-negotiable. For reads, yes: replicas serve them too, which multiplies read capacity. Because mappings are <strong>immutable</strong>, reading a slightly-behind replica is safe — the only staleness is not-yet-knowing a brand-new key, which I handle by falling back to the primary or the cache on a miss. One mechanism buys me both durability and read scaling."},
+      {who:"intv",text:"The primary for that shard later crashes and you promote a replica. Two minutes on, the old primary rejoins still thinking it's primary. What happens?"},
+      {who:"cand",text:"That's <strong>split-brain</strong>, and for writes it means divergent data on the same key — corruption. Promotion must go through <strong>consensus / leader election</strong> (Raft/Paxos or a fencing coordinator) that grants a monotonically increasing <strong>epoch</strong>. The new primary writes under a higher epoch; when the stale old primary rejoins, replicas <strong>reject its writes via the fencing token</strong> and it demotes and re-syncs. There is never a window where two nodes hold the current epoch, so a mapping is never written by two authorities."},
+    ],resources:[
+      {title:"System Design Primer — replication",url:"https://github.com/donnemartin/system-design-primer#replication"},
+      {title:"Dynamo paper — replication & quorum",url:"https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"},
+    ]},
+    {title:"Track clicks without slowing redirects",tag:"scaling",reveal:["analytics"],turns:[
+      {who:"intv",text:"<span class='scenario'><b>Scenario:</b> product wants click counts, geo, and referrer per link, but you promised redirect p99 &lt; 100ms. A marketing blast then drives <b>500K</b> clicks/s for an hour. How do you count without slowing redirects or falling hours behind?</span>"},
+      {who:"cand",text:"Analytics goes <strong>off the critical path</strong>. On redirect I fire a click event to a <strong>message queue</strong> (Kafka) and return the redirect immediately — it never waits on an analytics write. Let me add an async analytics path. Kafka happily absorbs 500K/s and buffers the spike; stream consumers do <strong>windowed aggregation</strong> — per-key counts in 1-minute tumbling windows — and write <em>aggregates</em>, not raw rows, to an OLAP store. That's a huge reduction in write volume, and the dashboard reads pre-rolled counts."},
+      {who:"intv",text:"Does the 301-vs-302 choice affect your counts?"},
+      {who:"cand",text:"Hugely. A <strong>301</strong> is cached by browsers and CDNs, so after the first hit most clicks never reach me — I'd systematically undercount. A <strong>302</strong> forces every click back to me — accurate counts at higher load. If analytics is the product I default to 302 and lean on the cache/edge to absorb the extra origin traffic; where raw redirect speed matters more, 301. It's a per-link lever, not a global switch."},
+      {who:"intv",text:"The redirect path emits to Kafka. If Kafka is briefly unavailable, does that stall redirects?"},
+      {who:"cand",text:"It must not — analytics is best-effort. The producer is <strong>async, fire-and-forget with a bounded local buffer</strong>: if Kafka is slow or unreachable, events queue in-memory up to a cap and then I <em>drop</em> them (or spill to a local log) rather than block the redirect. Losing a slice of analytics during a blip is acceptable; adding latency to a billion redirects is not. The goal is approximate, timely counts — not exact ones."},
+    ],resources:[
+      {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+      {title:"System Design Primer — async & message queues",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
+    ]},
+    {title:"A viral link and a global audience",tag:"scaling",turns:[
+      {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a link in a tweet goes viral. Redirect traffic jumps from 116K/s to <b>1.2M/s</b> in under a minute, heavily skewed to that one key, and your users are global. What falls over first, and how do you keep p99 &lt; 100ms for a user in Sydney when your origin is in Virginia?</span>"},
+      {who:"cand",text:"First to feel it is the app fleet if redirects reach it, then the shard holding that key — but this is the <em>easy</em> kind of load: one immutable key read a million times. The defense is layered. The <strong>CDN / edge</strong> absorbs the vast majority since that key is now hot and cached with a long TTL, collapsing 1.2M/s into a handful of origin fetches. For Sydney I go <strong>multi-region with GeoDNS / anycast</strong> so users resolve to the nearest edge, and I replicate mappings to each region. Because mappings are immutable, replication lag is harmless for reads — Sydney serves locally and never round-trips to Virginia."},
+      {who:"intv",text:"Now the whole Virginia region goes dark — 40% of traffic was homed there. What do users see?"},
+      {who:"cand",text:"Without preparation, 40% of redirects time out — broken links across the web. To make it a non-event I rely on <strong>DNS health checks</strong>: the GeoDNS/anycast layer detects the region failing checks and stops resolving users to it, steering them to the next-nearest healthy region within the health-check interval. Because reads are served from <em>replicated, immutable</em> data everywhere, the surviving regions serve those redirects with no data loss — a capacity event, not a correctness one."},
+      {who:"intv",text:"That region was also your write primary. Creates are now failing. Acceptable?"},
+      {who:"cand",text:"More acceptable than broken redirects, but I'd avoid it by making writes <strong>region-independent</strong> from the start — each region mints globally-unique keys locally (Snowflake-style or per-region ID ranges), so any surviving region accepts creates with zero coordination. That turns a region loss into a pure capacity event rather than a write outage. The cost is slightly longer keys, which I'll happily trade for multi-region write availability."},
+    ],resources:[
+      {title:"Cloudflare: how anycast works",url:"https://www.cloudflare.com/learning/cdn/glossary/anycast-network/"},
+      {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
+    ]},
+  ],
+  q:{
+    lb:[
+      {l:"medium",tag:"concept",q:"LB vs gateway — what really lives at the edge?",turns:[
+        {who:"intv",text:"You drew 'LB + gateway' as one box. A <code>POST /shorten</code> and a <code>GET /aX9bQ</code> both arrive here — walk me through what happens to each, and be precise about LB vs gateway."},
+        {who:"cand",text:"The <strong>load balancer</strong> is L4/L7 distribution across healthy instances with health-check ejection. The <strong>gateway</strong> owns cross-cutting concerns: TLS, auth/API keys, validation, and <strong>rate limiting</strong>.<br><br><code>POST /shorten</code> is authenticated + rate-limited (creation is expensive, abuse-prone) then routed to the create path. <code>GET /aX9bQ</code> is anonymous and cache-friendly — I want it as cheap as possible, ideally answered before it even reaches an app server."},
+        {who:"intv",text:"Why so eager to keep redirects off the app fleet?"},
+        {who:"cand",text:"At 116K reads/s sustained I'd be paying a full request lifecycle — TLS, auth middleware, a lookup RPC — for what is a lookup of an <em>immutable</em> mapping. Since <code>key → longURL</code> never changes, it's ideal to cache at the <strong>CDN/edge</strong> with a long TTL and only fall through to the service on a miss. That decouples the hottest path from my origin's health."},
+      ],resources:[
+        {title:"System Design Primer — CDN & load balancing",url:"https://github.com/donnemartin/system-design-primer#content-delivery-network"},
+        {title:"Cloudflare: how anycast works",url:"https://www.cloudflare.com/learning/cdn/glossary/anycast-network/"},
+      ]},
+      {l:"hard",tag:"scaling",q:"Traffic spikes 10x from a viral link — does the edge hold?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a link in a tweet goes viral. Redirect traffic jumps from 116K/s to <b>1.2M/s</b> in under a minute, heavily skewed to that one key. Your LB tier and app fleet were sized for normal load. What falls over first, and what do you do?</span>"},
+        {who:"cand",text:"First to feel it is the <strong>app fleet</strong> if redirects reach it, then the DB shard holding that key. But this traffic is the <em>easy</em> kind — it's one immutable key read a million times. My defense is layered: <strong>(1)</strong> the CDN/edge absorbs the vast majority since that key is now hot and cached with a long TTL — 1.2M/s for one key collapses to a handful of origin fetches. <strong>(2)</strong> the app fleet autoscales on request rate, but honestly shouldn't need to if the edge is doing its job. <strong>(3)</strong> the LB is horizontally redundant and connection-based, so it scales by adding nodes."},
+        {who:"intv",text:"The CDN is regional and your users are global. How do you keep p99 < 100ms in Sydney when your origin is in Virginia?"},
+        {who:"cand",text:"Multi-region with <strong>GeoDNS/anycast</strong> so users resolve to the nearest edge, and replicate the mapping to each region. Because mappings are immutable, replication lag is harmless for reads — a region only ever lags in learning about a <em>brand-new</em> key, which resolves in seconds. So Sydney serves from a Sydney edge/replica; it never round-trips to Virginia for a redirect. Writes are the only asymmetry and I handle those separately with region-independent key generation."},
+      ],resources:[
+        {title:"System Design Primer — scaling & CDNs",url:"https://github.com/donnemartin/system-design-primer#content-delivery-network"},
+        {title:"Cache stampede — patterns & mitigations",url:"https://en.wikipedia.org/wiki/Cache_stampede"},
+      ]},
+      {l:"hard",tag:"failover",q:"An entire region goes dark — what do users see?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> your primary region (us-east-1) has a full network partition — the LB, app fleet, and DB there are all unreachable. 40% of your global redirect traffic was homed there. What do users experience in the first 30 seconds, and how do you make it a non-event?</span>"},
+        {who:"cand",text:"Without preparation: 40% of redirects time out — broken links across the web, the worst outcome for us. To make it a non-event I rely on <strong>DNS health checks</strong>: the GeoDNS/anycast layer detects us-east-1 is failing checks and stops resolving users to it, steering them to the next-nearest healthy region within the health-check interval (tunable to ~10-30s). Because reads are served from <em>replicated, immutable</em> data in every region, the other regions can serve those redirects with no data loss."},
+        {who:"intv",text:"Reads are covered. But us-east-1 was your write primary. Creates are now failing. Acceptable?"},
+        {who:"cand",text:"More acceptable than broken redirects, but I'd still avoid it. Two options: <strong>(a)</strong> promote a secondary region to write-primary (needs a controlled failover of the write path), or better <strong>(b)</strong> design writes to be <em>region-independent</em> from the start — each region mints globally-unique keys locally (Snowflake-style or per-region ID ranges), so any surviving region can accept creates with zero coordination. I'd pick (b): it turns a region loss into a pure capacity event, not a correctness event. The cost is slightly longer keys, which I'll trade for multi-region write availability."},
+      ],resources:[
+        {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
+        {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+      ]},
+    ],
+    svc:[
+      {l:"easy",tag:"concept",q:"Walk me through a create request end to end.",turns:[
+        {who:"intv",text:"Take me through exactly what the service does on <code>POST /shorten {url: https://example.com/very/long/path}</code>. Every step."},
+        {who:"cand",text:"<ul><li><strong>Validate</strong> — well-formed, http/https, length bound.</li><li><strong>Get a unique key</strong> from key-gen, say <code>aX9bQ</code>.</li><li><strong>Persist</strong> <code>aX9bQ → {longURL, userId, createdAt, expiry}</code> to the KV store.</li><li><strong>Warm the cache</strong> (best-effort).</li><li><strong>Return</strong> <code>https://sho.rt/aX9bQ</code>.</li></ul>The handler is thin and <strong>stateless</strong> — all durable state is in the DB, so any instance serves any request."},
+        {who:"intv",text:"You persist and <em>then</em> warm the cache. Crash in between — problem?"},
+        {who:"cand",text:"No, and the ordering is deliberate: <strong>DB first, cache best-effort</strong>. A crash after commit just means the first redirect is a cache miss that reads the DB and populates it (read-through). The dangerous ordering is the reverse — cache-first — where a crash leaves a link that resolves until the entry evicts and then vanishes. DB is always source of truth."},
+      ],resources:[{title:"System Design Primer — application layer",url:"https://github.com/donnemartin/system-design-primer#application-layer"}]},
+      {l:"easy",tag:"concept",q:"How is the short key generated? (adds key-gen)",reveal:["key"],turns:[
+        {who:"intv",text:"The core trick is the key. Given a unique 64-bit integer <code>1000000007</code>, how do you get <code>aX9bQ</code>, and how long is it?"},
+        {who:"cand",text:"<strong>Base62-encode</strong> it — <code>0-9 a-z A-Z</code>.<span class='eg'>1000000007 → base62 ≈ \"15ftgG\" (6 chars). 62^7 ≈ 3.5 trillion.</span>~7 base62 chars covers hundreds of billions of URLs, stays short and URL-safe (no <code>+ / =</code> like base64). Let me add a <strong>key-generation</strong> component — the real work is minting the unique integer without a bottleneck, which deserves its own box."},
+        {who:"intv",text:"Fair — we'll drill into key-gen separately. Quick: why not a UUID?"},
+        {who:"cand",text:"A UUID is 36 chars — far too long for a 'short' URL, and its entropy is wasted here. Base62 of a compact integer is the sweet spot: short, clean, URL-safe."},
+      ],resources:[{title:"System Design Primer — generating unique IDs",url:"https://github.com/donnemartin/system-design-primer#use-good-indices"}]},
+      {l:"medium",tag:"scaling",q:"Reads are hammering the DB — fix it (adds cache).",reveal:["cache"],turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> you launch with just service + DB. At 116K redirects/s, your DB's p99 read latency climbs to 300ms and CPU pegs at 95%. Redirects are timing out. The DB can't take it. What's your move?</span>"},
+        {who:"cand",text:"Put a <strong>cache</strong> in front — Redis — and serve redirects from it. This is the highest-leverage change because the workload is read-dominated (100:1) and access is <em>heavily skewed</em>: a small set of links gets most clicks. So a cache with a high hit ratio absorbs almost all reads, and the DB only sees misses + writes. Let me add the cache to the design.<span class='eg'>If 95% of reads hit cache, the DB read load drops from 116K/s to ~5.8K/s — well within a single shard's comfort zone.</span>"},
+        {who:"intv",text:"Cache added. What's the read path now, and what happens on a miss?"},
+        {who:"cand",text:"Read-through: check cache; on hit, redirect immediately; on miss, read DB, populate cache, then redirect. Since mappings are <strong>immutable</strong>, cached entries never go stale — long TTLs, no invalidation logic. Eviction is <strong>LRU</strong>, which matches the skewed access: hot links stay resident, cold links fall out. We should dig into what happens when the cache itself fails — that's where it gets interesting."},
+      ],resources:[
+        {title:"System Design Primer — caching",url:"https://github.com/donnemartin/system-design-primer#cache"},
+        {title:"Redis: eviction policies",url:"https://redis.io/docs/latest/operate/oss_and_stack/management/config/"},
+      ]},
+      {l:"medium",tag:"failover",q:"A service instance dies mid-request — any data loss?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a deploy is rolling and one service pod gets SIGKILLed while it's handling 200 in-flight create requests. What happens to those 200 users?</span>"},
+        {who:"cand",text:"Two buckets. Requests that had <strong>already committed to the DB</strong> before the kill are safe — the mapping is durable even if the pod never returned the response; the client sees a dropped connection and retries, and the link exists. Requests killed <em>before</em> commit simply didn't happen — the client retries and gets a fresh key. Because the service is <strong>stateless</strong> and creates are effectively idempotent-on-retry, a pod death is a client retry, not data loss."},
+        {who:"intv",text:"On retry the client might get a <em>different</em> key than a create that actually did commit — so one long URL now has two short keys. Bug?"},
+        {who:"cand",text:"Not a correctness bug — both keys resolve to the same URL, which is harmless (I don't dedupe by default anyway). It's mild key-space waste, negligible against 3.5 trillion. If a client needs exactly-once creation, it sends a <strong>client-generated idempotency key</strong>; the service dedupes on it so a retry returns the same short key. I'd offer that on the API but not force it — for a shortener the duplicate-key cost isn't worth making every write do an extra idempotency lookup."},
+      ],resources:[{title:"Idempotency keys (Stripe pattern)",url:"https://stripe.com/blog/idempotency"}]},
+      {l:"medium",tag:"concept",q:"Track clicks without slowing redirects (adds analytics).",reveal:["analytics"],turns:[
+        {who:"intv",text:"Product wants click counts, geo, and referrer per link — but you promised p99 < 100ms on redirects. Reconcile that."},
+        {who:"cand",text:"Analytics goes <strong>off the critical path</strong>. On redirect I fire a click event to a <strong>message queue</strong> (Kafka) and return the 301/302 immediately — the redirect never waits on the analytics write. Let me add an async analytics path. Consumers aggregate events into an OLAP store; the dashboard reads pre-rolled counts, never raw events."},
+        {who:"intv",text:"301 vs 302 for the redirect — does it matter for analytics?"},
+        {who:"cand",text:"Hugely. <strong>301</strong> is cacheable by browsers/CDNs, so after the first hit most clicks never reach me — great for latency, terrible for counting. <strong>302</strong> forces every click back to me — accurate counts, higher load. If analytics is the product I default to <strong>302</strong> (I've built the read path to absorb it); where raw redirect speed matters more I use 301. It's a per-link lever, not a fixed choice."},
+      ],resources:[
+        {title:"MDN: 301 vs 302 redirects",url:"https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections"},
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+      ]},
+    ],
+    db:[
+      {l:"medium",tag:"concept",q:"SQL or NoSQL, schema, and how do you shard?",turns:[
+        {who:"intv",text:"Pick your datastore and defend it, then give me the schema and how you shard 180B rows."},
+        {who:"cand",text:"<strong>Key-value / wide-column NoSQL</strong> — DynamoDB or Cassandra. The access pattern is a point lookup by primary key, no joins, needing huge horizontal write throughput and storage. Schema: <code>key (PK) → {longURL, userId, createdAt, expiry}</code>. Shard by <strong>hash of the key</strong> so a lookup goes straight to one shard and writes spread uniformly."},
+        {who:"intv",text:"Why hash-shard, not range-shard? Name the failure you're avoiding."},
+        {who:"cand",text:"Range-sharding on a monotonic counter-derived key sends <em>all new writes to the last shard</em> — a write hotspot while other shards idle.<span class='eg'>Range: keys 0-1B on shard1, 1B-2B on shard2 → every create hits the newest shard.</span>Hash-sharding spreads consecutive keys across all shards. I lose efficient range scans, but I only ever point-look-up short keys, so that costs nothing."},
+      ],resources:[
+        {title:"Amazon Dynamo paper",url:"https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"},
+        {title:"Consistent hashing explained",url:"https://www.toptal.com/big-data/consistent-hashing"},
+      ]},
+      {l:"hard",tag:"durability",q:"The DB node holding a shard dies — is data lost? (adds replicas)",reveal:["replica"],turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> the single node holding shard 7 has a disk failure and won't come back. That shard held ~22B mappings. Are those links gone forever? Walk me through your durability story.</span>"},
+        {who:"cand",text:"If shard 7 were a single node, yes — catastrophic, and unacceptable for links that live on other people's sites. The fix is <strong>replication</strong>: every shard is a replica group of, say, 3 nodes across failure domains (AZs), with writes acknowledged by a quorum before I return success. Let me add DB replicas. A disk failure on one replica loses nothing — the other two have the data, and a new replica rebuilds from them."},
+        {who:"intv",text:"Quorum writes add latency to every create. And do you read from replicas too?"},
+        {who:"cand",text:"Create latency isn't on the hot path (reads are), so a quorum write of a few ms is fine — and durability is non-negotiable here. For reads, yes: replicas serve reads too, which multiplies read capacity. Because mappings are immutable, reading a slightly-behind replica is safe — the only staleness is 'hasn't seen a brand-new key yet,' handled by falling back to the primary or the cache on a miss. So replicas buy me both <strong>durability</strong> and <strong>read scaling</strong> from one mechanism."},
+      ],resources:[
+        {title:"System Design Primer — replication",url:"https://github.com/donnemartin/system-design-primer#replication"},
+        {title:"Dynamo paper — replication & quorum",url:"https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"},
+      ]},
+      {l:"hard",tag:"concept",q:"Is eventual consistency safe here? Where do you need strong?",turns:[
+        {who:"intv",text:"You're replicating for reads. That's usually eventual consistency. Safe for a URL shortener? Anywhere you need stronger?"},
+        {who:"cand",text:"For <strong>reads</strong>, eventual consistency is ideal — a mapping is immutable, so a replica's only possible staleness is not-yet-knowing a brand-new key, resolved in seconds (or by cache/primary fallback). The place I want <strong>strong consistency</strong> is <em>create</em>, specifically <strong>custom aliases</strong>: two users must not both claim <code>sho.rt/sale</code>."},
+        {who:"intv",text:"So how do you get strong uniqueness on writes but cheap eventual reads in one system?"},
+        {who:"cand",text:"They act on different operations, so no conflict. DynamoDB gives <strong>conditional writes</strong> (<code>attribute_not_exists(key)</code>) that are strongly consistent for that one item — perfect for alias claims and as a safety net for generated keys. Reads use cheap eventually-consistent replica reads. Writes pay a small strong-consistency cost on a single key; reads — 99% of traffic — stay cheap and local. Standard 'strong-on-write, eventual-on-read' that works precisely because data is write-once."},
+      ],resources:[
+        {title:"CAP theorem",url:"https://en.wikipedia.org/wiki/CAP_theorem"},
+        {title:"DynamoDB: read consistency & conditional writes",url:"https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html"},
+      ]},
+    ],
+    cache:[
+      {l:"hard",tag:"failover",q:"Redis OOMs at 3am and flushes everything — what now?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> 3am, a bad key pattern balloons memory, Redis hits maxmemory and — worse — the node restarts and comes back <b>empty</b>. Suddenly 100% of your 116K reads/s are cache misses hitting the DB simultaneously. Describe the blast and contain it.</span>"},
+        {who:"cand",text:"That's a <strong>cold-cache thundering herd</strong>: the DB, which normally sees ~5% of reads, instantly sees 100% — a 20x spike that can topple it, cascading into the redirects the cache was protecting. Containment: <strong>(1) request coalescing / single-flight</strong> so only one miss per key hits the DB and concurrent requests share the result. <strong>(2)</strong> the DB replica group can serve reads, spreading the surge. <strong>(3)</strong> a warmed/replicated cache: run Redis as a replicated cluster so a single node restart doesn't empty the whole tier — failover to a replica that still has the data."},
+        {who:"intv",text:"Even with coalescing, re-warming from cold means the DB carries elevated load for a while. Anything to blunt the recovery?"},
+        {who:"cand",text:"Yes: <strong>jittered TTLs</strong> so entries don't all expire together and re-stampede; <strong>negative caching</strong> so the bad-key pattern that started it can't repeat; and <strong>proactive pre-warming</strong> of the top-N hottest keys on cold start from an offline list, since those account for most traffic. I'd also cap the blast at the source with the memory policy that caused it — set <code>maxmemory-policy</code> to LRU eviction (not restart-inducing behavior) so it sheds cold keys gracefully instead of falling over."},
+      ],resources:[
+        {title:"Cache stampede — mitigations",url:"https://en.wikipedia.org/wiki/Cache_stampede"},
+        {title:"Redis: high availability & replication",url:"https://redis.io/docs/latest/operate/oss_and_stack/management/replication/"},
+      ]},
+      {l:"hard",tag:"scaling",q:"One key is 60% of cache traffic — hot-key meltdown.",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a single viral link is now 60% of all reads. In a sharded Redis cluster that key lives on <b>one</b> node, which is at 100% CPU while the others idle. The hot node is the bottleneck. Fix the imbalance.</span>"},
+        {who:"cand",text:"Classic <strong>hot-key</strong> problem — consistent hashing balances <em>keys</em>, not <em>load per key</em>, so one scorching key pins one node. Fixes: <strong>(1) key replication/fan-out</strong> — store the hot key on multiple nodes (e.g. suffix it <code>key#1..#N</code>) and have clients read a random replica, spreading load N-ways. <strong>(2) client-side / local caching</strong> — app instances cache the hottest keys in-process for a few seconds, so most reads never reach Redis at all. For an immutable mapping, a short local TTL is completely safe."},
+        {who:"intv",text:"How do you even know a key is hot in time to act?"},
+        {who:"cand",text:"Detection: track per-key request rates with a lightweight <strong>approximate top-K / count-min sketch</strong> at the app or proxy tier — cheap, and it flags a key crossing a threshold within seconds. Then promotion is automatic: flip hot keys into the local-cache tier and/or replicate them. The immutability of the data makes this trivial — no coherence concerns, I just need more copies. This is the same top-K machinery you'd build for 'trending links' anyway."},
+      ],resources:[
+        {title:"Count-min sketch (heavy hitters)",url:"https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch"},
+        {title:"System Design Primer — cache",url:"https://github.com/donnemartin/system-design-primer#cache"},
+      ]},
+    ],
+    key:[
+      {l:"hard",tag:"scaling",q:"Generate unique IDs across many servers, no central bottleneck.",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a naive design uses one auto-increment counter in a DB row. At 1,160 creates/s across 30 service instances, that row is a lock-contention hotspot and a SPOF — if it's down, nobody can create. Fix it.</span>"},
+        {who:"cand",text:"Two good approaches. <strong>(1) Range/block allocation:</strong> a coordinator (ZooKeeper or a DB sequence) hands each instance a block of, say, 1,000,000 IDs; the instance burns through it locally and only coordinates once per million creates.<span class='eg'>Instance A owns [1M-1.999M], B owns [2M-2.999M] — no per-request coordination.</span><strong>(2) Snowflake-style:</strong> a 64-bit ID generated fully locally as <code>[timestamp | machine-id | sequence]</code> — zero coordination, time-sortable. For a shortener I lean range-allocation (denser → shorter keys)."},
+        {who:"intv",text:"With range-allocation, what happens if an instance crashes mid-block?"},
+        {who:"cand",text:"You lose the unused tail of that block — those IDs are never used. Totally fine: the space is 3.5T+, leaking a few million per crash is a rounding error, and it buys a crash that needs zero recovery logic. Trying to reclaim partial blocks adds coordination and correctness risk for savings that don't matter."},
+      ],resources:[
+        {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+        {title:"Twitter/X: announcing Snowflake",url:"https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake"},
+      ]},
+      {l:"hard",tag:"failover",q:"The ID coordinator (ZooKeeper) goes down — can you still create?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> you chose range-allocation backed by ZooKeeper. ZK has an outage for 5 minutes. Does URL creation stop dead?</span>"},
+        {who:"cand",text:"It shouldn't, and the design is what makes that true. Each instance holds a <strong>full block of ~1M IDs locally</strong>, so it keeps minting keys from its current block throughout the ZK outage — at 1,160/s a single block lasts ~14 minutes, far longer than a typical blip. The instance only touches ZK to fetch its <em>next</em> block, so I pre-fetch the next block when the current is, say, 20% remaining. ZK being down briefly is invisible to users."},
+        {who:"intv",text:"And if ZK is down long enough that an instance exhausts its block <em>and</em> its prefetched one?"},
+        {who:"cand",text:"Then that instance stops minting — but I've decoupled the blast radius: other instances with headroom keep serving creates (the LB routes around the stalled one), so it's degraded capacity, not an outage. As a stronger fallback I can switch to <strong>Snowflake-style</strong> generation, which needs no coordinator at all — some designs run Snowflake as the primary exactly to avoid this dependency. ZK itself is also run as a 3-or-5-node ensemble, so a true full outage is rare; the local-block buffer covers the common failure."},
+      ],resources:[
+        {title:"Apache ZooKeeper overview",url:"https://zookeeper.apache.org/doc/current/zookeeperOver.html"},
+        {title:"System Design Primer — unique IDs",url:"https://github.com/donnemartin/system-design-primer#use-good-indices"},
+      ]},
+    ],
+    replica:[
+      {l:"hard",tag:"failover",q:"A user 404s on the link they just created — replication lag.",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a user creates a link, gets <code>sho.rt/aX9bQ</code>, and immediately opens it to test — and gets a 404. Your create went to the primary; their redirect read a replica that's 200ms behind. Read-your-writes just broke. Fix it.</span>"},
+        {who:"cand",text:"This is the classic <strong>read-your-writes</strong> violation from async replication. Fixes, cheapest first: <strong>(1)</strong> on create, I already <em>warm the cache</em> synchronously — so their immediate read hits the cache, not a lagging replica, and sees the key. <strong>(2)</strong> for a short window after a user's write, pin that user's reads to the primary (or a 'read-your-writes' token / session stickiness). <strong>(3)</strong> on any replica miss for a very recent key, fall back to the primary before returning 404."},
+        {who:"intv",text:"The cache-warm covers the creator. But a friend they texted the link to, in another region, also 404s for a moment. Same fix?"},
+        {who:"cand",text:"That one's genuinely eventual — the friend has no session with my primary and the write may not have propagated to their region's replica yet. I lean on <strong>replica-miss → primary fallback</strong>: a miss on a fresh key isn't 'doesn't exist,' it's 'might be too new,' so I check the primary (or cross-region) before 404ing, and cache the result. It adds a little latency to the rare fresh-key miss while keeping the 99.99% steady-state reads cheap on local replicas. I'd also make key creation → global cache propagation fast (push to a global cache tier on create) so the window is sub-second."},
+      ],resources:[
+        {title:"Read-your-writes consistency",url:"https://en.wikipedia.org/wiki/Consistency_model#Read-your-writes_consistency"},
+        {title:"System Design Primer — replication lag",url:"https://github.com/donnemartin/system-design-primer#replication"},
+      ]},
+      {l:"hard",tag:"durability",q:"Primary dies — promote a replica without split-brain.",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> the write-primary for a shard crashes. You promote a replica to primary. Two minutes later the old primary rejoins — and it still thinks it's primary. Now you have two primaries taking writes. What happens and how do you prevent it?</span>"},
+        {who:"cand",text:"That's <strong>split-brain</strong>, and for writes it means divergent, conflicting data on the same key — corruption. Prevention: promotion must go through a <strong>consensus/leader-election</strong> mechanism (Raft/Paxos, or a fencing coordinator) that grants a monotonically increasing <strong>epoch/term</strong>. The new primary writes under a higher epoch; when the old primary rejoins with a stale epoch, replicas and clients <strong>reject its writes</strong> (fencing token), and it's demoted to replica and re-syncs. There is never a moment two nodes hold the current epoch."},
+        {who:"intv",text:"During the election window, are writes just unavailable?"},
+        {who:"cand",text:"Briefly, yes — that's the CAP trade-off: to avoid split-brain I choose <strong>consistency over availability for writes</strong> during a partition, so creates on that shard pause for the election (typically a few seconds). Reads stay fully available from replicas throughout, so redirects — the traffic that actually matters for a shortener — are unaffected. I'd rather a handful of creates retry for 3 seconds than corrupt the mapping store. Managed stores (DynamoDB, Spanner) do this fencing internally, which is a strong reason to use them rather than hand-rolling failover."},
+      ],resources:[
+        {title:"Raft consensus",url:"https://raft.github.io/"},
+        {title:"Fencing tokens (Martin Kleppmann)",url:"https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"},
+      ]},
+    ],
+    analytics:[
+      {l:"medium",tag:"scaling",q:"Aggregate billions of click events without melting.",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a marketing blast drives 500K clicks/s for an hour. Your analytics consumer writes one DB row per click and immediately falls hours behind, and the dashboard shows stale counts. Redesign the pipeline.</span>"},
+        {who:"cand",text:"Row-per-click is the mistake — it couples ingest rate to DB write rate. Instead: events land in <strong>Kafka</strong> (which happily absorbs 500K/s and buffers the spike), and stream consumers do <strong>windowed aggregation</strong> — roll up per-key counts in, say, 1-minute tumbling windows and write <em>aggregates</em>, not raw rows, to an OLAP/column store. That's a ~million-fold reduction in write volume. Raw events also archive to object storage for replay."},
+        {who:"intv",text:"The redirect path emits to Kafka synchronously. If Kafka is briefly unavailable, does that stall redirects?"},
+        {who:"cand",text:"It must not — analytics is best-effort and off the critical path. The producer is <strong>async, fire-and-forget with a bounded local buffer</strong>: if Kafka is slow/unreachable, events queue in-memory up to a cap and then I <em>drop</em> them (or spill to a local log) rather than block or delay the 302. Losing a slice of analytics during a Kafka blip is acceptable; adding latency to a billion redirects is not. Exact counts aren't the goal — approximate, timely counts are."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"System Design Primer — async & message queues",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
+      ]},
+    ],
+    client:[
+      {l:"medium",tag:"concept",q:"What can you push to the client/edge, and its limits?",turns:[
+        {who:"intv",text:"You keep saying 'serve redirects from the edge.' Where's the line — what lives at the edge vs the origin?"},
+        {who:"cand",text:"<strong>Redirects</strong> are the ideal edge workload: immutable, small mappings, cacheable with long TTL, answerable close to the user by an edge worker against a replicated edge KV. <strong>Creation</strong> must stay at the origin — it needs key-gen coordination and the authoritative durable write. Rule of thumb: read-only + immutable → edge; write + coordinated + authoritative → origin."},
+        {who:"intv",text:"An edge-cached link gets deleted or flagged as malware. The edge keeps redirecting to it. How do you revoke fast?"},
+        {who:"cand",text:"Bounded edge TTLs (not infinite) plus <strong>active purge</strong>: on delete/flag, issue a CDN cache-invalidation for that specific key so edges drop it. Expiry I encode in the cached response so the edge enforces <code>now > expiry</code> without a purge. So the edge stays fast for the immutable happy-path, but I keep a fast revocation path for the rare mutation — the same reason I don't set TTLs to forever."},
+      ],resources:[
+        {title:"Cloudflare Workers — edge compute",url:"https://developers.cloudflare.com/workers/"},
+        {title:"System Design Primer — CDNs",url:"https://github.com/donnemartin/system-design-primer#content-delivery-network"},
+      ]},
+    ],
+  }
+};

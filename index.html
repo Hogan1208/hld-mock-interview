@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HLD Mock Interview — SDE-3</title>
+<link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3/dist/tabler-icons.min.css" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --line:#2a323d;
+    --text:#e6edf3; --muted:#9aa7b4; --accent:#4f8cff; --accent2:#7c5cff;
+    --intv:#f0a742; --cand:#4fd1a1; --easy:#4fd1a1; --medium:#f0a742; --hard:#ff6b6b;
+    --t-concept:#6ea8ff; --t-scaling:#f0a742; --t-durability:#4fd1a1; --t-failover:#ff6b6b;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.55;}
+  header{padding:16px 26px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:16px;background:var(--panel);position:sticky;top:0;z-index:20}
+  header h1{font-size:19px;margin:0;font-weight:600}
+  header .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px;transition:.15s}
+  .btn:hover{border-color:var(--accent);background:#222c38}
+  .wrap{max-width:1360px;margin:0 auto;padding:22px}
+
+  .setup h2{font-size:15px;color:var(--muted);font-weight:500;margin:26px 0 12px;text-transform:uppercase;letter-spacing:1px}
+  .diff-row{display:flex;gap:12px;flex-wrap:wrap}
+  .diff{flex:1;min-width:180px;border:1px solid var(--line);border-radius:var(--radius);padding:16px;cursor:pointer;background:var(--panel);transition:.15s}
+  .diff:hover{border-color:var(--accent)}
+  .diff.sel{border-color:var(--accent);background:#1a2634;box-shadow:0 0 0 1px var(--accent)}
+  .diff .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px}
+  .diff h3{margin:0 0 6px;font-size:16px}.diff p{margin:0;color:var(--muted);font-size:13px}
+  .prob-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+  .prob{border:1px solid var(--line);border-radius:var(--radius);padding:18px;cursor:pointer;background:var(--panel);transition:.15s}
+  .prob:hover{border-color:var(--accent2);transform:translateY(-2px)}
+  .prob h3{margin:0 0 8px;font-size:16px}.prob p{margin:0;color:var(--muted);font-size:13px}
+  .prob .tag{display:inline-block;margin-top:12px;font-size:11px;color:var(--accent);border:1px solid var(--line);border-radius:20px;padding:3px 10px}
+  .prob .cat{display:block;font-size:10px;color:var(--accent2);text-transform:uppercase;letter-spacing:.7px;margin-bottom:8px;font-weight:600}
+
+  .stepper{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+  .step{flex:1;min-width:150px;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:10px 12px;cursor:pointer;transition:.15s;display:flex;gap:10px;align-items:center}
+  .step:hover{border-color:var(--accent)}
+  .step.on{border-color:var(--accent);background:#1a2634;box-shadow:0 0 0 1px var(--accent)}
+  .step.done .num{background:var(--cand);color:#0e1116}
+  .step .num{width:22px;height:22px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
+  .step.on .num{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .step .lbl{font-size:12.5px;font-weight:600;line-height:1.25}
+  .step .sub{font-size:10.5px;color:var(--muted)}
+
+  .stage{display:grid;grid-template-columns:1.05fr 1fr;gap:20px;align-items:start}
+  @media(max-width:1000px){.stage{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+  .card .hd{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  .card .hd h3{margin:0;font-size:14px;font-weight:600}.card .hd .hint{font-size:12px;color:var(--muted)}
+  .diagram{padding:10px}
+  svg{width:100%;height:auto;display:block}
+  .node{cursor:pointer}.node rect{transition:.15s}
+  .node:hover rect{stroke:var(--accent);stroke-width:2}
+  .node.active rect{stroke:var(--accent);stroke-width:2.5;fill:#1e2a3a}
+  .node.done rect{stroke:var(--cand)}
+  .node text{fill:var(--text);font-size:12px;font-weight:500;pointer-events:none}
+  .node .sub{fill:var(--muted);font-size:10px}
+  .edge{stroke:#3a4652;stroke-width:1.5;fill:none;marker-end:url(#arr)}
+  @keyframes pop{0%{opacity:0;transform:scale(.6)}60%{opacity:1;transform:scale(1.08)}100%{transform:scale(1)}}
+  @keyframes edgein{from{opacity:0}to{opacity:1}}
+  .node.new{animation:pop .5s cubic-bezier(.2,1.3,.5,1) both;transform-box:fill-box;transform-origin:center}
+  .node.new rect{stroke:var(--accent2);stroke-width:2.5}
+  .edge.new{animation:edgein .6s ease .2s both}
+
+  .panel{margin-top:18px}
+  .panel .empty{color:var(--muted);font-size:14px;padding:20px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
+  .phead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .phead h4{margin:0;font-size:15px}.counter{font-size:12px;color:var(--muted)}
+  .reqcol{margin-bottom:14px}
+  .reqcol h5{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .reqli{display:flex;gap:9px;align-items:flex-start;font-size:13.5px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+  .reqli i{color:var(--accent2);margin-top:2px}
+  .item{width:100%;text-align:left;background:var(--panel2);border:1px solid var(--line);color:var(--text);padding:11px 13px;border-radius:10px;cursor:pointer;margin-bottom:8px;font-size:13.5px;display:flex;gap:9px;align-items:flex-start;transition:.15s}
+  .item:hover:not(:disabled){border-color:var(--accent);background:#222c38}
+  .item:disabled{opacity:.5;cursor:not-allowed}
+  .item .qt{flex:1}.item .turns{font-size:10px;color:var(--muted);white-space:nowrap;margin-top:2px}
+  .chip{font-size:10px;padding:2px 7px;border-radius:6px;flex-shrink:0;margin-top:1px;font-weight:600;white-space:nowrap}
+  .chip.easy{background:rgba(79,209,161,.15);color:var(--easy)}.chip.medium{background:rgba(240,167,66,.15);color:var(--medium)}.chip.hard{background:rgba(255,107,107,.15);color:var(--hard)}
+  .chip.req{background:rgba(124,92,255,.15);color:var(--accent2)}
+  .tchip{font-size:10px;padding:2px 7px;border-radius:6px;flex-shrink:0;margin-top:1px;white-space:nowrap;border:1px solid}
+  .tchip.concept{color:var(--t-concept);border-color:rgba(110,168,255,.4)}
+  .tchip.scaling{color:var(--t-scaling);border-color:rgba(240,167,66,.4)}
+  .tchip.durability{color:var(--t-durability);border-color:rgba(79,209,161,.4)}
+  .tchip.failover{color:var(--t-failover);border-color:rgba(255,107,107,.4)}
+  .filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 12px}
+  .fchip{font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted);cursor:pointer;background:none}
+  .fchip.on{border-color:var(--accent);color:var(--text);background:#1c2836}
+  .compbar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+  .compbtn{font-size:12px;padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer}
+  .compbtn.on{border-color:var(--accent);background:#1c2836}
+  .compbtn.done{border-color:var(--cand)}
+
+  .askbox{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#12161d}
+  .askbox label{font-size:12px;color:var(--muted);display:block;margin-bottom:8px}.askbox label b{color:var(--accent2)}
+  .askrow{display:flex;gap:8px}
+  .askbox textarea{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 11px;font-size:13px;resize:vertical;min-height:38px;font-family:inherit}
+  .askbox textarea:focus{outline:none;border-color:var(--accent)}
+  .askbox .go{background:var(--accent2);border:none;color:#fff;border-radius:8px;padding:0 14px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap}
+  .askbox .go:hover{background:#6a4ce0}.askbox .go:disabled{opacity:.5;cursor:not-allowed}
+
+  .transcript{padding:16px;max-height:74vh;overflow-y:auto;scroll-behavior:smooth}
+  .bubble{margin-bottom:16px;animation:fade .35s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .bubble .who{font-size:12px;font-weight:700;margin-bottom:5px;display:flex;align-items:center;gap:7px}
+  .bubble .who .av{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;color:#0e1116;font-weight:700}
+  .bubble.intv .av{background:var(--intv)}.bubble.intv .who{color:var(--intv)}
+  .bubble.cand .av{background:var(--cand)}.bubble.cand .who{color:var(--cand)}
+  .bubble.you .av{background:var(--accent2)}.bubble.you .who{color:var(--accent2)}
+  .bubble .body{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:13.5px}
+  .bubble.intv .body{border-left:3px solid var(--intv)}.bubble.cand .body{border-left:3px solid var(--cand)}.bubble.you .body{border-left:3px solid var(--accent2)}
+  .bubble .body p{margin:0 0 8px}.bubble .body p:last-child{margin:0}
+  .bubble .body ul{margin:6px 0;padding-left:20px}.bubble .body li{margin:4px 0}
+  .bubble .body strong{color:#fff;font-weight:600}.bubble .body em{color:#cdd8e3}
+  .bubble .body code{background:#0e1116;padding:2px 6px;border-radius:5px;font-size:12px;color:#7ad;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .bubble .body .eg{display:block;background:#0e1116;border-left:3px solid var(--accent2);padding:8px 12px;border-radius:6px;margin:8px 0;font-size:12.5px;color:#c7d2de}
+  .bubble .body .scenario{display:block;background:#241318;border-left:3px solid #ff6b6b;padding:9px 12px;border-radius:6px;margin:0 0 10px;font-size:13px;color:#ffd5d5}
+  .bubble .body .scenario b{color:#ff8f8f}
+  .bubble.live .body{border-left-color:var(--accent2)}
+  .reveal-note{font-size:11.5px;color:var(--accent2);margin:6px 0 0;display:flex;align-items:center;gap:6px}
+  .res{background:#12211b;border:1px solid #234b3a;border-radius:10px;padding:12px 14px;margin-bottom:16px}
+  .res .rh{font-size:12px;font-weight:700;color:var(--cand);margin-bottom:8px;display:flex;align-items:center;gap:7px}
+  .res a{display:flex;gap:8px;align-items:baseline;color:#7fd4ff;text-decoration:none;font-size:13px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+  .res a:last-child{border-bottom:none}.res a:hover{color:#a9e2ff;text-decoration:underline}
+  .res a .d{color:var(--muted);font-size:11px}
+  .typing{display:flex;gap:4px;padding:6px 2px}
+  .typing span{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:blink 1.2s infinite}
+  .typing span:nth-child(2){animation-delay:.2s}.typing span:nth-child(3){animation-delay:.4s}
+  @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+  .empty-t{color:var(--muted);text-align:center;padding:40px 20px;font-size:14px}
+  .tip{margin-top:14px;font-size:12px;color:var(--muted);padding:0 2px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>HLD Mock Interview <span style="color:var(--muted);font-weight:400">— SDE-3 System Design</span></h1>
+    <div class="sub" id="subtitle">Pick a difficulty and a problem to begin. You are the interviewer.</div>
+  </div>
+  <div style="display:flex;gap:10px">
+    <button class="btn" id="resetBtn" style="display:none">Reset problem</button>
+    <button class="btn" id="changeBtn" style="display:none">Change problem</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="setup" class="setup"></div>
+  <div id="interview" style="display:none"></div>
+</div>
+
+<script src="problems/url.js"></script>
+<script src="problems/feed.js"></script>
+<script src="problems/chat.js"></script>
+<script src="problems/ratelimiter.js"></script>
+<script src="problems/video.js"></script>
+<script src="problems/proximity.js"></script>
+<script src="problems/gdocs.js"></script>
+<script src="problems/filesync.js"></script>
+<script src="problems/ticketmaster.js"></script>
+<script src="problems/crawler.js"></script>
+<script src="problems/adclick.js"></script>
+
+<script>
+const DATA = window.DATA || {};
+const DIFF_INFO = {
+  easy:{name:"Easy",dot:"var(--easy)",desc:"Warm-up. Fundamentals and 'what/why' probes."},
+  medium:{name:"Medium",dot:"var(--medium)",desc:"Standard SDE-3 bar. Trade-off conversations."},
+  hard:{name:"Hard",dot:"var(--hard)",desc:"Senior deep-dives — scale, durability, failover."},
+};
+const DIFF_ALLOWED = {easy:["easy"], medium:["easy","medium"], hard:["easy","medium","hard"]};
+const TAGS = {concept:{icon:"ti-bulb"},scaling:{icon:"ti-trending-up"},durability:{icon:"ti-database"},failover:{icon:"ti-alert-triangle"}};
+const MAX_FOLLOWUPS = 10;
+const PHASE_META = [
+  {n:1,lbl:"Requirements",sub:"functional + NFR",key:"requirements"},
+  {n:2,lbl:"Functional HLD",sub:"build per requirement",key:"reqBuild"},
+  {n:3,lbl:"System deep dives",sub:"evolve the architecture",key:"systemDives"},
+  {n:4,lbl:"Component deep dives",sub:"drill each box",key:"q"},
+];
+
+let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
+  reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null};
+
+const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
+
+function idsOf(p){return p.nodes.map(n=>n.id);}
+function basicSet(p){return new Set(p.basic&&p.basic.length?p.basic:(p.core&&p.core.length?p.core:idsOf(p)));}
+function functionalSet(p){const s=basicSet(p);(p.reqBuild||[]).forEach(r=>(r.reveal||[]).forEach(id=>s.add(id)));return s;}
+function availablePhases(p){return PHASE_META.filter(m=> m.key==='q' ? Object.keys(p.q||{}).length : (m.key==='requirements'? (p.requirements&&(p.requirements.functional||p.requirements.nonFunctional)) : (p[m.key]&&p[m.key].length)) );}
+
+/* ---------------- setup ---------------- */
+function renderSetup(){
+  interviewEl.style.display='none'; setupEl.style.display='block';
+  document.getElementById('resetBtn').style.display='none'; document.getElementById('changeBtn').style.display='none';
+  subtitle.textContent="Pick a difficulty and a problem to begin. You are the interviewer.";
+  let html=`<div class="setup"><h2>1 · Choose difficulty</h2><div class="diff-row">`;
+  for(const[k,v]of Object.entries(DIFF_INFO)) html+=`<div class="diff ${state.diff===k?'sel':''}" data-diff="${k}"><h3><span class="dot" style="background:${v.dot}"></span>${v.name}</h3><p>${v.desc}</p></div>`;
+  html+=`</div><h2>2 · Choose a problem</h2><div class="prob-grid">`;
+  for(const[k,v]of Object.entries(DATA)) html+=`<div class="prob" data-prob="${k}">${v.cat?`<span class="cat">${v.cat}</span>`:''}<h3>${v.title}</h3><p>${v.blurb}</p><span class="tag">${v.nodes.length} components · ${countF(k)} deep-dives</span></div>`;
+  html+=`</div></div>`;
+  setupEl.innerHTML=html;
+  setupEl.querySelectorAll('.diff').forEach(el=>el.onclick=()=>{state.diff=el.dataset.diff;renderSetup();});
+  setupEl.querySelectorAll('.prob').forEach(el=>el.onclick=()=>{ if(!state.diff){flashDiff();return;} startInterview(el.dataset.prob); });
+}
+function flashDiff(){const h=setupEl.querySelector('h2');h.style.color='var(--hard)';h.textContent='1 · Choose difficulty  ← pick one first';setTimeout(()=>{h.style.color='';h.textContent='1 · Choose difficulty';},1400);}
+function countF(pk){let n=0;const q=DATA[pk].q||{};for(const c in q)n+=q[c].length;return n;}
+
+/* ---------------- interview shell ---------------- */
+function startInterview(pk){
+  state.prob=pk; state.activeNode=null; state.asked={}; state.answeredCount={}; state.reqDone={}; state.diveDone={};
+  state.playing=false; state.filter=null; state.justRevealed=new Set();
+  const p=DATA[pk];
+  const avail=availablePhases(p);
+  state.phase=avail[0].n;
+  state.revealed=new Set(basicSet(p));
+  setupEl.style.display='none'; interviewEl.style.display='block';
+  document.getElementById('resetBtn').style.display='inline-block'; document.getElementById('changeBtn').style.display='inline-block';
+  subtitle.innerHTML=`<strong>${p.title}</strong> · Difficulty: <span style="color:${DIFF_INFO[state.diff].dot}">${DIFF_INFO[state.diff].name}</span>`;
+  interviewEl.innerHTML=`
+    <div id="stepper" class="stepper"></div>
+    <div class="stage">
+      <div>
+        <div class="card"><div class="hd"><h3>High-level design</h3><span class="hint" id="dhint"></span></div><div class="diagram" id="diagram"></div></div>
+        <div class="panel" id="panel"></div>
+        <div class="tip" id="ptip"></div>
+      </div>
+      <div class="card"><div class="hd"><h3>Interview transcript</h3><span class="hint" id="tcount"></span></div><div class="transcript" id="transcript"></div></div>
+    </div>`;
+  renderStepper(); renderDiagram(); renderPanel();
+  addBubble('intv',p.prompt); addBubble('cand',p.opening);
+}
+function renderStepper(){
+  const p=DATA[state.prob], avail=availablePhases(p).map(m=>m.n);
+  const done={1:Object.keys(state.reqDone).length>0||state.phase>1,2:(p.reqBuild&&Object.keys(state.reqDone).length>=p.reqBuild.length),3:(p.systemDives&&Object.keys(state.diveDone).length>=p.systemDives.length),4:false};
+  let html='';
+  PHASE_META.forEach(m=>{ if(!avail.includes(m.n))return;
+    html+=`<div class="step ${state.phase===m.n?'on':''} ${done[m.n]?'done':''}" data-p="${m.n}"><div class="num">${done[m.n]?'<i class="ti ti-check"></i>':m.n}</div><div><div class="lbl">${m.lbl}</div><div class="sub">${m.sub}</div></div></div>`;
+  });
+  document.getElementById('stepper').innerHTML=html;
+  document.querySelectorAll('#stepper .step').forEach(el=>el.onclick=()=>{ if(state.playing)return; setPhase(parseInt(el.dataset.p)); });
+}
+function setPhase(n){
+  const p=DATA[state.prob];
+  state.phase=n; state.filter=null;
+  let target;
+  if(n<=1) target=basicSet(p);
+  else if(n===2) target=new Set([...state.revealed,...basicSet(p)]);
+  else if(n===3) target=new Set([...state.revealed,...functionalSet(p)]);
+  else target=new Set(idsOf(p));
+  state.justRevealed=new Set([...target].filter(id=>!state.revealed.has(id)));
+  state.revealed=target;
+  if(n!==4) state.activeNode=null;
+  renderStepper(); renderDiagram(); renderPanel();
+  if(state.justRevealed.size) setTimeout(()=>{state.justRevealed=new Set();},700);
+}
+
+/* ---------------- diagram ---------------- */
+function renderDiagram(){
+  const p=DATA[state.prob], cellW=132, cellH=54;
+  const maxX=Math.max(...p.nodes.map(n=>n.x))+cellW+40, maxY=Math.max(...p.nodes.map(n=>n.y))+cellH+30;
+  const pos={}; p.nodes.forEach(n=>pos[n.id]={x:n.x,y:n.y});
+  let edges='';
+  p.edges.forEach(([a,b])=>{ if(!state.revealed.has(a)||!state.revealed.has(b))return; const A=pos[a],B=pos[b];
+    const isNew=state.justRevealed.has(a)||state.justRevealed.has(b);
+    edges+=`<line class="edge ${isNew?'new':''}" x1="${A.x+cellW/2}" y1="${A.y+cellH/2}" x2="${B.x+cellW/2}" y2="${B.y+cellH/2}"></line>`; });
+  let nodes='';
+  p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return;
+    const hasQ=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l));
+    const isNew=state.justRevealed.has(n.id);
+    const cls=[(state.activeNode===n.id?'active':''),(state.answeredCount[n.id]>=1?'done':''),(isNew?'new':'')].join(' ');
+    const cnt=state.answeredCount[n.id]||0;
+    const badge=cnt>0?`<text class="sub" x="${n.x+cellW-12}" y="${n.y+18}" text-anchor="end" style="fill:var(--cand)">${cnt}</text>`:'';
+    nodes+=`<g class="node ${cls}" data-node="${n.id}" style="${(state.phase===4&&!hasQ)?'opacity:.5':''}"><rect x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="9" fill="var(--panel2)" stroke="var(--line)" stroke-width="1.5"></rect><text x="${n.x+12}" y="${n.y+23}">${n.name}</text><text class="sub" x="${n.x+12}" y="${n.y+40}">${n.sub}</text>${badge}</g>`; });
+  document.getElementById('diagram').innerHTML=`<svg viewBox="0 0 ${maxX} ${maxY}"><defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6" fill="none" stroke="#4a5663" stroke-width="1.2"/></marker></defs>${edges}${nodes}</svg>`;
+  document.querySelectorAll('#diagram .node').forEach(el=>el.onclick=()=>{ if(state.playing)return; state.activeNode=el.dataset.node; if(state.phase!==4)setPhase(4); else{renderDiagram();renderPanel();} });
+  const total=p.nodes.length, shown=state.revealed.size;
+  const dh=document.getElementById('dhint'); if(dh) dh.textContent=shown<total?`${shown}/${total} components`:`all ${total} components`;
+}
+
+/* ---------------- panels per phase ---------------- */
+function renderPanel(){
+  const p=DATA[state.prob];
+  if(state.phase===1) return renderRequirements(p);
+  if(state.phase===2) return renderReqBuild(p);
+  if(state.phase===3) return renderDives(p);
+  return renderComponents(p);
+}
+function renderRequirements(p){
+  const r=p.requirements||{};
+  let html=`<div class="phead"><h4>Requirements</h4><span class="counter">the basic HLD is on the board</span></div>`;
+  if(r.functional){ html+=`<div class="reqcol"><h5>Functional</h5>`; r.functional.forEach(x=>html+=`<div class="reqli"><i class="ti ti-check"></i><span>${x}</span></div>`); html+=`</div>`; }
+  if(r.nonFunctional){ html+=`<div class="reqcol"><h5>Non-functional</h5>`; r.nonFunctional.forEach(x=>html+=`<div class="reqli"><i class="ti ti-bolt"></i><span>${x}</span></div>`); html+=`</div>`; }
+  html+=`<div class="tip">Next: <b>Functional HLD</b> — build the diagram so it satisfies each functional requirement.</div>`;
+  document.getElementById('panel').innerHTML=html;
+  document.getElementById('ptip').textContent='';
+}
+function renderReqBuild(p){
+  const steps=p.reqBuild||[]; const done=Object.keys(state.reqDone).length;
+  let html=`<div class="phead"><h4>Build the functional HLD</h4><span class="counter">${done}/${steps.length} requirements addressed</span></div>`;
+  steps.forEach((s,i)=>{ const d=state.reqDone[i]; const rev=(s.reveal&&s.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
+    html+=`<button class="item" data-i="${i}" ${d||state.playing?'disabled':''}><span class="chip req">req ${i+1}</span><span class="qt">${s.req}${rev}${d?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil((s.turns||[]).length/2)}×</span></button>`; });
+  if(done>=steps.length&&steps.length) html+=`<div class="tip" style="color:var(--cand)">Functional HLD complete — every requirement is satisfied. Move to <b>System deep dives</b>.</div>`;
+  document.getElementById('panel').innerHTML=html;
+  document.getElementById('ptip').textContent='Address each functional requirement; the diagram grows to cover it.';
+  document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playReqStep(parseInt(el.dataset.i)); });
+}
+function renderDives(p){
+  const dives=p.systemDives||[]; const done=Object.keys(state.diveDone).length;
+  let html=`<div class="phead"><h4>System-wide deep dives</h4><span class="counter">${done}/${dives.length} explored</span></div>`;
+  dives.forEach((s,i)=>{ const d=state.diveDone[i]; const tag=s.tag||'scaling';
+    const rev=(s.reveal&&s.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
+    html+=`<button class="item" data-i="${i}" ${state.playing?'disabled':''}><span class="tchip ${tag}"><i class="ti ${TAGS[tag]?TAGS[tag].icon:'ti-bulb'}"></i> ${tag}</span><span class="qt">${s.title}${rev}${d?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil((s.turns||[]).length/2)}×</span></button>`; });
+  document.getElementById('panel').innerHTML=html+askBoxHTML('the whole system');
+  document.getElementById('ptip').innerHTML='These evolve the architecture. Next: <b>Component deep dives</b> to drill each box.';
+  document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playDive(parseInt(el.dataset.i)); });
+  wireAsk('system');
+}
+function renderComponents(p){
+  const nid=state.activeNode;
+  let html=`<div class="compbar">`;
+  p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return; const has=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l)); if(!has)return;
+    html+=`<button class="compbtn ${nid===n.id?'on':''} ${state.answeredCount[n.id]?'done':''}" data-n="${n.id}">${n.name}${state.answeredCount[n.id]?' ·'+state.answeredCount[n.id]:''}</button>`; });
+  html+=`</div>`;
+  if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill into it — concept, scaling, durability and failover threads.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
+  const node=p.nodes.find(n=>n.id===nid);
+  let all=(p.q[nid]||[]).filter(q=>DIFF_ALLOWED[state.diff].includes(q.l));
+  const tagsP=[...new Set(all.map(q=>q.tag||'concept'))];
+  if(state.filter) all=all.filter(q=>(q.tag||'concept')===state.filter);
+  const answered=state.answeredCount[nid]||0, capped=answered>=MAX_FOLLOWUPS;
+  html+=`<div class="phead"><h4>${node.name}</h4><span class="counter">${answered}/${MAX_FOLLOWUPS} asked${capped?' · max':''}</span></div>`;
+  if(tagsP.length>1){ html+=`<div class="filters"><button class="fchip ${!state.filter?'on':''}" data-f="">all</button>`; tagsP.forEach(t=>html+=`<button class="fchip ${state.filter===t?'on':''}" data-f="${t}"><i class="ti ${TAGS[t]?TAGS[t].icon:'ti-bulb'}"></i> ${t}</button>`); html+=`</div>`; }
+  all.forEach(q=>{ const gi=p.q[nid].indexOf(q),key=nid+':'+gi,asked=state.asked[key],dis=asked||(capped&&!asked)||state.playing,tag=q.tag||'concept';
+    const rev=(q.reveal&&q.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
+    html+=`<button class="item" data-idx="${gi}" ${dis?'disabled':''}><span class="chip ${q.l}">${q.l}</span><span class="tchip ${tag}"><i class="ti ${TAGS[tag]?TAGS[tag].icon:'ti-bulb'}"></i> ${tag}</span><span class="qt">${q.q}${rev}${asked?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil(q.turns.length/2)}×</span></button>`; });
+  html+=askBoxHTML(node.name);
+  document.getElementById('panel').innerHTML=html;
+  document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.';
+  document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
+  document.querySelectorAll('#panel .fchip').forEach(el=>el.onclick=()=>{state.filter=el.dataset.f||null;renderPanel();});
+  document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playThread(nid,parseInt(el.dataset.idx)); });
+  wireAsk(nid);
+}
+
+/* ---------------- playback ---------------- */
+function applyReveal(list){ state.justRevealed=new Set(); (list||[]).forEach(id=>{ if(!state.revealed.has(id)){state.revealed.add(id);state.justRevealed.add(id);} }); }
+function playTurns(item, tagLabel, after){
+  state.playing=true; renderStepper(); renderPanel();
+  applyReveal(item.reveal); renderDiagram();
+  const turns=item.turns||[]; let i=0;
+  const step=()=>{ if(i>=turns.length){ if(state.justRevealed.size){ const names=[...state.justRevealed].map(id=>DATA[state.prob].nodes.find(n=>n.id===id).name).join(', '); addReveal(names);} if(item.resources&&item.resources.length)addResources(item.resources); state.playing=false; state.justRevealed=new Set(); if(after)after(); renderStepper(); renderDiagram(); renderPanel(); return; }
+    const t=turns[i]; const prefix=(i===0&&tagLabel)?`<span style="color:var(--muted);font-size:11px">${tagLabel}</span><br>`:''; showTyping(t.who);
+    const d=i===0?120:(t.who==='cand'?640:470); setTimeout(()=>{clearTyping();addBubble(t.who,prefix+t.text);i++;step();},d); };
+  step();
+}
+function playReqStep(i){ const p=DATA[state.prob], s=p.reqBuild[i]; state.reqDone[i]=true; playTurns(s, `[requirement ${i+1}]`); }
+function playDive(i){ const p=DATA[state.prob], s=p.systemDives[i]; state.diveDone[i]=true; playTurns(s, `[system deep dive · ${s.tag||''}]`); }
+function playThread(nid,idx){ const p=DATA[state.prob], item=p.q[nid][idx]; state.asked[nid+':'+idx]=true; state.answeredCount[nid]=(state.answeredCount[nid]||0)+1; const node=p.nodes.find(n=>n.id===nid); playTurns(item, `[${node.name} · ${item.tag||'concept'} · ${item.l}]`); }
+
+let typingEl=null;
+function showTyping(who){ const t=document.getElementById('transcript'); typingEl=document.createElement('div'); typingEl.className=`bubble ${who}`; typingEl.innerHTML=`<div class="who"><span class="av">${who==='intv'?'I':'C'}</span>${who==='intv'?'Interviewer':'Candidate'}</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`; t.appendChild(typingEl); t.scrollTop=t.scrollHeight; }
+function clearTyping(){ if(typingEl){typingEl.remove();typingEl=null;} }
+function addBubble(who,body){ const t=document.getElementById('transcript'); if(t.querySelector('.empty-t'))t.innerHTML=''; const label=who==='intv'?'Interviewer':(who==='you'?'You (interviewer)':'Candidate'); const md=body.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>'); const div=document.createElement('div'); div.className=`bubble ${who}`; div.innerHTML=`<div class="who"><span class="av">${who==='intv'?'I':(who==='you'?'Y':'C')}</span>${label}</div><div class="body">${md}</div>`; t.appendChild(div); t.scrollTop=t.scrollHeight; document.getElementById('tcount').textContent=`${t.querySelectorAll('.bubble').length} messages`; return div; }
+function addReveal(names){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='reveal-note'; d.innerHTML=`<i class="ti ti-circle-plus"></i> Diagram updated — added: <strong style="color:#fff">${names}</strong>`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
+function addResources(list){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='res'; const links=list.map(r=>{let host='';try{host=new URL(r.url).hostname.replace('www.','');}catch(e){} return `<a href="${r.url}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:14px"></i><span>${r.title}<br><span class="d">${host}</span></span></a>`;}).join(''); d.innerHTML=`<div class="rh"><i class="ti ti-book"></i>Resources &amp; further reading</div>${links}`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
+
+/* ---------------- live ask (answered in-app by Claude in the background) ---------------- */
+function askBoxHTML(scopeLabel){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered live, right here.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div></div>`; }
+function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(!go)return; go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); }
+function submitAsk(scopeId){
+  const ta=document.getElementById('askText'); const txt=(ta.value||'').trim(); if(!txt)return;
+  const p=DATA[state.prob];
+  const scopeName= scopeId==='system' ? 'the overall system' : (p.nodes.find(n=>n.id===scopeId)||{}).name || scopeId;
+  const revealed=p.nodes.filter(n=>state.revealed.has(n.id)).map(n=>n.name).join(', ');
+  const id='q_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
+  const ctx=`Mock interview problem: "${p.title}". Phase: ${PHASE_META[state.phase-1].lbl}. Focus: ${scopeName}. Components on the board: ${revealed}. Difficulty: ${state.diff}.`;
+  addBubble('you',`<span style="color:var(--muted);font-size:11px">[your question · ${scopeName}]</span><br>${txt}`);
+  const t=document.getElementById('transcript'); const live=document.createElement('div'); live.className='bubble cand live'; live.id='live-'+id;
+  live.innerHTML=`<div class="who"><span class="av">C</span>Candidate</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  t.appendChild(live); t.scrollTop=t.scrollHeight; ta.value='';
+  fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,q:txt,ctx})}).catch(()=>{});
+  pollAnswer(id,0);
+}
+function pollAnswer(id,tries){
+  if(tries>90){ const el=document.getElementById('live-'+id); if(el)el.querySelector('.body').innerHTML="<em>Still thinking — the answer will appear here shortly. (If it doesn't, Claude may not be actively watching this session.)</em>"; return; }
+  fetch('/poll').then(r=>r.json()).then(m=>{ if(m[id]){ const el=document.getElementById('live-'+id); if(el){ const md=m[id].replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>'); el.querySelector('.body').innerHTML=md; el.classList.remove('live'); const t=document.getElementById('transcript'); t.scrollTop=t.scrollHeight; } } else setTimeout(()=>pollAnswer(id,tries+1),1500); }).catch(()=>setTimeout(()=>pollAnswer(id,tries+1),1500));
+}
+
+document.getElementById('resetBtn').onclick=()=>{ if(state.prob)startInterview(state.prob); };
+document.getElementById('changeBtn').onclick=()=>{ renderSetup(); };
+renderSetup();
+</script>
+</body>
+</html>
