@@ -90,6 +90,18 @@
   .bubble.flow .body{border-left-color:var(--accent2);background:#161327}
   .bubble.flow .body ol{margin:4px 0;padding-left:20px}.bubble.flow .body li{margin:5px 0}
   .bubble.flow .body .comp{color:#c3b6ff;font-weight:600}
+  .bubble.model .body{border-left-color:#7ad;background:#0f1a22}
+  .bubble.model .who{color:#7ad}
+  .answerbox{margin:4px 0 16px;border:1px solid var(--accent2);border-radius:10px;padding:10px;background:#141026;display:flex;gap:8px}
+  .answerbox textarea{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 11px;font-size:13px;min-height:46px;font-family:inherit;resize:vertical}
+  .answerbox textarea:focus{outline:none;border-color:var(--accent)}
+  .answerbox .go{background:var(--accent2);border:none;color:#fff;border-radius:8px;padding:0 14px;cursor:pointer;font-weight:600;white-space:nowrap}
+  .answerbox .go:hover{background:#6a4ce0}
+  .quizprompt{margin:-2px 0 16px}
+  .quizprompt button{background:none;border:1px dashed var(--accent2);color:#c3b6ff;border-radius:8px;padding:7px 13px;cursor:pointer;font-size:12.5px}
+  .quizprompt button:hover{background:#1a1430}
+  .askbox .quizme{background:none;border:1px dashed var(--accent2);color:#c3b6ff;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:12px;display:inline-flex;align-items:center;gap:5px}
+  .askbox .quizme:hover{background:#1a1430}
 
   .panel{margin-top:18px}
   .panel .empty{color:var(--muted);font-size:14px;padding:20px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
@@ -167,6 +179,7 @@
     <div class="sub" id="subtitle">Pick a difficulty and a problem to begin. You are the interviewer.</div>
   </div>
   <div style="display:flex;gap:10px">
+    <button class="btn" id="mockBtn" style="display:none">Mock test</button>
     <button class="btn" id="resetBtn" style="display:none">Reset problem</button>
     <button class="btn" id="changeBtn" style="display:none">Change problem</button>
   </div>
@@ -221,7 +234,7 @@ function availablePhases(p){return PHASE_META.filter(m=> m.key==='q' ? Object.ke
 /* ---------------- setup ---------------- */
 function renderSetup(){
   interviewEl.style.display='none'; setupEl.style.display='block';
-  document.getElementById('resetBtn').style.display='none'; document.getElementById('changeBtn').style.display='none';
+  document.getElementById('mockBtn').style.display='none'; document.getElementById('resetBtn').style.display='none'; document.getElementById('changeBtn').style.display='none';
   subtitle.textContent="Pick a difficulty and a problem to begin. You are the interviewer.";
   let html=`<div class="setup"><h2>1 · Choose difficulty</h2><div class="diff-row">`;
   for(const[k,v]of Object.entries(DIFF_INFO)) html+=`<div class="diff ${state.diff===k?'sel':''}" data-diff="${k}"><h3><span class="dot" style="background:${v.dot}"></span>${v.name}</h3><p>${v.desc}</p></div>`;
@@ -244,7 +257,7 @@ function startInterview(pk){
   state.phase=avail[0].n;
   state.revealed=new Set(basicSet(p));
   setupEl.style.display='none'; interviewEl.style.display='block';
-  document.getElementById('resetBtn').style.display='inline-block'; document.getElementById('changeBtn').style.display='inline-block';
+  document.getElementById('mockBtn').style.display='inline-block'; document.getElementById('resetBtn').style.display='inline-block'; document.getElementById('changeBtn').style.display='inline-block';
   subtitle.innerHTML=`<strong>${p.title}</strong> · Difficulty: <span style="color:${DIFF_INFO[state.diff].dot}">${DIFF_INFO[state.diff].name}</span>`;
   interviewEl.innerHTML=`
     <div id="stepper" class="stepper"></div>
@@ -403,7 +416,7 @@ function renderDives(p){
   dives.forEach((s,i)=>{ const d=state.diveDone[i]; const tag=s.tag||'scaling';
     const rev=(s.reveal&&s.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
     html+=`<button class="item" data-i="${i}" ${state.playing?'disabled':''}><span class="tchip ${tag}"><i class="ti ${TAGS[tag]?TAGS[tag].icon:'ti-bulb'}"></i> ${tag}</span><span class="qt">${s.title}${rev}${d?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil((s.turns||[]).length/2)}×</span></button>`; });
-  document.getElementById('panel').innerHTML=html+askBoxHTML('the whole system');
+  document.getElementById('panel').innerHTML=html+askBoxHTML('the whole system','system');
   document.getElementById('ptip').innerHTML='These evolve the architecture. Next: <b>Component deep dives</b> to drill each box.';
   document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playDive(parseInt(el.dataset.i)); });
   wireAsk('system');
@@ -425,7 +438,7 @@ function renderComponents(p){
   all.forEach(q=>{ const gi=p.q[nid].indexOf(q),key=nid+':'+gi,asked=state.asked[key],dis=asked||(capped&&!asked)||state.playing,tag=q.tag||'concept';
     const rev=(q.reveal&&q.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
     html+=`<button class="item" data-idx="${gi}" ${dis?'disabled':''}><span class="chip ${q.l}">${q.l}</span><span class="tchip ${tag}"><i class="ti ${TAGS[tag]?TAGS[tag].icon:'ti-bulb'}"></i> ${tag}</span><span class="qt">${q.q}${rev}${asked?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil(q.turns.length/2)}×</span></button>`; });
-  html+=askBoxHTML(node.name);
+  html+=askBoxHTML(node.name,nid);
   document.getElementById('panel').innerHTML=html;
   document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.';
   document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
@@ -447,7 +460,7 @@ function playTurns(item, tagLabel, after){
 }
 function playReqStep(i){ const p=DATA[state.prob], s=p.reqBuild[i]; state.reqDone[i]=true; playTurns(s, `[requirement ${i+1}]`); }
 function playDive(i){ const p=DATA[state.prob], s=p.systemDives[i]; state.diveDone[i]=true; playTurns(s, `[system deep dive · ${s.tag||''}]`); }
-function playThread(nid,idx){ const p=DATA[state.prob], item=p.q[nid][idx]; state.asked[nid+':'+idx]=true; state.answeredCount[nid]=(state.answeredCount[nid]||0)+1; const node=p.nodes.find(n=>n.id===nid); playTurns(item, `[${node.name} · ${item.tag||'concept'} · ${item.l}]`); }
+function playThread(nid,idx){ const p=DATA[state.prob], item=p.q[nid][idx]; state.asked[nid+':'+idx]=true; state.answeredCount[nid]=(state.answeredCount[nid]||0)+1; const node=p.nodes.find(n=>n.id===nid); playTurns(item, `[${node.name} · ${item.tag||'concept'} · ${item.l}]`, ()=>appendQuizPrompt(nid, item)); }
 
 let typingEl=null;
 function showTyping(who){ const t=document.getElementById('transcript'); typingEl=document.createElement('div'); typingEl.className=`bubble ${who}`; typingEl.innerHTML=`<div class="who"><span class="av">${who==='intv'?'I':'C'}</span>${who==='intv'?'Interviewer':'Candidate'}</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`; t.appendChild(typingEl); t.scrollTop=t.scrollHeight; }
@@ -457,8 +470,8 @@ function addReveal(names){ const t=document.getElementById('transcript'); const 
 function addResources(list){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='res'; const links=list.map(r=>{let host='';try{host=new URL(r.url).hostname.replace('www.','');}catch(e){} return `<a href="${r.url}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:14px"></i><span>${r.title}<br><span class="d">${host}</span></span></a>`;}).join(''); d.innerHTML=`<div class="rh"><i class="ti ti-book"></i>Resources &amp; further reading</div>${links}`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
 
 /* ---------------- live ask (answered in-app by Claude in the background) ---------------- */
-function askBoxHTML(scopeLabel){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered live, right here.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div></div>`; }
-function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(!go)return; go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); }
+function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered live, right here. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
+function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(go){ go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); } const q=document.getElementById('quizGo'); if(q) q.onclick=()=>quizMe(scopeId); }
 function submitAsk(scopeId){
   const ta=document.getElementById('askText'); const txt=(ta.value||'').trim(); if(!txt)return;
   const p=DATA[state.prob];
@@ -478,8 +491,100 @@ function pollAnswer(id,tries){
   fetch('/poll').then(r=>r.json()).then(m=>{ if(m[id]){ const el=document.getElementById('live-'+id); if(el){ const md=m[id].replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>'); el.querySelector('.body').innerHTML=md; el.classList.remove('live'); const t=document.getElementById('transcript'); t.scrollTop=t.scrollHeight; } } else setTimeout(()=>pollAnswer(id,tries+1),1500); }).catch(()=>setTimeout(()=>pollAnswer(id,tries+1),1500));
 }
 
+/* ---------------- live exchange bridge (shared) ---------------- */
+function liveExchange(opts){
+  const id='q_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
+  const t=document.getElementById('transcript');
+  const who=opts.who||'cand', label=who==='intv'?'Interviewer':'Candidate';
+  const b=document.createElement('div'); b.className='bubble '+who+' live'; b.id='live-'+id;
+  b.innerHTML=`<div class="who"><span class="av">${who==='intv'?'I':'C'}</span>${label}</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  t.appendChild(b); t.scrollTop=t.scrollHeight;
+  fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,q:opts.question,ctx:opts.ctx})}).catch(()=>{});
+  pollExchange(id,0,opts.onDone);
+}
+function pollExchange(id,tries,onDone){
+  if(tries>120){ const el=document.getElementById('live-'+id); if(el)el.querySelector('.body').innerHTML="<em>No live answer yet — this needs the local server running with Claude watching the session.</em>"; return; }
+  fetch('/poll').then(r=>r.json()).then(m=>{ if(m[id]){ const el=document.getElementById('live-'+id); const md=m[id].replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>'); if(el){el.querySelector('.body').innerHTML=md; el.classList.remove('live');} document.getElementById('transcript').scrollTop=1e9; if(onDone)onDone(m[id]); } else setTimeout(()=>pollExchange(id,tries+1,onDone),1500); }).catch(()=>setTimeout(()=>pollExchange(id,tries+1,onDone),1500));
+}
+function renderAnswerBox(onSubmit){
+  removeAnswerBox();
+  const t=document.getElementById('transcript');
+  const d=document.createElement('div'); d.className='answerbox'; d.id='answerbox';
+  d.innerHTML=`<textarea id="ansText" placeholder="Type your answer — you're the candidate now. (Cmd/Ctrl+Enter to submit)"></textarea><button class="go" id="ansGo">Submit ↗</button>`;
+  t.appendChild(d); t.scrollTop=1e9; const ta=document.getElementById('ansText'); ta.focus();
+  document.getElementById('ansGo').onclick=onSubmit;
+  ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') onSubmit(); });
+}
+function removeAnswerBox(){ const e=document.getElementById('answerbox'); if(e)e.remove(); }
+
+/* ---------------- quiz-me (test yourself on a topic) ---------------- */
+function quizMe(scopeId){
+  if(state.playing)return;
+  const p=DATA[state.prob];
+  const node=(scopeId&&scopeId!=='system')?p.nodes.find(n=>n.id===scopeId):null;
+  const scopeName=node?node.name:'the overall system';
+  const revealed=p.nodes.filter(n=>state.revealed.has(n.id)).map(n=>n.name).join(', ');
+  liveExchange({who:'intv', question:'[generate one quiz question]',
+    ctx:`ROLE: You are the interviewer in an SDE-3 system-design mock for "${p.title}". Components on the board: ${revealed}. Ask the candidate ONE focused, non-trivial question that tests their understanding of ${scopeName} (and its scaling/capacity/DB/failure trade-offs where relevant). Output ONLY the question, 1-2 sentences, no preamble, no answer.`,
+    onDone:(qtext)=>{ state.quiz={q:qtext, scope:scopeName}; renderAnswerBox(submitQuizAnswer); }});
+}
+function submitQuizAnswer(){
+  const ta=document.getElementById('ansText'); const v=(ta.value||'').trim(); if(!v)return;
+  removeAnswerBox(); addBubble('you', v);
+  const p=DATA[state.prob];
+  liveExchange({who:'intv', question:v,
+    ctx:`ROLE: interviewer grading a candidate in an SDE-3 mock for "${p.title}". You asked: "${state.quiz.q}". The candidate's answer is in their message. Reply with: a bold one-word verdict (<strong>Correct</strong> / <strong>Partially correct</strong> / <strong>Incorrect</strong>), then 1-3 sentences on what was right and what was missing or wrong, then "<strong>Ideal answer:</strong>" followed by a concise model answer. Encouraging but honest. Address the candidate as "you".`,
+    onDone:()=>{ appendAnotherQuiz(state.quiz.scopeId); }});
+}
+function appendQuizPrompt(nid,item){
+  const t=document.getElementById('transcript');
+  const d=document.createElement('div'); d.className='quizprompt';
+  d.innerHTML=`<button><i class="ti ti-help-circle"></i> Your turn — let me quiz you on this ↳</button>`;
+  t.appendChild(d); d.querySelector('button').onclick=()=>{ d.remove(); quizMe(nid); };
+  t.scrollTop=1e9;
+}
+function appendAnotherQuiz(){ /* keep it to one round; user can click Quiz me again */ }
+
+/* ---------------- mock test ---------------- */
+function startMockTest(){
+  const p=DATA[state.prob];
+  if(!p.mockTest||!p.mockTest.length){ addBubble('intv','No mock test authored for this problem yet.'); return; }
+  state.mock={list:p.mockTest, i:0};
+  addBubble('intv', `<strong>Mock test — ${p.mockTest.length} questions.</strong> I'll ask; you answer as the candidate; I grade each and show the model answer. Ready — here's the first.`);
+  askMockQuestion();
+}
+function askMockQuestion(){
+  const m=state.mock; if(!m)return;
+  if(m.i>=m.list.length){ addBubble('intv', `<strong>That's the set.</strong> You answered all ${m.list.length}. Review the graded answers above; re-run any problem's threads to shore up weak spots. Click <em>Mock test</em> again to retry.`); state.mock=null; return; }
+  const q=m.list[m.i].q;
+  addBubble('intv', `<span style="color:var(--muted);font-size:11px">[mock test · Q${m.i+1}/${m.list.length}]</span><br>${q}`);
+  renderAnswerBox(submitMockAnswer);
+}
+function submitMockAnswer(){
+  const ta=document.getElementById('ansText'); const v=(ta.value||'').trim(); if(!v)return;
+  removeAnswerBox(); addBubble('you', v);
+  const m=state.mock, item=m.list[m.i], p=DATA[state.prob];
+  // instant model answer (always available, offline-safe)
+  const t=document.getElementById('transcript');
+  const mb=document.createElement('div'); mb.className='bubble model';
+  mb.innerHTML=`<div class="who"><span class="av" style="background:#7ad">A</span>Model answer</div><div class="body">${item.a.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')}</div>`;
+  t.appendChild(mb); t.scrollTop=1e9;
+  // live grade of the user's specific answer
+  liveExchange({who:'intv', question:v,
+    ctx:`ROLE: interviewer grading in an SDE-3 mock for "${p.title}". Question: "${item.q}". Model answer: "${item.a}". The candidate's answer is in their message. Reply with a bold verdict (<strong>Correct</strong>/<strong>Partially correct</strong>/<strong>Incorrect</strong>) and 1-3 sentences on what they nailed and what they missed vs the model answer. Address them as "you".`,
+    onDone:()=>{ appendNextMock(); }});
+}
+function appendNextMock(){
+  const t=document.getElementById('transcript');
+  const d=document.createElement('div'); d.className='quizprompt';
+  d.innerHTML=`<button>Next question ▶</button>`;
+  t.appendChild(d); d.querySelector('button').onclick=()=>{ d.remove(); state.mock.i++; askMockQuestion(); };
+  t.scrollTop=1e9;
+}
+
 document.getElementById('resetBtn').onclick=()=>{ if(state.prob)startInterview(state.prob); };
 document.getElementById('changeBtn').onclick=()=>{ renderSetup(); };
+document.getElementById('mockBtn').onclick=()=>{ if(state.prob&&!state.playing) startMockTest(); };
 renderSetup();
 </script>
 </body>
