@@ -17,6 +17,17 @@ window.DATA['proximity'] = {
   edges:[["client","gw"],["gw","match"],["match","db"],["gw","location"],["location","index"],["match","index"],["match","notify"]],
   core:["client","gw","match","db"],
   basic:["client","gw","match","db"],
+  dbDoc:{
+    component:"Location store",
+    load:"~250K location writes/s (blind latest-wins overwrites, one tiny record each) + ~20K nearby geo-queries/s (peak ~80K reads/s) + ~1M current driver positions held in memory (working set only ~150MB). Access = point write by driverId and point-radius search — no joins, no history, no range scans.",
+    candidates:[
+      {name:"In-memory KV with native geo (Redis GEO)",ceiling:"~100K GEOADD/GEOSEARCH ops/s per node before latency climbs",nodes:"250K writes/s &divide; ~100K/node &asymp; 3 write shards, &times;2 for primary + AZ replica &asymp; <strong>6 nodes</strong>; peak ~80K reads/s ride the same shards as headroom",pick:true,note:"chosen — the only option with a native point-radius primitive, fewest nodes, and it spends zero effort on a durability guarantee the ~4s self-healing position stream already provides."},
+      {name:"PostGIS (Postgres + GiST spatial index)",ceiling:"~5-10K fsync-backed writes/s per node",nodes:"250K &divide; ~8K/node &asymp; <strong>30+ write nodes</strong>, and constant lat/lng updates bloat the GiST index and pile on vacuum",pick:false,note:"durable, but every write is an fsync-backed row update that churns the spatial index — you fight vacuum to stand still, serving data that does not need to survive."},
+      {name:"Cassandra (LSM wide-column)",ceiling:"~30-50K writes/s per node",nodes:"250K &divide; ~40K/node &asymp; <strong>6-7 nodes</strong> for writes alone",pick:false,note:"absorbs writes well, but has no native radius query and latest-wins overwrites become a stream of LSM inserts that generate tombstones and heavy compaction for data that lives ~15s."},
+    ],
+    indexing:"Bucket every position by its cell: map lat/lng to a <strong>geohash prefix / H3 cell</strong> and keep a <code>cell &rarr; set of driverIds</code> mapping (Redis GEO does this under the hood as a geohash-scored sorted set). A radius query becomes a handful of <strong>cell lookups</strong>, not a scan — compute the rider's cell plus its neighbor ring, union the driverIds in those few cells, then run exact haversine only on that small candidate set.<span class='eg'>2km radius over ~1km cells &rarr; ~9 cell lookups returning a few dozen candidates, versus haversine over all 1M rows.</span>A <code>TTL</code> ~15s auto-evicts stale drivers so a dropped-off position ages out without a sweep. In-memory over durable because a lost position is overwritten by the driver's next report ~4s later — it self-heals, so an fsync/WAL guarantee buys nothing on this hot path.",
+    decision:"Pick an <strong>in-memory KV with native geo (Redis GEO), geo-sharded by density, replica per AZ</strong>. Not PostGIS — its durability and GiST maintenance cap it at ~5-10K writes/s/node, so ~30+ nodes fighting vacuum to serve data that need not survive. Not Cassandra — great write absorption but no native radius query and wasteful compaction on ~15s-lived overwrites. Redis wins on the three axes that matter here: native point-radius, ~100K ops/s/node so the fleet is ~6 nodes, and no wasted effort on a durability guarantee the self-healing stream already provides.",
+  },
   schema:{tables:[
     {name:"drivers",pk:"driver_id",columns:[
       ["driver_id","bigint","driver, primary key"],

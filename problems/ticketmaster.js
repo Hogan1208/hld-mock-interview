@@ -18,6 +18,17 @@ window.DATA['ticketmaster'] = {
   edges:[["client","gw"],["gw","booking"],["booking","db"],["booking","cache"],["gw","queue"],["booking","payment"],["gw","search"]],
   core:["client","gw","booking","db"],
   basic:["client","gw","booking","db"],
+  dbDoc:{
+    component:"Inventory DB",
+    load:"~5-10K single-row conditional writes/s at peak on-sale, spread across one event's ~100K distinct seat rows; the truly contended rate (two buyers on the same hot seat) is a tiny slice. Data is trivial — ~100K seats × ~1KB ≈ 100MB/event. The scarce resource is <strong>correctness under concurrency</strong> (one-seat-one-order), NOT raw throughput or bytes: every candidate below can physically serve this write rate.",
+    candidates:[
+      {name:"Postgres/MySQL (relational, single primary)",ceiling:"~5-10K contended single-row writes/s",nodes:"1 primary + read replicas (replicas don't help writes)",pick:true,note:"chosen — ACID transaction spanning seat + order, row-level <code>SELECT FOR UPDATE</code> and atomic conditional <code>UPDATE</code> enforce the invariant natively; throughput is more than enough for 100MB."},
+      {name:"Cassandra (wide-column)",ceiling:"~10-50K writes/s per node raw, but <code>LWT</code> (Paxos per partition) collapses to ~1-2K/s",nodes:"multi-node, eventually consistent by default",pick:false,note:"eventually consistent by default risks double-selling a seat; its compare-and-set path is slow and can't span seat+order atomically. Its horizontal scale solves a problem we don't have."},
+      {name:"DynamoDB (managed KV)",ceiling:"~1K writes/s per single item/partition key",nodes:"managed / auto-sharded",pick:false,note:"conditional writes on one item are strongly consistent (legit), but multi-item <code>TransactWriteItems</code> is limited &amp; pricey — buying petabyte-scale horizontal throughput for 100MB of data."},
+    ],
+    indexing:"Primary key <code>(event_id, seat_id)</code>; secondary index on <strong>(event_id, status)</strong> to render the seat map (all AVAILABLE for an event) and let the reaper sweep expired holds. Correctness comes from <strong>row-level locking</strong>: <code>SELECT ... FOR UPDATE</code> for pessimistic read-check-write, or an atomic conditional <code>UPDATE seats SET status='HELD' WHERE seat_id=? AND status='AVAILABLE'</code> so the DB serializes writers on the row — exactly one wins, the loser gets a 409.",
+    decision:"Pick a <strong>strongly-consistent relational store (Postgres/MySQL), or a NewSQL store like CockroachDB/Spanner</strong> for managed horizontal scale. Raw throughput can't decide this — every candidate serves ~10K writes/s over 100MB — so the deciding factor is enforcing one-seat-one-order under concurrency, which relational gives natively via ACID transactions spanning seat + order plus row-level locking. I explicitly reject eventually-consistent NoSQL (Cassandra) for the inventory core: a stale replica can hand seat 14A to two buyers; the invariant is a correctness property I won't trade for throughput I don't need.",
+  },
   schema:{tables:[
     {name:"events",pk:"event_id",columns:[
       ["event_id","bigint","primary key"],

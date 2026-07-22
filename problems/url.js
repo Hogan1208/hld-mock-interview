@@ -18,6 +18,17 @@ window.DATA['url'] = {
   edges:[["client","lb"],["lb","svc"],["svc","db"],["svc","cache"],["cache","db"],["svc","key"],["db","replica"],["svc","analytics"]],
   core:["client","lb","svc","db"],
   basic:["client","lb","svc","db"],
+  dbDoc:{
+    component:"Database (mapping store)",
+    load:"~1,160 writes/s (peak ~5K); up to ~116K reads/s on a cold cache (but the cache/replicas absorb ~95%+); ~180B rows ≈ 90TB raw, ×3 replication ≈ 270TB. Access = single-key point lookup, no joins, no range scans.",
+    candidates:[
+      {name:"PostgreSQL (relational)",ceiling:"~5-10K writes/s per primary",nodes:"~1 primary + read replicas; 270TB forces bolt-on sharding across many nodes",pick:false,note:"we need no joins/transactions and it tops out on write throughput + storage on a single primary; sharding is a bolt-on you operate by hand."},
+      {name:"Cassandra / ScyllaDB (wide-column)",ceiling:"~10-50K writes/s per node",nodes:"storage-bound: 270TB ÷ ~2TB usable/node ≈ <strong>135 nodes</strong> (throughput needs far fewer)",pick:false,note:"excellent fit — linear scale, hash partitioning, tunable consistency; the runner-up, chosen if you want to self-host."},
+      {name:"DynamoDB (managed KV)",ceiling:"~1K WCU &amp; ~3K RCU per partition, auto-splits",nodes:"managed / auto-sharded; provision ~5K WCU + rely on cache for reads",pick:true,note:"chosen — pure point-lookup KV, <code>conditional writes</code> give strong uniqueness for custom aliases, TTL for expiry, and zero sharding ops."},
+    ],
+    indexing:"Primary key = <code>short_key</code>, <strong>hash-partitioned</strong>, so every read and write resolves to exactly one partition in O(1) — no secondary index needed for the core path. A reverse index on <code>hash(long_url)</code> (for dedupe) would <em>double</em> write cost and risk a hot partition, so skip it unless dedupe is a hard requirement. Expiry is a <code>TTL</code> attribute the store reclaims lazily — never a scan. Because consecutive counter-derived keys hash to different partitions, writes spread evenly (no monotonic-key hotspot).",
+    decision:"Pick a <strong>hash-partitioned KV / wide-column store</strong> (DynamoDB managed, or Cassandra self-hosted). The workload is a single-key point lookup with no joins needing horizontal write-scale and ~270TB — exactly what KV stores are built for, and exactly where a relational primary (~5-10K writes/s, manual sharding) struggles. The store is sized by <strong>storage (~135 nodes)</strong>, not read QPS, because the cache + replicas absorb the read fan-out. The one spot needing strong consistency — custom-alias uniqueness — is covered by DynamoDB conditional writes / a Cassandra LWT, not by adopting a relational DB wholesale.",
+  },
   schema:{tables:[
     {name:"urls",pk:"short_key",columns:[
       ["short_key","varchar(11)","base62 key, primary key"],

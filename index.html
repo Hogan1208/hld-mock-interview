@@ -87,6 +87,14 @@
   .schemaBox .rows{margin-top:2px}
   .schemaBox .rows caption{caption-side:top;text-align:left;font-size:10.5px;color:var(--muted);padding:6px 9px 2px}
   .schemaBox .rows td{font-family:ui-monospace,Menlo,monospace;color:#cdd8e3;font-size:11px}
+  .schemaBox .dbreq{padding:8px 11px;font-size:12px;color:var(--text);border-top:1px solid var(--line);background:#0e1116}
+  .schemaBox td .pick{color:var(--cand);font-weight:600}
+  .schemaBox td .rej{color:var(--muted)}
+  .schemaBox .dbsec{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;color:#cdd8e3;line-height:1.6}
+  .schemaBox .dbsec h6{margin:0 0 6px;font-size:12px;color:#c3b6ff;display:flex;align-items:center;gap:6px;font-weight:600}
+  .schemaBox .dbsec.decision{border-color:#234b3a;background:#12211b}
+  .schemaBox .dbsec.decision h6{color:var(--cand)}
+  .schemaBox .dbsec code{background:#0e1116;padding:1px 5px;border-radius:4px;color:#7ad;font-size:11.5px}
   .bubble.flow .body{border-left-color:var(--accent2);background:#161327}
   .bubble.flow .body ol{margin:4px 0;padding-left:20px}.bubble.flow .body li{margin:5px 0}
   .bubble.flow .body .comp{color:#c3b6ff;font-weight:600}
@@ -222,7 +230,7 @@ const PHASE_META = [
 
 let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
   reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null,
-  flowNode:null, showSchema:false};
+  flowNode:null, showSchema:false, showDbDoc:false};
 
 const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
 
@@ -267,6 +275,7 @@ function startInterview(pk){
           <div class="difftools" id="difftools"></div>
           <div class="diagram" id="diagram"></div>
           <div class="schemaBox" id="schemaBox" style="display:none"></div>
+          <div class="schemaBox" id="dbDocBox" style="display:none"></div>
         </div>
         <div class="panel" id="panel"></div>
         <div class="tip" id="ptip"></div>
@@ -307,6 +316,8 @@ function renderDifftools(){
   let html='';
   if(p.schema&&p.schema.tables&&p.schema.tables.length)
     html+=`<button id="schemaBtn" class="${state.showSchema?'on':''}"><i class="ti ti-table"></i> Data model</button>`;
+  if(p.dbDoc)
+    html+=`<button id="dbDocBtn" class="${state.showDbDoc?'on':''}"><i class="ti ti-database-cog"></i> DB decision</button>`;
   if(p.flows&&p.flows.length){
     html+=`<span class="lab">Walk a flow:</span>`;
     p.flows.forEach(f=>{ html+=`<button class="flowbtn" data-flow="${f.id}" ${state.playing?'disabled':''}><i class="ti ti-player-play"></i> ${f.name}</button>`; });
@@ -314,11 +325,30 @@ function renderDifftools(){
   if(!html) html=`<span class="lab">Click a component below to drill in.</span>`;
   el.innerHTML=html;
   const sb=document.getElementById('schemaBtn'); if(sb) sb.onclick=toggleSchema;
+  const db=document.getElementById('dbDocBtn'); if(db) db.onclick=toggleDbDoc;
   el.querySelectorAll('.flowbtn').forEach(b=>b.onclick=()=>{ if(!state.playing) walkFlow(b.dataset.flow); });
 }
 function toggleSchema(){ state.showSchema=!state.showSchema; const box=document.getElementById('schemaBox');
-  if(state.showSchema){ renderSchema(); box.style.display='block'; } else box.style.display='none';
+  if(state.showSchema){ state.showDbDoc=false; const d=document.getElementById('dbDocBox'); if(d)d.style.display='none'; renderSchema(); box.style.display='block'; } else box.style.display='none';
   renderDifftools();
+}
+function toggleDbDoc(){ state.showDbDoc=!state.showDbDoc; const box=document.getElementById('dbDocBox');
+  if(state.showDbDoc){ state.showSchema=false; const s=document.getElementById('schemaBox'); if(s)s.style.display='none'; renderDbDoc(); box.style.display='block'; } else box.style.display='none';
+  renderDifftools();
+}
+function renderDbDoc(){
+  const p=DATA[state.prob], box=document.getElementById('dbDocBox'), d=p.dbDoc; if(!d){box.innerHTML='';return;}
+  let html=`<div class="tbl"><div class="tname"><span><i class="ti ti-database-cog"></i> Datastore decision · ${d.component||''}</span></div>`;
+  html+=`<div class="dbreq"><strong>Load to serve:</strong> ${d.load||''}</div>`;
+  html+=`<table><tr><th style="width:22%">option</th><th style="width:22%">per-node ceiling</th><th style="width:16%">nodes needed</th><th>verdict &amp; why</th></tr>`;
+  (d.candidates||[]).forEach(c=>{
+    const v=c.pick?`<span class="pick"><i class="ti ti-check"></i> chosen</span>`:`<span class="rej">not chosen</span>`;
+    html+=`<tr><td class="col">${c.name}</td><td class="typ">${c.ceiling||''}</td><td class="typ">${c.nodes||''}</td><td class="note">${v} — ${c.note||''}</td></tr>`;
+  });
+  html+=`</table></div>`;
+  if(d.indexing) html+=`<div class="dbsec"><h6><i class="ti ti-list-search"></i> Indexing</h6><div>${d.indexing}</div></div>`;
+  if(d.decision) html+=`<div class="dbsec decision"><h6><i class="ti ti-gavel"></i> Decision</h6><div>${d.decision}</div></div>`;
+  box.innerHTML=html;
 }
 function renderSchema(){
   const p=DATA[state.prob], box=document.getElementById('schemaBox');
