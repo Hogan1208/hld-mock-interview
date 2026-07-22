@@ -548,44 +548,70 @@ function renderAnswerBox(onSubmit){
 function removeAnswerBox(){ const e=document.getElementById('answerbox'); if(e)e.remove(); }
 
 /* ---------------- quiz-me (test yourself on a topic) ---------------- */
+/* Token-lean: questions + model answers are pre-authored (0 tokens). Only the
+   optional "Ask AI to grade" button spends tokens (one live call), on demand. */
+function pickCanned(){
+  const p=DATA[state.prob], bank=(p.mockTest||[]);
+  if(!bank.length) return null;
+  state.quizUsed=state.quizUsed||new Set();
+  let pool=bank.map((x,i)=>i).filter(i=>!state.quizUsed.has(i));
+  if(!pool.length){ state.quizUsed=new Set(); pool=bank.map((x,i)=>i); }
+  const idx=pool[Math.floor(Math.random()*pool.length)];
+  state.quizUsed.add(idx); return bank[idx];
+}
+function showModelAnswer(a){
+  const t=document.getElementById('transcript');
+  const mb=document.createElement('div'); mb.className='bubble model';
+  mb.innerHTML=`<div class="who"><span class="av" style="background:#7ad">A</span>Model answer</div><div class="body">${(a||'').replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')}</div>`;
+  t.appendChild(mb); t.scrollTop=1e9;
+}
+function offerActions(item,userAns,withNext){
+  const t=document.getElementById('transcript');
+  const d=document.createElement('div'); d.className='quizprompt';
+  d.innerHTML=`<button class="g"><i class="ti ti-robot"></i> Ask AI to grade my answer ↳ <span style="color:var(--muted)">(uses tokens)</span></button>${withNext?` <button class="n">Next question ▶</button>`:''}`;
+  t.appendChild(d);
+  d.querySelector('.g').onclick=()=>{ const g=d.querySelector('.g'); g.remove(); gradeWithAI(item.q,item.a,userAns); };
+  const n=d.querySelector('.n'); if(n) n.onclick=()=>{ d.remove(); state.mock.i++; askMockQuestion(); };
+  t.scrollTop=1e9;
+}
+function gradeWithAI(q,a,v){
+  const p=DATA[state.prob];
+  liveExchange({who:'intv', question:v,
+    ctx:`ROLE: interviewer grading in an SDE-3 mock for "${p.title}". Question: "${q}". Model answer: "${a}". The candidate's answer is in their message. Reply with a bold verdict (<strong>Correct</strong>/<strong>Partially correct</strong>/<strong>Incorrect</strong>) and 1-3 sentences on what they nailed and what they missed vs the model answer. Address them as "you".`});
+}
 function quizMe(scopeId){
   if(state.playing)return;
-  const p=DATA[state.prob];
-  const node=(scopeId&&scopeId!=='system')?p.nodes.find(n=>n.id===scopeId):null;
-  const scopeName=node?node.name:'the overall system';
-  const revealed=p.nodes.filter(n=>state.revealed.has(n.id)).map(n=>n.name).join(', ');
-  liveExchange({who:'intv', question:'[generate one quiz question]',
-    ctx:`ROLE: You are the interviewer in an SDE-3 system-design mock for "${p.title}". Components on the board: ${revealed}. Ask the candidate ONE focused, non-trivial question that tests their understanding of ${scopeName} (and its scaling/capacity/DB/failure trade-offs where relevant). Output ONLY the question, 1-2 sentences, no preamble, no answer.`,
-    onDone:(qtext)=>{ state.quiz={q:qtext, scope:scopeName}; renderAnswerBox(submitQuizAnswer); }});
+  const item=pickCanned();
+  if(!item){ addBubble('intv','No question bank for this problem yet.'); return; }
+  state.quiz=item;
+  addBubble('intv', `<span style="color:var(--muted);font-size:11px">[quiz]</span><br>${item.q}`);
+  renderAnswerBox(submitQuizAnswer);
 }
 function submitQuizAnswer(){
   const ta=document.getElementById('ansText'); const v=(ta.value||'').trim(); if(!v)return;
   removeAnswerBox(); addBubble('you', v);
-  const p=DATA[state.prob];
-  liveExchange({who:'intv', question:v,
-    ctx:`ROLE: interviewer grading a candidate in an SDE-3 mock for "${p.title}". You asked: "${state.quiz.q}". The candidate's answer is in their message. Reply with: a bold one-word verdict (<strong>Correct</strong> / <strong>Partially correct</strong> / <strong>Incorrect</strong>), then 1-3 sentences on what was right and what was missing or wrong, then "<strong>Ideal answer:</strong>" followed by a concise model answer. Encouraging but honest. Address the candidate as "you".`,
-    onDone:()=>{ appendAnotherQuiz(state.quiz.scopeId); }});
+  showModelAnswer(state.quiz.a);
+  offerActions(state.quiz, v, false);
 }
 function appendQuizPrompt(nid,item){
   const t=document.getElementById('transcript');
   const d=document.createElement('div'); d.className='quizprompt';
-  d.innerHTML=`<button><i class="ti ti-help-circle"></i> Your turn — let me quiz you on this ↳</button>`;
+  d.innerHTML=`<button><i class="ti ti-help-circle"></i> Your turn — quiz me on this ↳</button>`;
   t.appendChild(d); d.querySelector('button').onclick=()=>{ d.remove(); quizMe(nid); };
   t.scrollTop=1e9;
 }
-function appendAnotherQuiz(){ /* keep it to one round; user can click Quiz me again */ }
 
-/* ---------------- mock test ---------------- */
+/* ---------------- mock test (pre-authored; grading optional) ---------------- */
 function startMockTest(){
   const p=DATA[state.prob];
   if(!p.mockTest||!p.mockTest.length){ addBubble('intv','No mock test authored for this problem yet.'); return; }
   state.mock={list:p.mockTest, i:0};
-  addBubble('intv', `<strong>Mock test — ${p.mockTest.length} questions.</strong> I'll ask; you answer as the candidate; I grade each and show the model answer. Ready — here's the first.`);
+  addBubble('intv', `<strong>Mock test — ${p.mockTest.length} questions.</strong> Answer each as the candidate; you'll see the model answer instantly (free), and can optionally ask me to grade your specific answer. Here's the first.`);
   askMockQuestion();
 }
 function askMockQuestion(){
   const m=state.mock; if(!m)return;
-  if(m.i>=m.list.length){ addBubble('intv', `<strong>That's the set.</strong> You answered all ${m.list.length}. Review the graded answers above; re-run any problem's threads to shore up weak spots. Click <em>Mock test</em> again to retry.`); state.mock=null; return; }
+  if(m.i>=m.list.length){ addBubble('intv', `<strong>That's the set.</strong> You worked through all ${m.list.length}. Compare your answers to the model answers above, and re-run any component's threads to shore up weak spots. Click <em>Mock test</em> again to retry.`); state.mock=null; return; }
   const q=m.list[m.i].q;
   addBubble('intv', `<span style="color:var(--muted);font-size:11px">[mock test · Q${m.i+1}/${m.list.length}]</span><br>${q}`);
   renderAnswerBox(submitMockAnswer);
@@ -593,23 +619,9 @@ function askMockQuestion(){
 function submitMockAnswer(){
   const ta=document.getElementById('ansText'); const v=(ta.value||'').trim(); if(!v)return;
   removeAnswerBox(); addBubble('you', v);
-  const m=state.mock, item=m.list[m.i], p=DATA[state.prob];
-  // instant model answer (always available, offline-safe)
-  const t=document.getElementById('transcript');
-  const mb=document.createElement('div'); mb.className='bubble model';
-  mb.innerHTML=`<div class="who"><span class="av" style="background:#7ad">A</span>Model answer</div><div class="body">${item.a.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')}</div>`;
-  t.appendChild(mb); t.scrollTop=1e9;
-  // live grade of the user's specific answer
-  liveExchange({who:'intv', question:v,
-    ctx:`ROLE: interviewer grading in an SDE-3 mock for "${p.title}". Question: "${item.q}". Model answer: "${item.a}". The candidate's answer is in their message. Reply with a bold verdict (<strong>Correct</strong>/<strong>Partially correct</strong>/<strong>Incorrect</strong>) and 1-3 sentences on what they nailed and what they missed vs the model answer. Address them as "you".`,
-    onDone:()=>{ appendNextMock(); }});
-}
-function appendNextMock(){
-  const t=document.getElementById('transcript');
-  const d=document.createElement('div'); d.className='quizprompt';
-  d.innerHTML=`<button>Next question ▶</button>`;
-  t.appendChild(d); d.querySelector('button').onclick=()=>{ d.remove(); state.mock.i++; askMockQuestion(); };
-  t.scrollTop=1e9;
+  const item=state.mock.list[state.mock.i];
+  showModelAnswer(item.a);
+  offerActions(item, v, true);
 }
 
 document.getElementById('resetBtn').onclick=()=>{ if(state.prob)startInterview(state.prob); };
