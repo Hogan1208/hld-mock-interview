@@ -206,6 +206,15 @@ window.DATA['filesync'] = {
         {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
         {title:"Dropbox: inside the Magic Pocket",url:"https://dropbox.tech/infrastructure/inside-the-magic-pocket"},
       ]},
+      {l:"medium",tag:"capacity",q:"How heavy is the sync agent on a normal machine?",turns:[
+        {who:"intv",text:"Concrete numbers on the client itself. For a typical user, how big is the local index, how many watches, and how much work is hashing?"},
+        {who:"cand",text:"Size it from a typical user of ~50K files averaging 1MB — ~50GB synced. The <strong>local index</strong> stores path, size, mtime, and hash per file — roughly 100 bytes each. Watches are per-<em>directory</em>, not per-file. Hashing only runs on changed files.<span class='eg'>Index: 50K files × 100B ≈ 5MB SQLite — trivial. Initial full hash of 50GB at ~500MB/s ≈ 100s, one-time. Steady state: a 1MB edit re-hashes in ~2ms.</span>So the resident footprint is tiny; the only heavy moment is the first full index."},
+        {who:"intv",text:"Now a power user with 500GB and millions of files — does the agent still stay light?"},
+        {who:"cand",text:"The index scales linearly and stays fine — 2M files × 100B ≈ 200MB — but the <strong>initial hash of 500GB at ~500MB/s ≈ 17 minutes</strong> of CPU and disk is very noticeable if I run it flat out. So the trade-off is first-sync speed versus not pinning the user's machine. Decision: I throttle hashing to a fraction of cores, index lazily in the background at low IO priority, and persist the index so it is a strict one-time cost. I trade a slower initial sync for an agent that never hijacks the laptop; steady state stays event-driven and near-free."},
+      ],resources:[
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     gw:[
       {l:"medium",tag:"concept",q:"What does the sync service actually do?",turns:[
@@ -242,6 +251,15 @@ window.DATA['filesync'] = {
       ],resources:[
         {title:"Dropbox: inside the Magic Pocket",url:"https://dropbox.tech/infrastructure/inside-the-magic-pocket"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many API + sync instances do you run?",turns:[
+        {who:"intv",text:"Numbers now. You quoted ~115K change events/s at peak 3-5x, plus every device syncing. How many API + sync-service instances, and show the math."},
+        {who:"cand",text:"I size the <strong>metadata / control plane</strong> on request rate; the data plane needs no instances because bytes go direct-to-storage over pre-signed URLs. The service is stateless — accept a tree delta, return changes-since — so a 4-core instance handles maybe ~5K req/s.<span class='eg'>Commits: 115K/s × 4 peak ≈ 460K/s; add sync-pull reads → call it ~500K rps. ÷5K rps/instance ≈ 100 instances; +30% headroom ≈ 130. Byte uploads bypass the fleet entirely → 0 instances for content.</span>So ~130 metadata instances at peak, spread across at least 3 AZs."},
+        {who:"intv",text:"130 feels like a lot for forwarding tiny commits. What cuts it?"},
+        {who:"cand",text:"The count is dominated by how many sync reads actually reach the fleet, and two levers slash that. Direct-to-storage already removes the expensive byte path, and the <strong>notification service</strong> turns constant polling into event-driven pokes, so sync reads collapse from a naive every-few-seconds poll to roughly one read per real change. Decision: size to survive the poll-heavy worst case but keep a <strong>warm floor</strong> (~40 across AZs) and autoscale above it — steady state is far lower once pokes and per-namespace caching land. The trade-off is provisioning cost versus autoscale lag on a sudden spike."},
+      ],resources:[
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
       ]},
     ],
     meta:[
@@ -280,6 +298,15 @@ window.DATA['filesync'] = {
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the metadata-service fleet — commits vs sync reads.",turns:[
+        {who:"intv",text:"How many metadata-service instances, and what QPS must they serve — separate commits from sync reads."},
+        {who:"cand",text:"It is read-dominated. Commits are ~115K/s × 4 peak ≈ 460K/s. Sync reads are the bigger unknown: 100M devices asking changes-since. An instance does maybe ~6K rps of these light ops.<span class='eg'>If each of 100M devices syncs ~once/min on average → ~1.6M reads/s cold; ÷6K rps ≈ ~270 instances pre-cache. Commits ~460K/s ≈ ~80 instances. Post-cache the shared-folder herd collapses to one cached read per namespace+cursor → ~50-80 instances.</span>"},
+        {who:"intv",text:"Those sync reads swing wildly with cache-hit ratio — how do you plan capacity you cannot pin?"},
+        {who:"cand",text:"The count is a function of the changes-since cache-hit ratio: that response is <strong>immutable and identical per namespace+cursor</strong>, so it caches almost perfectly, and jittered pokes spread the herd over seconds. Decision: size the fleet to survive a <strong>cold cache</strong> (a few hundred instances), but run a warm floor with read replicas absorbing reads and autoscale down — the honest steady state is low-tens once caching works. The trade-off is paying for worst-case provisioning versus risk during a cache flush, so I keep the floor rather than trust autoscale to catch a stampede."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+      ]},
     ],
     db:[
       {l:"medium",tag:"concept",q:"What consistency does the metadata DB need?",turns:[
@@ -316,6 +343,24 @@ window.DATA['filesync'] = {
         {who:"cand",text:"Their client attempts the commit, gets a retryable error (leader unavailable), and <strong>queues it locally</strong> — the sync agent already buffers changes and retries, so from the user's side the save is instant to local disk and syncs a few seconds later when the new primary is up. No data loss, just brief added propagation latency on that one shard. This is the CAP trade-off: for metadata writes I choose <strong>consistency over availability</strong> during a partition — a few seconds of retry beats a corrupted or forked file tree. Managed stores that do this fencing internally are why I'd lean on one rather than hand-roll failover."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How much metadata storage, and how many shards/nodes?",turns:[
+        {who:"intv",text:"Size the metadata store. You have trillions of files, each with versions. How many rows, how much storage, and how many shards/nodes?"},
+        {who:"cand",text:"Rows first, then throughput, and I take the max.<span class='eg'>~1 trillion files × ~5 versions ≈ 5 trillion version rows; at ~200 B/row ≈ 1 PB; × 3-way replication ≈ 3 PB; at ~2 TB usable/node ≈ ~1,500 nodes for space alone. Throughput: ~460K commits/s peak plus sync reads — reads lean on replicas and cache, commits drive the write sizing.</span>Storage dominates, so I provision on the order of ~1,500 nodes, sharded by namespace so each commit stays single-shard."},
+        {who:"intv",text:"That is sized for all history kept hot forever — wasteful?"},
+        {who:"cand",text:"Yes — most namespaces are cold and most of the rows are old versions no one reads. Decision: I <strong>tier</strong> the metadata — live tree plus recent versions on the fast sharded cluster, older version rows aged to cheaper storage, and retention policy prunes past the window (decrementing chunk ref counts). That can cut the hot cluster several-fold. The trade-off is a slower path for rare deep-history lookups versus paying to keep trillions of stale version rows on fast nodes; since deep history is rarely touched, the cliff is acceptable."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+      ]},
+      {l:"hard",tag:"concept",q:"Which database for the metadata store, and why?",turns:[
+        {who:"intv",text:"You keep calling the metadata store transactional and sharded by namespace. Concretely — which database, and what are the contenders?"},
+        {who:"cand",text:"The workload is the decider: trillions of rows and high write throughput, but every commit is an <strong>atomic multi-row transaction with a compare-and-set</strong> on the namespace version, all within one namespace. Contenders: sharded <strong>Postgres / MySQL</strong> — rock-solid single-shard transactions, but I own sharding, rebalancing, and failover; <strong>Cassandra / DynamoDB</strong> — trivial horizontal scale, but weak multi-row transactions, which fights atomic tree commits and CAS; <strong>Spanner / CockroachDB</strong> — horizontal scale plus distributed ACID and strong consistency built in."},
+        {who:"intv",text:"So pick one, and be honest about the cost."},
+        {who:"cand",text:"Because the per-namespace atomic commit and version CAS are the crux, I want genuine transactions and I do not want to hand-roll sharding and leader election forever — so I lean <strong>Spanner / CockroachDB-class</strong>: it gives ACID, horizontal scale, and built-in quorum replication and failover. The cost is money, some lock-in, and cross-region write latency. If I must stay cheap and open-source, sharded Postgres works precisely because commits are single-shard — I just accept operating the sharding myself. I rule out pure Cassandra here: eventual consistency with no cross-row transactions is exactly the property metadata cannot give up."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
       ]},
     ],
     chunk:[
@@ -355,6 +400,15 @@ window.DATA['filesync'] = {
         {title:"rsync algorithm (tech report)",url:"https://rsync.samba.org/tech_report/"},
         {title:"Rolling hash",url:"https://en.wikipedia.org/wiki/Rolling_hash"},
       ]},
+      {l:"medium",tag:"capacity",q:"What CPU does chunking cost — could it centralize?",turns:[
+        {who:"intv",text:"Content-defined chunking runs a rolling hash over every ingested byte. At full ingest scale, what does that cost, and could you run it as a central fleet?"},
+        {who:"cand",text:"The rolling hash is O(1) per byte, but it still has to touch every byte that comes in.<span class='eg'>Ingest: 100M DAU × 100 changes/day × ~1MB ≈ 10 PB/day ≈ ~115 GB/s, peak ×4 ≈ ~460 GB/s. Rolling hash at ~1 GB/s/core → ~460 cores at peak just to chunk, before content hashing or compression.</span>Centralizing that puts a large, byte-in-the-path CPU fleet right on the hot upload path — the opposite of what I want."},
+        {who:"intv",text:"So where does the chunking actually run?"},
+        {who:"cand",text:"Decision: I push chunking and hashing to the <strong>client</strong> — each device chunks its own writes, so those ~460 cores are spread free across 100M machines and bytes go direct-to-storage, never through my fleet. The server-side chunk/dedup box then only does cheap <strong>hash-existence lookups</strong>: ~115K changes/s × a few chunks ≈ a few hundred K lookups/s, a light metadata op, not byte-crunching. The trade-off is I must not trust client-computed hashes blindly, so the block layer re-hashes on commit to verify — a small cost that buys eliminating an entire central CPU tier."},
+      ],resources:[
+        {title:"Content-defined chunking",url:"https://en.wikipedia.org/wiki/Content-defined_chunking"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     block:[
       {l:"medium",tag:"concept",q:"How the block store keeps exabytes.",turns:[
@@ -393,6 +447,24 @@ window.DATA['filesync'] = {
         {title:"Dropbox: inside the Magic Pocket",url:"https://dropbox.tech/infrastructure/inside-the-magic-pocket"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many bytes and nodes does the block store need?",turns:[
+        {who:"intv",text:"Size the block store. 100M-plus users, files ranging to tens of GB. How many bytes end up stored, and how many nodes?"},
+        {who:"cand",text:"Raw, then dedup, then coding overhead.<span class='eg'>~500M users × ~50 GB avg ≈ 25 EB raw; global chunk dedup ~2x → ~12 EB unique; erasure coding 6+3 adds ~1.5x → ~18 EB physical; at ~20 TB/node ≈ ~900K drives worth of capacity.</span>This is inherently an exabyte, cell-based fleet — dedup and erasure coding are exactly what keep it from ballooning to ~75 EB under naive 3x replication."},
+        {who:"intv",text:"That assumes everything sits on fast storage forever. Right-sized?"},
+        {who:"cand",text:"No — most bytes are cold: written once, rarely re-read. Decision: I <strong>tier by access age</strong> — hot and recent chunks on fast media, chunks idle for months migrate to dense cold storage at a fraction of the cost, with erasure coding as the cold durable backbone (1.5x) and hot chunks additionally cached or replicated. The trade-off is a latency cliff on the rare cold read versus a several-fold cost cut. Dedup, tiering, and EC together are what make an exabyte store financially possible at all."},
+      ],resources:[
+        {title:"Dropbox: inside the Magic Pocket",url:"https://dropbox.tech/infrastructure/inside-the-magic-pocket"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"hard",tag:"concept",q:"S3 or self-hosted (Magic Pocket) for the blocks?",turns:[
+        {who:"intv",text:"For those exabytes of immutable chunks — do you build the block store yourself or lean on <strong>S3</strong>? Make the call and give the contenders."},
+        {who:"cand",text:"Two real options. <strong>S3 (or an equivalent object store)</strong>: managed, eleven-nines durability, effectively infinite scale, near-zero ops — but at exabyte scale the bill is enormous and I pay per-request and egress on a hot read path. <strong>Self-hosted, Dropbox Magic-Pocket-style</strong>: a content-addressed store on my own hardware with erasure coding — dramatically cheaper per byte at scale and full control over placement and tiering, but a multi-year engineering and operations investment to reach comparable durability."},
+        {who:"intv",text:"So which, and when?"},
+        {who:"cand",text:"Decision: it is scale-dependent. I <strong>start on S3</strong> — early on, managed durability and zero ops massively outweigh cost and let me ship. I <strong>migrate to self-hosted at exabyte scale</strong>, the exact path Dropbox took, once the storage bill dwarfs the cost of running my own fleet; content-addressing makes the migration safe because chunks are immutable and verifiable by re-hash, so I can copy and check them in the background. The trade-off is capex and engineering risk versus opex savings — which only flips in favor of building once I am genuinely at petabyte-to-exabyte scale, so I would not hand-build on day one."},
+      ],resources:[
+        {title:"Dropbox: inside the Magic Pocket",url:"https://dropbox.tech/infrastructure/inside-the-magic-pocket"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     notif:[
       {l:"easy",tag:"concept",q:"Long-poll vs push for change notifications.",turns:[
@@ -427,6 +499,24 @@ window.DATA['filesync'] = {
         {who:"cand",text:"This is why the notification is a <strong>hint, not a delivery guarantee</strong>, and correctness never depends on any single poke landing. Even if that poke is lost, the device's <strong>background poll</strong> (and its next long-poll re-establishment) will present cursor 41, and the metadata service responds with the 41→42 delta — so it self-corrects on the next poll cycle regardless. The system is designed so a lost notification costs only latency, never correctness, precisely because the cursor makes catch-up idempotent and the device always re-anchors on its own cursor."},
         {who:"intv",text:"So do you even bother making notification delivery reliable, or lean entirely on polling?"},
         {who:"cand",text:"I make it <strong>best-effort but good</strong> — at-least-once poke delivery with retries while the connection is healthy, because most of the time it works and gives the seconds-latency experience users expect. But I deliberately do <em>not</em> build exactly-once or durable per-device queued delivery for pokes — that complexity buys nothing when a cheap periodic poll already guarantees eventual delivery. So: fast path = best-effort push keyed on the cursor; correctness backstop = cursor-based polling. Duplicate pokes are harmless (idempotent re-pull), lost pokes are covered by polling. The effort goes into making the <em>metadata log</em> durable, not the notifications."},
+      ],resources:[
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the notification tier — connections and poke rate.",turns:[
+        {who:"intv",text:"Numbers. 100M devices hold subscriptions. Size the tier — connection memory and the rate of pokes it must emit."},
+        {who:"cand",text:"Connections first, then fan-out.<span class='eg'>100M concurrent long-poll/WebSocket connections; ~10 KB state each ≈ 1 TB RAM in aggregate; a node holding ~250K idle connections under an async/epoll model → 100M ÷ 250K ≈ 400 connection nodes. Poke rate: ~115K commits/s × average fan-out ~3 subscribers ≈ ~350K pokes/s baseline, peak ×4 ≈ ~1.4M/s, with shared folders spiking far above the average.</span>"},
+        {who:"intv",text:"400 nodes just to hold mostly-idle connections is a lot of always-on infra. Can you shrink it?"},
+        {who:"cand",text:"The key observation is that most of those 100M devices are idle — asleep or backgrounded — and do not need seconds-latency pokes. Decision: I keep live push connections only for <strong>foreground / recently-active</strong> devices; backgrounded devices drop the connection and fall back to a slow periodic poll, reconnecting when they wake. If only ~20-30M are live at once, that is ~100 nodes, not 400. The trade-off is slightly staler sync for a sleeping laptop versus paying to hold 100M permanently-open connections — and the device the user is actually watching still gets the live push."},
+      ],resources:[
+        {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"hard",tag:"concept",q:"What do you build the notification backbone on?",turns:[
+        {who:"intv",text:"The thing that fans one namespace-advanced event out to the right connection nodes — what do you build it on? Name the options."},
+        {who:"cand",text:"The backbone takes one namespace-X-advanced event and gets it to the subscribed connection nodes fast, and delivery is best-effort since a lost poke is covered by polling. Options: <strong>Redis Pub/Sub</strong> — dead simple, very low latency, fire-and-forget, no persistence; <strong>Kafka</strong> — durable, ordered, partitioned, great for replay, but heavier per message and built for consumer groups rather than 100M ephemeral fan-out targets; a <strong>managed pub/sub</strong> — a middle ground with less ops."},
+        {who:"intv",text:"Pick one, given what a poke actually needs."},
+        {who:"cand",text:"Decision: because a poke is a tiny, idempotent, best-effort hint and correctness lives in the cursor-based metadata log — not the notification — I do not need Kafka's durability or ordering here; paying for them adds latency and cost for a guarantee I deliberately never rely on. So I lean a <strong>Redis Pub/Sub-style</strong> lightweight bus between the metadata layer and the connection nodes: publish one event keyed by namespace, and nodes subscribed for that shard fan out to their devices. The trade-off I am making is durability for speed and simplicity — I keep Kafka for the data/analytics side where losing events matters, and rely on cursor-based polling as the correctness backstop for pokes."},
       ],resources:[
         {title:"Dropbox: streaming file synchronization",url:"https://dropbox.tech/infrastructure/streaming-file-synchronization"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},

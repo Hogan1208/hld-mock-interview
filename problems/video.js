@@ -245,6 +245,15 @@ window.DATA['video'] = {
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the upload path — bandwidth and how many service instances?",turns:[
+        {who:"intv",text:"Concrete numbers. With ~500 hours of video landing every minute, how much ingest bandwidth is that, and how big does the upload-service fleet have to be to absorb it?"},
+        {who:"cand",text:"The key move is separating the data plane from the control plane. Raw ingest bandwidth is large, but it never touches my service.<span class='eg'>500 video-hours/min = ~8.3 hours/s = 30,000 video-seconds/s; at ~10 Mbps average source bitrate that is ~300 Gbps sustained, peak 3-5x approaching ~1 Tbps.</span>Those bytes go <strong>direct to object storage</strong> via pre-signed URLs, so the fleet never carries that 300 Gbps."},
+        {who:"intv",text:"So what does the upload service actually have to be sized for?"},
+        {who:"cand",text:"Just the <strong>control plane</strong>: initiate, part-tracking, and complete calls.<span class='eg'>~500 hours/min at ~10-min average videos = ~3,000 uploads started/min = ~50 initiates/s, plus completes and status checks — low thousands of req/s even at peak.</span>That is a handful of stateless instances across 3 AZs for redundancy, not for throughput. The trade-off I am rejecting is proxying bytes through the service: simpler to reason about, but it would force a ~1 Tbps app fleet for zero benefit. So I route bytes direct-to-storage and keep the control tier tiny — capacity here is dominated by storage bandwidth, not compute."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
+      ]},
     ],
     storage:[
       {l:"medium",tag:"concept",q:"Object storage for masters and renditions — plus hot vs cold.",turns:[
@@ -282,6 +291,24 @@ window.DATA['video'] = {
       ],resources:[
         {title:"Cloudflare: what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many petabytes a day, and what does that cost you to keep?",turns:[
+        {who:"intv",text:"You said storage grows in petabytes per day. Show me that number from the ingest rate, and tell me what it forces on your storage design."},
+        {who:"cand",text:"It comes straight from ingest times the rendition fan-out.<span class='eg'>500 hours/min = 720K hours/day; a 6-8 rung ladder plus master sums to roughly ~20 Mbps of stored bitrate per video-hour → ~9 GB per video-hour; 720K × 9 GB ≈ 6.5 PB/day, on the order of ~2.4 EB/year.</span>So this is exabyte-scale within a couple of years, and no single cluster or naive 3x replication survives that cost."},
+        {who:"intv",text:"So how do you keep exabytes without the bill exploding?"},
+        {who:"cand",text:"I tier by popularity and pick redundancy per tier. Full <strong>3x replication</strong> gives the fastest reads but triples the footprint — I only pay that for the hot set. The vast cold tail goes to <strong>erasure coding</strong> at ~1.3-1.5x overhead, and to cold/archive classes.<span class='eg'>Replicating 6.5 PB/day at 3x = ~19.5 PB/day of raw disk; erasure-coding the ~90% cold tail cuts that closer to ~8-9 PB/day.</span>The trade-off is that cold-tier reads are slower and reconstruction costs CPU, which is fine because the cold tail is rarely watched — and masters are always retained so any rendition is regenerable. Decision: replicate the hot head, erasure-code and tier the cold tail."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which storage system — cloud object store, HDFS, or self-managed?",turns:[
+        {who:"intv",text:"You keep saying object storage. Be specific — an S3-class cloud object store, HDFS, or a self-run cluster like Ceph or MinIO? Defend the pick against the other two."},
+        {who:"cand",text:"For the bytes I want a <strong>cloud object store (S3-class)</strong>. It is HTTP-native so a CDN pulls segments straight from it, it is ~11-nines durable out of the box, and it scales to exabytes with no capacity planning. <strong>HDFS</strong> is built for high-throughput batch analytics over big blocks, but it is not HTTP-native, the NameNode is a scaling and availability chokepoint, and it is operationally heavy for what is really a serve-blobs-over-HTTP workload. So HDFS solves a problem I do not have."},
+        {who:"intv",text:"And a self-managed Ceph or MinIO cluster — why not own it?"},
+        {who:"cand",text:"That is the real contender at the top end. Self-managed object storage means no per-GB and per-egress fees, which across exabytes and hundreds of Tbps of egress dominate the bill; the cost is you now own durability, rebalancing, and hardware ops.<span class='eg'>Cloud egress fees alone at ~500 Tbps peak would run into millions per day — exactly why Netflix built Open Connect on owned hardware.</span>Trade-off: opex-and-simplicity versus capex-and-control. Decision: start on a cloud object store for durability and zero ops, then migrate the hot, high-egress path onto self-managed storage and edge appliances once scale makes the egress economics worth the capex — a hybrid keyed on volume."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"Netflix Open Connect",url:"https://openconnect.netflix.com/"},
       ]},
     ],
     cdn:[
@@ -330,6 +357,24 @@ window.DATA['video'] = {
         {title:"Cloudflare: what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much egress bandwidth, and how much must the edge absorb?",turns:[
+        {who:"intv",text:"Egress is the number that scares people here. From ~5B views/day, what peak egress does the CDN have to push, and what does that imply?"},
+        {who:"cand",text:"Egress scales with concurrent streams times bitrate, not with views per second.<span class='eg'>5B views/day at a ~10-min average session ≈ 5e9 × 600s / 86,400s ≈ ~35M concurrent streams average; peak 3-5x → ~100-150M concurrent; at ~5 Mbps each that is 100M × 5 Mbps ≈ ~500 Tbps peak egress.</span>Half a petabit per second is far beyond any single origin or the public backbone — so the number itself dictates that delivery must be edge-served."},
+        {who:"intv",text:"So how much of that 500 Tbps is the edge really carrying versus your origin?"},
+        {who:"cand",text:"Nearly all of it. Because segments are immutable and popularity is heavily skewed, a high edge cache-hit ratio means origin only sees misses.<span class='eg'>At a ~95% edge hit ratio, origin egress drops from ~500 Tbps to ~25 Tbps; push it to 99% with pre-positioning and origin sees ~5 Tbps.</span>The trade-off is edge capacity and storage cost versus origin bandwidth: I spend heavily on edge PoPs and ISP appliances precisely so origin bandwidth stays a rounding error. Decision: size the edge for the full ~500 Tbps and size origin only for the miss stream — the whole architecture exists to keep that hit ratio high."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Cloudflare: what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which CDN — buy commercial, build your own, or multi-CDN?",turns:[
+        {who:"intv",text:"For delivery, do you buy a commercial CDN like CloudFront or Akamai, build your own like Netflix Open Connect, or run several? Make the call."},
+        {who:"cand",text:"A <strong>commercial CDN</strong> is the right start: global PoPs on day one, no capex, and you pay per GB delivered. The catch is that per-GB pricing is brutal at video egress scale — at hundreds of Tbps the delivery bill dwarfs everything else. <strong>Building your own</strong> (Open Connect-style appliances placed inside ISP networks) flips that: huge upfront capex and ops, but egress cost collapses and you get last-mile control and better QoE. So it is a classic buy-for-speed versus build-for-unit-economics decision."},
+        {who:"intv",text:"And running more than one CDN at once — worth the complexity?"},
+        {who:"cand",text:"Yes, for resilience and reach. <strong>Multi-CDN</strong> lets the player steer to the healthiest, cheapest path per region and survive a whole CDN degrading, at the cost of integration complexity and split cache efficiency.<span class='eg'>A single CDN at ~500 Tbps peak is both a cost and a single-vendor risk; splitting across 2-3 providers plus owned appliances caps exposure to any one.</span>Decision, staged by scale: launch on one or two commercial CDNs for speed, add client-side multi-CDN steering for resilience, and build owned edge appliances for the popular catalog once egress volume makes the capex pay back — pre-position the head on owned edge, buy commercial capacity for the tail and bursts."},
+      ],resources:[
+        {title:"Netflix Open Connect",url:"https://openconnect.netflix.com/"},
+        {title:"Cloudflare: what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
+      ]},
     ],
     transcode:[
       {l:"hard",tag:"scaling",q:"Encode a 2-hour master into 8 renditions in minutes, not hours.",turns:[
@@ -368,6 +413,15 @@ window.DATA['video'] = {
         {title:"Netflix: video processing with microservices",url:"https://netflixtechblog.com/rebuilding-netflix-video-processing-pipeline-with-microservices-4e5e6310e359"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many encode cores to keep up with uploads?",turns:[
+        {who:"intv",text:"Sizing the encode fleet. With 500 hours of video arriving every minute and a full ladder per title, roughly how many cores do you need to keep pace, and how do you provision them?"},
+        {who:"cand",text:"I size it from encode-work per minute of arriving video.<span class='eg'>500 video-hours/min = 30,000 video-minutes/min; a chunked full-ladder encode costs on the order of ~10 core-minutes per video-minute → ~300,000 cores running continuously just to break even, peak 3-5x → toward ~1M cores.</span>That is tens of thousands of multi-core machines — far too much to sit idle, so how I provision it matters as much as the count."},
+        {who:"intv",text:"So do you reserve that fleet, or something cheaper?"},
+        {who:"cand",text:"Reserving for peak means paying for ~1M idle cores most of the day — safe latency, terrible economics. The alternative is an <strong>elastic, queue-buffered</strong> fleet on <strong>spot/preemptible</strong> capacity: the transcode queue already decouples ingest from processing, so it absorbs bursts while workers scale up, and spot is cheap because jobs are idempotent and retryable so a preemption just redelivers the chunk. The trade-off is that under a big burst the backlog grows and time-to-watchable rises. Decision: run a modest reserved floor for steady state plus elastic spot on top for peaks, and lean on priority lanes so a title's first watchable rung still lands fast even while the fleet catches up."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Netflix: video processing with microservices",url:"https://netflixtechblog.com/rebuilding-netflix-video-processing-pipeline-with-microservices-4e5e6310e359"},
+      ]},
     ],
     meta:[
       {l:"medium",tag:"concept",q:"What lives in metadata, and why is a view count different?",turns:[
@@ -402,6 +456,24 @@ window.DATA['video'] = {
         {who:"cand",text:"Metadata is small relative to the video bytes but far more critical to availability, so I over-protect it cheaply. It's <strong>replicated across AZs with quorum writes</strong>, so a primary disk failure just promotes a healthy replica — no data loss. On top of that, regular <strong>backups plus point-in-time recovery</strong> from the write-ahead log guard against logical corruption, not just disk death. And as a backstop, the core mapping (which renditions exist for a video) is <em>reconstructible</em> by scanning object storage, since the rendition keys follow a deterministic scheme."},
         {who:"intv",text:"Do view counts get the same durability bar as core metadata?"},
         {who:"cand",text:"No — I tier durability by value. <strong>Core metadata</strong> (ownership, rendition map, state) is business-critical and gets the full quorum-plus-backup treatment; losing it makes videos unplayable or unauthorized. <strong>Approximate view counts</strong> can tolerate small loss — they're rebuildable by replaying the Kafka event log, and a few seconds of un-flushed local aggregates lost in a crash is within the fuzz nobody notices. So I don't pay maximum durability for a number that's already approximate, and I spend it where correctness genuinely matters."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How big is metadata, and how many nodes does it need?",turns:[
+        {who:"intv",text:"Size the metadata store. How many rows, how much space, and how many nodes — separate the core metadata from the counters in your answer."},
+        {who:"cand",text:"Core metadata is surprisingly small.<span class='eg'>~500 hours/min at ~10-min videos ≈ ~4M new videos/day; over 5 years ≈ ~8B rows; at ~2 KB per row (title, owner, state, rendition map) ≈ ~16 TB total.</span>That is a modest sharded cluster — a handful of nodes for space, sized more by read QPS than by bytes. Playback lookups track views: ~58K/s average, peak a few hundred K/s, though the cache absorbs almost all of it."},
+        {who:"intv",text:"And the counters — same sizing?"},
+        {who:"cand",text:"No, counters are a write-rate problem, not a storage one.<span class='eg'>5B view increments/day ≈ 58K/s average, and a single hot title can take tens of thousands/s on its own.</span>Storing counts is trivial bytes; absorbing the write rate on a hot row is not. So the trade-off is one shared store sized for the worst-case write hotspot versus splitting them. Decision: keep <strong>core metadata</strong> on a small sharded, replicated cluster tuned for cached point-reads, and push <strong>counters</strong> onto their own sharded/aggregated path — never let counter write volume dictate the core cluster's node count."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which database for metadata — Cassandra or Postgres?",turns:[
+        {who:"intv",text:"Pick the metadata database and defend it. A wide-column store like Cassandra, or a relational store like Postgres?"},
+        {who:"cand",text:"The core access pattern is a <strong>point lookup by video-id</strong> that returns the rendition map, served globally and read-heavy. <strong>Cassandra</strong> (or a managed wide-column store) fits that: linear write and read scale, multi-region multi-master so a lookup is served locally in every region, and tunable consistency. <strong>Postgres</strong> gives me rich queries, joins across owner and tags, and real transactions, but it scales vertically first and a single primary becomes the write and availability chokepoint at global scale."},
+        {who:"intv",text:"But you just said metadata is only ~16 TB — Postgres handles that comfortably. So why not Postgres?"},
+        {who:"cand",text:"True, and if this were single-region with heavy relational querying I would take Postgres for the query power. The deciding factor is <strong>global, always-on reads</strong>: the manifest lookup sits on the playback hot path in every region, and I do not want it round-tripping to one primary continent.<span class='eg'>~16 TB fits one Postgres box, but ~58K+ global lookups/s served from the nearest region does not fit a single-primary topology cleanly.</span>Trade-off: relational query richness versus multi-region read locality and write availability. Decision: a wide-column store (Cassandra-class) for the global rendition-map lookups, with a relational store only if a catalog or search surface needs heavy ad-hoc queries — and counters stay on their own path either way."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
@@ -443,6 +515,15 @@ window.DATA['video'] = {
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"ByteByteGo: system design",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How big a buffer, and what does it cost the client?",turns:[
+        {who:"intv",text:"The player buffers ahead to survive network dips. How much should it hold, and what does that choice cost in memory and startup time?"},
+        {who:"cand",text:"Buffer size is a direct memory and data trade-off.<span class='eg'>30s of 1080p at ~5 Mbps = 30 × 5 Mbit = 150 Mbit ≈ 19 MB held; at 4K ~16 Mbps that is ~60 MB; with ~4s segments a 1080p segment is ~2.5 MB, so 30s is ~7-8 segments prefetched.</span>So a deep buffer is tens of MB of RAM plus data that is wasted if the viewer abandons early — a real cost on mobile and cheap TVs."},
+        {who:"intv",text:"So where do you land, and why not just buffer minutes ahead to be safe?"},
+        {who:"cand",text:"Because a huge buffer hurts the two things that matter most. It raises <strong>startup latency</strong> if I gate playback on filling it, and it wastes bandwidth and battery on abandoned sessions.<span class='eg'>Buffering 2 minutes at 1080p is ~75 MB and delays start; ~20-30s is enough to ride out the typical dip while still starting fast.</span>Trade-off: dip-resilience versus startup speed and waste. Decision: start playback after just one or two small low-rung segments so start-time is sub-2s, then build to a <strong>~20-30s steady-state buffer</strong> and let ABR downshift before it drains — moderate buffer, small startup fetch, quality ramps after playback begins."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Apple: HTTP Live Streaming (HLS)",url:"https://developer.apple.com/streaming/"},
       ]},
     ],
   }

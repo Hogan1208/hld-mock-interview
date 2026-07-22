@@ -211,6 +211,15 @@ window.DATA['feed'] = {
       ],resources:[
         {title:"ByteByteGo — system design patterns",url:"https://bytebytego.com/"},
       ]},
+      {l:"medium",tag:"capacity",q:"How big is the push-connection tier during a live event?",turns:[
+        {who:"intv",text:"You flip hot users onto persistent push connections during a live event. Concrete numbers: how many connection-tier nodes do you provision, and what bounds one node? Show the math."},
+        {who:"cand",text:"Size it from memory per connection. A persistent WebSocket is mostly idle — a file descriptor, socket buffers, a little session state — call it ~10KB resident, and the bound per node is memory and fd limits, not CPU, since idle sockets do almost nothing.<span class='eg'>50M foregrounded clients in a live event x ~10KB = ~500GB of connection state. Budget ~2GB per node to connections after overhead → ~200K connections/node → 50M / 200K = 250 nodes. Add ~30% headroom → ~325.</span>I spread them across AZs so one AZ loss drops a third of capacity, not the whole tier."},
+        {who:"intv",text:"325 nodes just to hold idle sockets sounds heavy. What cuts it?"},
+        {who:"cand",text:"The count is driven by how many clients I keep connected at once, and I do not need all 50M on push. The trade-off: push turns request-rate load into connection-count load, so I only pay it where it earns out — highly active sessions and live-event windows — and leave the mostly-idle long tail on adaptive polling, which holds zero persistent state. That drops concurrent connections to the genuinely engaged fraction, maybe a few million, so the tier is tens of nodes, not hundreds. The lever is the connect threshold: too aggressive and I provision hundreds of nodes for sockets that never fire; too conservative and I lose the polling-flood relief. So I size for the engaged working set and shed to polling above it."},
+      ],resources:[
+        {title:"ByteByteGo — system design patterns",url:"https://bytebytego.com/"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     lb:[
       {l:"medium",tag:"concept",q:"LB vs gateway, and read path vs write path.",turns:[
@@ -248,6 +257,15 @@ window.DATA['feed'] = {
       ],resources:[
         {title:"Consistent hashing",url:"https://en.wikipedia.org/wiki/Consistent_hashing"},
         {title:"Instagram Engineering — sharding IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many gateway nodes for peak traffic?",turns:[
+        {who:"intv",text:"Numbers. Peak is ~300K timeline reads/s plus the count-poll flood on top, all landing on the LB + gateway first. How many gateway nodes do you run, and what sizes them — throughput or connections?"},
+        {who:"cand",text:"Connections bind first at the edge — every client holds a keep-alive and the poll flood is many short requests — but I size from a per-node request budget since that is the scarce resource. An L7 gateway node doing TLS, auth, and rate-limiting handles maybe ~50K req/s.<span class='eg'>Real requests: ~300K/s reads + ~4K/s writes ≈ 305K/s → 305K / 50K ≈ 7 nodes. But the count-poll flood is 50M clients every 5s ≈ 10M/s; sized against that raw rate it would be 10M / 50K ≈ 200 nodes. Add ~30% headroom.</span>So the poll flood, not the real reads, is what would dominate gateway sizing."},
+        {who:"intv",text:"So the poll flood sets your node count. That is a lot of gateway just to answer whether anything is new. What do you do about it?"},
+        {who:"cand",text:"I refuse to size the whole tier for pure nothing-changed traffic. The trade-off is scale the fleet to ~200 nodes (cost) versus push the flood off it (complexity), and I push it off: serve the count from the edge/feed-cache with a short TTL so it never reaches an app-serving gateway, add client backoff and jitter so idle apps poll slowly, and flip live-event users to push. That collapses the ~10M/s of effective work back toward the ~305K/s of real requests, so the tier lands around 10-15 nodes across 3 AZs, not 200. I size for real reads and writes and treat the poll flood as something to absorb at the edge, not provision for."},
+      ],resources:[
+        {title:"ByteByteGo — system design patterns",url:"https://bytebytego.com/"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
       ]},
     ],
     feed:[
@@ -309,6 +327,15 @@ window.DATA['feed'] = {
         {title:"System Design Primer — the Twitter timeline",url:"https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search"},
         {title:"System Design Primer — fan-out",url:"https://github.com/donnemartin/system-design-primer#fan-out"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many feed-service instances at peak?",turns:[
+        {who:"intv",text:"Concrete. Peak timeline reads are ~300K/s. How many feed-service instances do you run? Show the math — do not just say autoscale."},
+        {who:"cand",text:"Size it from per-instance throughput. The feed service is stateless — range-read a cached list, scatter-gather hydration, assemble JSON — so it is I/O-bound on the cache and post store, and a modern instance handles maybe ~5K req/s within the latency budget (I would confirm with a load test).<span class='eg'>Peak reads ~300K/s → 300K / 5K = 60 instances. Add ~30% headroom → ~80. Writes at ~4K/s peak need ~1-2 instances, negligible. Call it ~80 read-serving instances.</span>Spread across at least 3 AZs so an AZ loss drops a third, not the service."},
+        {who:"intv",text:"80 for what is mostly a cache read and a fan-out. What moves that number?"},
+        {who:"cand",text:"It is dominated by hydration fan-out width and cache-hit ratio, not the list read. The trade-off: if hydration hits warm caches for post bodies and authors, each read is cheap and I need fewer instances; if it misses and scatter-gathers to many shards, per-request cost rises and the count climbs. So the real lever is keeping hydration cached and paged — bound the fan-out width per page and hedge slow shards — which holds per-request cost flat and lets me run a warm floor of ~40 and autoscale on request rate above it. I provision for the busy-hour reads, not registration count, and lean on the cache tier to keep each request cheap."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — the Twitter timeline",url:"https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search"},
+      ]},
     ],
     db:[
       {l:"medium",tag:"concept",q:"Datastore, schema, and sharding the follow graph.",turns:[
@@ -358,6 +385,15 @@ window.DATA['feed'] = {
         {title:"Consistent hashing",url:"https://en.wikipedia.org/wiki/Consistent_hashing"},
         {title:"Facebook TAO — the social graph store (USENIX)",url:"https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much storage and how many nodes for posts and the graph?",turns:[
+        {who:"intv",text:"Size the datastore. You quoted ~1KB posts at ~300GB/day, plus a follow graph of billions of edges. How much storage, and how many nodes do you provision?"},
+        {who:"cand",text:"Storage dominates here, so I size that then check throughput.<span class='eg'>Posts: 300GB/day x 365 x 5y ≈ 550TB raw; at replication factor 3 → ~1.65PB. Follow graph: 300M users x ~300 follows x 2 directions = 180B edges x ~50B ≈ 9TB raw, ~27TB replicated — small next to posts. Total ~1.7PB. At ~2TB usable/node → ~850 nodes; round to ~900 with headroom.</span>Throughput is easy by comparison — ~3,500 posts/s writes and the follow writes sit well under what 900 wide-column nodes serve, because the ~1M/s feed-list writes live in the cache, not here."},
+        {who:"intv",text:"900 nodes holding 5 years of posts hot forever — wasteful?"},
+        {who:"cand",text:"Yes, and I would tier rather than keep it all hot. The trade-off: posts are read overwhelmingly in the days after creation and then go cold, so keeping 5-year-old posts on the fast cluster pays for capacity almost nobody reads. I put recent posts on the fast tier and age older ones to cheaper cold storage with a slower lookup path, which can shrink the hot cluster several-fold. The cost is a latency cliff for the rare old-post read plus tiering complexity — acceptable because cold posts are, by definition, rarely fetched. So I provision the hot tier for the working set and let cold storage hold the long tail cheaply."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Facebook TAO — the social graph store (USENIX)",url:"https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson"},
+      ]},
     ],
     fanout:[
       {l:"medium",tag:"concept",q:"How fan-out on write actually delivers a post.",turns:[
@@ -396,6 +432,15 @@ window.DATA['feed'] = {
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"System Design Primer — fan-out",url:"https://github.com/donnemartin/system-design-primer#fan-out"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many fan-out workers to keep delivery within seconds?",turns:[
+        {who:"intv",text:"Numbers. Fan-out is ~1M feed-list writes/s on average and more at peak. How many fan-out workers do you run to keep delivery within seconds, and what sizes one worker?"},
+        {who:"cand",text:"Size from per-worker insert throughput. A worker pulls a job, reads a follower slice, and does batched, pipelined inserts into the feed cache — network-bound, call it ~10K inserts/s per worker.<span class='eg'>Average ~1M writes/s → 1M / 10K = 100 workers. Peak 3-5x ≈ 3-5M/s → 300-500 workers; add headroom → ~600 at peak.</span>They are stateless queue consumers, so I scale by adding consumers and partitions, and let the queue absorb bursts so I size for sustained rate, not the instantaneous spike."},
+        {who:"intv",text:"600 workers at peak is a lot. What keeps that from exploding on a celebrity storm?"},
+        {who:"cand",text:"The hybrid and active-only delivery cap it well below the naive number. The trade-off: pure fan-out-on-write to every follower would push peak far past 5M/s on a celebrity storm and demand thousands of workers; instead celebrities skip fan-out entirely via read-time merge and I only deliver to active users. That strips the largest and the deadest work off the top, so the sustained rate workers actually see is a fraction of the raw 1M/s. The lever is the fan-out threshold and the activity window — I lower the threshold under backlog to shed more to read-time merge. So I provision ~150-200 workers for steady state and autoscale toward ~600 only under real surge, rather than sizing for a worst case the hybrid prevents."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — fan-out",url:"https://github.com/donnemartin/system-design-primer#fan-out"},
+      ]},
     ],
     cache:[
       {l:"medium",tag:"concept",q:"What's in the feed cache, and ranking a bounded candidate set.",turns:[
@@ -430,6 +475,24 @@ window.DATA['feed'] = {
         {who:"cand",text:"Yes, deliberately — the feed cache is explicitly <strong>not the source of truth</strong>. The durable truth is two things in the DB: the <strong>canonical posts</strong> and the <strong>follow graph</strong>. Any user's feed list is a <em>derived</em>, recomputable view of those two — 'recent posts from people I follow, ranked.' So losing a cached list loses nothing permanent; it's regenerated from durable inputs. Putting it in volatile memory is the right call precisely because it's a materialized cache of a query, not primary data."},
         {who:"intv",text:"So you never persist feed lists at all? Even for faster recovery?"},
         {who:"cand",text:"I can add durability as an <em>optimization</em>, not a correctness requirement. Options: Redis AOF/RDB snapshots so a node restart reloads warm rather than empty, and/or replicas that keep the data live through a single-node failure. These speed recovery — they don't change the truth model. I'd enable replication for availability (avoid the blank-feed stampede) and treat on-disk persistence as a nice-to-have for faster warm starts. But the guarantee I rely on is always 'the feed is rebuildable from posts + graph,' so no scenario where the cache loses data can lose a user's actual content — worst case it costs a rebuild."},
+      ],resources:[
+        {title:"Redis — data types (sorted sets)",url:"https://redis.io/docs/latest/develop/data-types/"},
+        {title:"System Design Primer — the Twitter timeline",url:"https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How much RAM does the feed cache need?",turns:[
+        {who:"intv",text:"Concrete. You hold a ranked list of post ids per active user in Redis. How much memory does the feed cache need, and how many nodes?"},
+        {who:"cand",text:"Size per active user, then multiply. Each timeline is a sorted set of post ids trimmed to the top few hundred.<span class='eg'>~800 post ids x 8 bytes = ~6.4KB of ids per user; with sorted-set overhead (member + score + pointers) call it ~3x → ~20KB per timeline. 300M active users x 20KB ≈ 6TB. At ~50GB usable per node → 6TB / 50GB ≈ 120 nodes; with a replica per shard → ~240, plus headroom.</span>That is the whole point of storing ids not bodies — inlining ~1KB bodies would be gigabytes per popular post and blow this up hundreds-fold."},
+        {who:"intv",text:"240 nodes of RAM is expensive. What shrinks the footprint?"},
+        {who:"cand",text:"Two levers, both trade-offs. First, only hold feeds for active users, not all 500M registered — that is already baked into the 300M figure and cuts memory by the inactive fraction, at the cost of a cold rebuild when a dormant user returns. Second, the trim length: 800 ids is generous, and cutting it to a couple hundred cuts per-user memory proportionally, at the cost of paging to the DB sooner when someone scrolls deep. Since engagement drops off a cliff with feed depth, a shorter list is nearly free in practice. So I tune the active window and trim length to fit the working set in memory rather than provisioning for every registered user at full depth."},
+      ],resources:[
+        {title:"Redis — data types (sorted sets)",url:"https://redis.io/docs/latest/develop/data-types/"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which cache for the feed lists, and why?",turns:[
+        {who:"intv",text:"You keep reaching for Redis for the feed cache. Defend it — why Redis and not Memcached, or just more DB replicas?"},
+        {who:"cand",text:"Match it to the access pattern: a per-user ranked list I range-read by cursor and that fan-out appends to constantly. Memcached is a flat key-to-blob cache with no server-side data structures, so a ranked timeline would be one opaque blob I fetch whole, deserialize, mutate, and rewrite on every fan-out insert — hopeless at ~1M inserts/s. More DB replicas keep list-building on disk-backed storage, which is exactly the hot-path cost I am trying to escape. Redis gives me a sorted set per user: score-ordered inserts from fan-out and range reads by cursor, in memory."},
+        {who:"intv",text:"Redis is single-threaded per shard and volatile. Does that not bite you?"},
+        {who:"cand",text:"Both are acceptable once you weigh them. Single-threaded per shard is fine because I shard widely — each node owns a slice of users, so aggregate throughput scales horizontally and no one node serves the whole keyspace. Volatility is fine because the feed cache is explicitly not the source of truth: every list is recomputable from posts + graph, so a lost node is a rebuild, not data loss. The one thing I would genuinely weigh is self-managed Redis versus a managed equivalent on operational cost — but on data-model fit the sorted-set primitive is decisive. So: Redis for the native ranked-list operations, sharded for throughput and replicated for availability, treated as a rebuildable cache."},
       ],resources:[
         {title:"Redis — data types (sorted sets)",url:"https://redis.io/docs/latest/develop/data-types/"},
         {title:"System Design Primer — the Twitter timeline",url:"https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search"},
@@ -471,6 +534,24 @@ window.DATA['feed'] = {
       ],resources:[
         {title:"Cloudflare — what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
         {title:"Dynamic Adaptive Streaming over HTTP (DASH)",url:"https://en.wikipedia.org/wiki/Dynamic_Adaptive_Streaming_over_HTTP"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How much media storage and CDN egress?",turns:[
+        {who:"intv",text:"Size the media path. Posts carry photos and video, and you said media is petabytes. Give me the storage and the egress numbers."},
+        {who:"cand",text:"Storage first, then egress.<span class='eg'>Say ~20% of 300M posts/day carry media at ~2MB avg across photos and short video → 300M x 0.2 x 2MB = 120TB/day of originals. Transcoding into a few renditions roughly doubles that → ~240TB/day. Over 5 years → ~440PB — object-storage territory, not a database.</span><span class='eg'>Egress: 6B feed reads/day, ~30% actually fetch a media item at ~500KB effective → 6B x 0.3 x 500KB ≈ 900TB/day served. At a 95% CDN hit ratio the origin serves ~5% → ~45TB/day; the CDN carries the rest.</span>"},
+        {who:"intv",text:"440PB and near a petabyte a day of egress — what keeps that affordable?"},
+        {who:"cand",text:"The trade-off is where bytes live and who serves them. Storage: keep originals plus renditions in object storage with lifecycle tiering — hot renditions on standard storage, cold originals of old posts aged to archival tiers, since old media is rarely re-fetched — which pulls the effective hot footprint well below 440PB. Egress: the CDN is what makes it affordable, collapsing 900TB/day of viewer demand to ~45TB/day of origin fills, so I pay cheap edge egress for the bulk and expensive origin egress only for misses. The levers are the CDN hit ratio and storage tiering; I optimize both rather than serving petabytes from origin at origin prices."},
+      ],resources:[
+        {title:"Cloudflare — what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store for the media bytes, and why?",turns:[
+        {who:"intv",text:"Where do the media bytes actually live? Defend object storage over putting them in your DB or on a self-managed distributed filesystem."},
+        {who:"cand",text:"Match it to the access pattern: write-once large blobs, read by key, served globally behind a CDN, never queried by content. Bytes in the DB is the clear loser — it bloats rows, wrecks the buffer cache the post lookups need, and databases are not built to stream 200MB blobs. A self-managed distributed filesystem (HDFS/Ceph-style) can hold the bytes, but then I own capacity planning, rebalancing, durability, and CDN integration myself. Object storage (S3-style) is purpose-built for exactly this: effectively unlimited, cross-AZ replication for durability, pre-signed direct upload, and native CDN origin integration."},
+        {who:"intv",text:"So object storage always wins? Where is the catch?"},
+        {who:"cand",text:"The catch is per-request latency and cost: object storage is slower per GET than a local filesystem and charges per request and per GB egress, so hitting it directly for every view would be slow and pricey. That is precisely why it is not the serving path — the CDN sits in front and absorbs the reads, so object storage only takes uploads and cache-fill misses, where its throughput and durability matter and its per-GET latency does not. A self-managed filesystem would only win if I needed POSIX semantics or had a hard reason to avoid a cloud dependency, which I do not here. So: object storage as the durable origin, CDN as the serving tier — the trade-offs land where object storage is strong."},
+      ],resources:[
+        {title:"Cloudflare — what is a CDN?",url:"https://www.cloudflare.com/learning/cdn/what-is-a-cdn/"},
+        {title:"System Design Primer — the Twitter timeline",url:"https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search"},
       ]},
     ],
   }

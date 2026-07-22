@@ -211,6 +211,15 @@ window.DATA['crawler'] = {
         {title:"Wikipedia — Web crawler",url:"https://en.wikipedia.org/wiki/Web_crawler"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the scheduler — throughput and state.",turns:[
+        {who:"intv",text:"Concrete numbers for the scheduler. It seeds the frontier and feeds recrawls back in. How much work does it push per second, and how big is the state it must hold to do that?"},
+        {who:"cand",text:"The scheduler is control-plane, so I size it off the recrawl feed, not raw fetch IO. Seeding is a one-off trickle; the sustained job is deciding <em>what is due for recrawl</em> across 30B pages.<span class='eg'>30B pages refreshed ~monthly = ~1B/day ≈ 12K recrawl decisions/s — the same order as the fetch budget. Per-page schedule state (next-due time, change-rate estimate) at ~40 bytes × 30B ≈ 1.2TB — well past one node's RAM, so it is sharded, not in-memory on a single scheduler.</span>Throughput itself is easy; the state size is the real constraint."},
+        {who:"intv",text:"1.2TB of timers just to decide when to recrawl feels heavy. What cuts it?"},
+        {who:"cand",text:"I do not keep a per-page timer. Instead I bucket pages into a few <strong>change-rate tiers</strong> (hourly, daily, monthly) and drive recrawl off the tier plus a cheap priority score, so the hot state is just the small <em>due-soon</em> window in memory while the long tail lives on disk or is recomputed. The trade-off is precision — tier-based scheduling recrawls a page a little early or late versus an exact per-page model — but for freshness that error is invisible, and it turns 1.2TB of hot timers into a few GB of due-soon entries. So I size the scheduler for the due-soon working set, not the full corpus."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
     ],
     frontier:[
       {l:"medium",tag:"concept",q:"Design the URL frontier.",turns:[
@@ -249,6 +258,24 @@ window.DATA['crawler'] = {
         {title:"Wikipedia — Web crawler",url:"https://en.wikipedia.org/wiki/Web_crawler"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the frontier — memory, disk, and throughput.",turns:[
+        {who:"intv",text:"Give me the frontier's sizing. How much memory versus disk per worker, and what enqueue and dequeue rates does it have to sustain?"},
+        {who:"cand",text:"Two very different rates. <strong>Dequeue</strong> equals the fetch budget — 12K URLs/s fleet-wide. <strong>Enqueue</strong> is far higher during expansion because each fetched page yields many new links.<span class='eg'>12K pages/s × ~10 genuinely-new links/page ≈ 120K enqueues/s; across 200 workers that is ~600 writes/s and ~60 dequeues/s each — trivial for a per-worker LSM store. Capacity: 3B URLs × ~200 bytes ≈ 600GB, ~3GB of disk per worker, while RAM holds only the host heap and back-queue heads — a few hundred MB.</span>So it is disk-bound, not throughput-bound."},
+        {who:"intv",text:"Enqueue running 10x dequeue means the frontier only ever grows. Is per-worker write throughput really the thing to size for?"},
+        {who:"cand",text:"No — the write rate is comfortable; the danger is unbounded <em>growth</em>. So the sizing lever is not machines but <strong>admission control</strong>: per-domain URL caps, max depth, and priority-based dropping keep the 600GB from becoming 6TB of trap junk. I provision disk for legitimate scale and a memory hot-set for the next decisions, then cap growth with policy. The trade-off is coverage — aggressive caps risk under-crawling a genuinely huge site — so I tune the caps against the content-dedup signal rather than sizing storage for infinite intake."},
+      ],resources:[
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"hard",tag:"concept",q:"Which queue technology backs the frontier?",turns:[
+        {who:"intv",text:"You keep saying disk-backed queue. Be specific — pick the technology that stores the frontier and defend it against the alternatives."},
+        {who:"cand",text:"Three real candidates. <strong>Kafka</strong> — a durable append log, huge throughput, but strictly FIFO per partition. <strong>Redis</strong> — sorted sets give priority and time ordering, but it is in-memory so 600GB is expensive and durability is weaker. <strong>An embedded LSM store (RocksDB) per worker</strong> — disk-backed, cheap, durable appends, sitting locally on the worker that already owns the host by domain-hash. I pick the <strong>per-worker LSM store plus an in-memory heap</strong>: the heap holds the host-next-fetch times, the LSM store holds the URL tail.<span class='eg'>600GB spread as ~3GB of RocksDB per worker; the heap and back-queue heads stay in RAM.</span>"},
+        {who:"intv",text:"Kafka is durable and scales effortlessly — why not just make the frontier a set of Kafka topics?"},
+        {who:"cand",text:"Because the frontier is not FIFO. It has to pop <em>the URL of the host whose politeness delay has elapsed, at the highest priority band</em> — a selective, time-ordered dequeue. Kafka only hands me the next message in offset order; I cannot skip to a due host or reorder by priority without consuming and re-buffering, which defeats the point. So Kafka is great as the <strong>durable transport</strong> for enqueues between workers, but the decision structure — priority front-queues and per-host back-queues — needs a keyed store plus a heap. I would use RocksDB for state and, at most, Kafka as the append pipe, not as the frontier itself."},
+      ],resources:[
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     fetcher:[
       {l:"medium",tag:"concept",q:"How does the fetcher pool actually work?",turns:[
@@ -285,6 +312,15 @@ window.DATA['crawler'] = {
         {who:"cand",text:"Ownership is coordinated: the crash is detected via <strong>heartbeat / lease expiry in the coordinator</strong> (ZooKeeper/etcd), which reassigns that worker's domain partitions to a healthy worker. The new owner reads the same <em>durable</em> frontier store for those hosts and resumes — the frontier being persistent is exactly what makes failover a reassignment rather than a data-loss event. In-flight leases expiring plus partition reassignment together mean a worker crash is degraded throughput for seconds, not lost coverage."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many fetcher machines to hit 12K pages/s?",turns:[
+        {who:"intv",text:"Give me the math on the fetch fleet. To sustain 12K pages/s, how many concurrent connections and how many worker machines?"},
+        {who:"cand",text:"Little's law gives the concurrency directly: in-flight = rate × latency.<span class='eg'>12,000 pages/s × ~0.4s average fetch ≈ 4,800 sockets in flight fleet-wide; at peak 3-5x that is ~24K concurrent connections. One async worker comfortably holds ~5K sockets, so raw throughput is barely a box or two — but I run ~200 workers, so each carries only ~24 sockets and ~60 fetches/s.</span>Because fetching is IO-bound, the constraint is concurrent-connection capacity and file descriptors, not CPU."},
+        {who:"intv",text:"If one or two boxes can push 12K/s, why on earth run 200 workers?"},
+        {who:"cand",text:"Raw throughput is not why the fleet is big. I need 200 workers for <strong>domain-hash partitioning</strong> — that is what makes politeness a local per-worker decision, keeps DNS and TCP connections warm per host, and localises the seen-set. I also want fault tolerance: losing one of 200 workers drops 0.5% of capacity, not half. So I size the fleet by <em>partitioning and blast-radius</em>, not by the Little's-law minimum — the trade-off is running far more machines than throughput alone demands, which I happily pay for locality and resilience."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
       ]},
     ],
@@ -325,6 +361,15 @@ window.DATA['crawler'] = {
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much CPU does parsing 12K pages/s need?",turns:[
+        {who:"intv",text:"The parser is the CPU-heavy box. At 12K pages/s, how many cores does extraction actually cost you?"},
+        {who:"cand",text:"Parsing is CPU-bound, so I size it by CPU-time per page, again via Little's law.<span class='eg'>DOM parse plus link and text extraction is ~20ms of CPU per page. 12,000 pages/s × 0.02s ≈ 240 cores busy — about 15 sixteen-core workers, or ~1.2 cores co-located on each of the 200 fetcher boxes.</span>Unlike the fetcher this scales with cores, not sockets, so I keep each parse under a CPU-time budget so one pathological page cannot monopolise a core."},
+        {who:"intv",text:"20ms assumes a static HTML page. Modern sites are JavaScript-heavy — what if you have to render them?"},
+        {who:"cand",text:"Rendering changes the budget by one to two orders of magnitude — a headless-browser render is ~100ms-1s of CPU per page, so rendering everything would turn 240 cores into thousands. So I deliberately <strong>do not render by default</strong>: static extraction for the bulk, and a small separate render pool sized only to the render-worthy fraction (say a few percent of pages on an allowlist). The trade-off is coverage of JS-only content versus cost — I would rather cheaply parse 95% of the web than pay 20x to render all of it, and I expand the render pool only where the index actually needs it."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
     ],
     dns:[
       {l:"easy",tag:"concept",q:"Why cache DNS, and what exactly?",turns:[
@@ -362,6 +407,15 @@ window.DATA['crawler'] = {
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How big does the DNS cache need to be?",turns:[
+        {who:"intv",text:"Size the DNS cache. How many entries, how much memory, and what miss load reaches the resolvers?"},
+        {who:"cand",text:"Each entry is tiny — host, IP, TTL — call it ~100 bytes. The number of <em>distinct</em> hosts is what matters, and it is far smaller than the page count.<span class='eg'>~100M distinct hosts fleet-wide × ~100 bytes ≈ 10GB for a complete cache; but the hot working set is much smaller — at 12K pages/s over only ~50 new hosts/s, a few million recently-seen hosts (a few hundred MB) already gives a >99% hit ratio, so resolvers see only ~50-100 misses/s.</span>The cache turns a 200ms round-trip into a memory read for almost every fetch."},
+        {who:"intv",text:"10GB of host entries duplicated on every one of 200 workers is wasteful. Does each worker really cache the whole web?"},
+        {who:"cand",text:"No — and domain-hash partitioning is what saves me. Each worker only ever fetches its own slice of hosts, so its DNS working set is roughly 1/200th of the total — tens of MB, not 10GB — and it stays warm because the same worker keeps hitting the same hosts. There is no global 10GB replica anywhere; the cache shards for free along the same partitioning that drives politeness. The trade-off is a cold cache after a partition reassignment, which I handle by persisting entries so a moved partition reloads warm rather than re-resolving from scratch."},
+      ],resources:[
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
       ]},
     ],
     politeness:[
@@ -401,6 +455,15 @@ window.DATA['crawler'] = {
         {title:"The Robots Exclusion Protocol",url:"https://www.robotstxt.org/robotstxt.html"},
         {title:"Wikipedia — Web crawler",url:"https://en.wikipedia.org/wiki/Web_crawler"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the per-host politeness and robots state.",turns:[
+        {who:"intv",text:"Politeness keeps per-host timing plus parsed robots rules. Across the whole crawl, how much memory is that?"},
+        {who:"cand",text:"Two kinds of state per host. Timing — last-fetch time and crawl-delay — is tiny, ~50 bytes. Parsed robots rules are bigger, call it ~1KB per host.<span class='eg'>Timing: ~100M active hosts × 50 bytes ≈ 5GB fleet-wide. Robots: 100M × ~1KB ≈ 100GB fleet-wide. Domain-partitioned across 200 workers that is ~25MB timing and ~500MB robots per worker.</span>Timing state is small enough to keep hot everywhere; robots is the part that needs care."},
+        {who:"intv",text:"500MB of robots per worker, and 100GB across the fleet, just for rules — too much to keep resident?"},
+        {who:"cand",text:"I trim it two ways. First, I store only the <strong>parsed disallow prefixes</strong> I actually match against, not the raw robots.txt text, which cuts most hosts to a few dozen bytes. Second, I <strong>LRU the robots cache</strong> to currently-active hosts and persist the rest to disk or a shared store, reloading on demand — the set of hosts I am crawling right now is far smaller than every host I have ever seen. The trade-off is an occasional reload for a host that went cold and came back, which is one cheap fetch or disk read, versus pinning 100GB in RAM. Timing state stays fully in memory because it is small and safety-critical."},
+      ],resources:[
+        {title:"The Robots Exclusion Protocol",url:"https://www.robotstxt.org/robotstxt.html"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     dedup:[
       {l:"medium",tag:"concept",q:"URL dedup with a Bloom filter.",turns:[
@@ -439,6 +502,15 @@ window.DATA['crawler'] = {
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the seen-set across the fleet.",turns:[
+        {who:"intv",text:"Put numbers on the seen-set. For 30B URLs, how much memory does the Bloom filter cost, and how is it split across workers?"},
+        {who:"cand",text:"Bloom-filter memory is bits-per-URL times URL count, and I pick bits per URL from the false-positive rate I will tolerate.<span class='eg'>30B URLs × 10 bits ≈ 37GB fleet-wide at a ~1% false-positive rate — versus 3TB+ to store the raw canonical strings in a hash set. Domain-partitioned across 200 workers, each holds ~190MB of filter for its own hosts.</span>So the whole global seen-set fits in the aggregate RAM of the fleet, and each worker only carries its slice."},
+        {who:"intv",text:"The crawl keeps discovering URLs — as it grows past 30B the filter fills up. What happens to that 1% then?"},
+        {who:"cand",text:"A Bloom filter degrades as it saturates: past its design capacity the false-positive rate climbs, and a false positive means I skip a genuinely-new URL — silent coverage loss. Two options. I can <strong>size for the target N up front</strong> with more bits (15 bits/URL pushes FP toward 0.1% at the cost of ~55GB), or use a <strong>scalable Bloom filter</strong> that adds a segment when the current one fills, keeping the aggregate FP bounded as the corpus grows. The trade-off is memory versus coverage — I would rather spend a few extra GB per worker than quietly stop discovering pages, so I provision bits for the corpus I expect, not the one I have today."},
+      ],resources:[
+        {title:"Wikipedia — Bloom filter",url:"https://en.wikipedia.org/wiki/Bloom_filter"},
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     store:[
       {l:"medium",tag:"concept",q:"What and how to store.",turns:[
@@ -473,6 +545,24 @@ window.DATA['crawler'] = {
         {who:"cand",text:"Dropping means re-crawling — expensive and impolite — so I avoid it. I <strong>decouple the parser from the store with a durable queue/log</strong> (Kafka-style): parsed pages are published to the log, and store-writer consumers drain it into object storage. During a 90s store outage the log <strong>buffers</strong> the ~1M pages; when the store recovers, consumers catch up. The crawl never blocks on store availability, and no crawled page is lost.<span class='eg'>1M pages × ~16KB ≈ 16GB buffered in the log for 90s — trivial for a Kafka-style log to hold and replay.</span>"},
         {who:"intv",text:"The buffer isn't infinite. What if the store is down for hours, not 90 seconds?"},
         {who:"cand",text:"Two levers. The log has <strong>bounded retention sized to a realistic outage</strong> (hours of buffer), so short-to-medium outages are fully absorbed and replayed. If it's approaching the buffer limit, I apply <strong>backpressure to the crawl</strong> — throttle the fetch rate — rather than dropping already-crawled pages, because slowing new work is cheaper than discarding completed work. Deliberately, I'd rather crawl slower than lose pages I already politely paid to fetch. A multi-hour store outage becomes reduced throughput, not data loss."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the content store — bytes, writes, nodes.",turns:[
+        {who:"intv",text:"Size the content store. How many bytes, what write bandwidth, and how many nodes to hold 30B pages?"},
+        {who:"cand",text:"I size storage and throughput separately and take the max, like any datastore.<span class='eg'>Space: 30B × ~100KB ≈ 3PB raw; HTML compresses ~6x → ~500TB stored (under the 1PB the framing quoted). At ~10TB usable/node that is ~50 nodes for space. Throughput: 12K pages/s × ~16KB compressed ≈ 190MB/s sustained write, ~1.6TB/day, plus 30B objects to key and index.</span>Space dominates node count; 190MB/s of writes spreads trivially, so I provision on the order of ~50-60 nodes and the throughput comes for free."},
+        {who:"intv",text:"That 500TB is just the raw HTML. You also keep extracted text, fingerprints, and multiple versions per URL — does the budget hold?"},
+        {who:"cand",text:"Raw HTML dominates; extracted text is a fraction of it and the fingerprint index is smaller still, so those do not move the 500TB much. Versions are the real multiplier — recrawling means several copies of each URL over time. So I keep a <strong>bounded version history</strong>: latest hot, a few recent snapshots for diffing, older ones cold-tiered or pruned. The trade-off is losing deep history versus unbounded cost — most consumers want current content and change-detection only needs the previous fingerprint, so I cap versions and let cold-tiering absorb the rest rather than sizing hot storage for every version forever."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},
+      ]},
+      {l:"hard",tag:"concept",q:"Which blob store for 3PB of pages?",turns:[
+        {who:"intv",text:"You said object storage. Pick the actual system for 3PB of raw pages and defend it against the alternatives."},
+        {who:"cand",text:"Three candidates. <strong>Managed object storage (S3-style)</strong> — ~11 nines durability, effectively infinite scale, built-in tiering, pay-per-use, but less control and cost adds up at 3PB. <strong>HDFS</strong> — colocates with batch indexing jobs, but 30B ~16KB objects is a brutal small-file problem: the NameNode holds metadata for every object in memory and buckles well before billions. <strong>Self-hosted Ceph</strong> — full control, no egress fees, but I run and scale it myself. I pick <strong>managed object storage</strong>: write-once blobs keyed by URL hash are exactly its sweet spot, and durability plus tiering come for free.<span class='eg'>Key = sha1(canonicalURL), value = gzip(rawHTML); 30B objects across sharded buckets.</span>"},
+        {who:"intv",text:"Your indexing pipeline runs big batch jobs over this data — doesn't HDFS colocation win on data locality?"},
+        {who:"cand",text:"It would if the objects were large, but the small-file problem sinks raw HDFS here — 30B tiny objects overwhelm the NameNode. The fix is to <strong>pack pages into large container files</strong> — WARC or sequence files of thousands of pages each — which I can store just as well in object storage and stream into compute, so I keep managed durability and still get efficient batch reads. Modern indexing runs compute against object storage directly anyway. So the trade-off resolves toward object storage plus packing: I give up HDFS-style locality but avoid its metadata ceiling and its operational burden, and I still feed batch jobs efficiently."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Hello Interview — web crawler",url:"https://www.hellointerview.com/learn/system-design/answer-keys/web-crawler"},

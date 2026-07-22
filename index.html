@@ -10,7 +10,7 @@
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --line:#2a323d;
     --text:#e6edf3; --muted:#9aa7b4; --accent:#4f8cff; --accent2:#7c5cff;
     --intv:#f0a742; --cand:#4fd1a1; --easy:#4fd1a1; --medium:#f0a742; --hard:#ff6b6b;
-    --t-concept:#6ea8ff; --t-scaling:#f0a742; --t-durability:#4fd1a1; --t-failover:#ff6b6b;
+    --t-concept:#6ea8ff; --t-scaling:#f0a742; --t-durability:#4fd1a1; --t-failover:#ff6b6b; --t-capacity:#a78bfa;
     --radius:12px;
   }
   *{box-sizing:border-box}
@@ -111,6 +111,7 @@
   .tchip.scaling{color:var(--t-scaling);border-color:rgba(240,167,66,.4)}
   .tchip.durability{color:var(--t-durability);border-color:rgba(79,209,161,.4)}
   .tchip.failover{color:var(--t-failover);border-color:rgba(255,107,107,.4)}
+  .tchip.capacity{color:var(--t-capacity);border-color:rgba(167,139,250,.4)}
   .filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 12px}
   .fchip{font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted);cursor:pointer;background:none}
   .fchip.on{border-color:var(--accent);color:var(--text);background:#1c2836}
@@ -197,7 +198,7 @@ const DIFF_INFO = {
   hard:{name:"Hard",dot:"var(--hard)",desc:"Senior deep-dives — scale, durability, failover."},
 };
 const DIFF_ALLOWED = {easy:["easy"], medium:["easy","medium"], hard:["easy","medium","hard"]};
-const TAGS = {concept:{icon:"ti-bulb"},scaling:{icon:"ti-trending-up"},durability:{icon:"ti-database"},failover:{icon:"ti-alert-triangle"}};
+const TAGS = {concept:{icon:"ti-bulb"},capacity:{icon:"ti-calculator"},scaling:{icon:"ti-trending-up"},durability:{icon:"ti-database"},failover:{icon:"ti-alert-triangle"}};
 const MAX_FOLLOWUPS = 10;
 const PHASE_META = [
   {n:1,lbl:"Requirements",sub:"functional + NFR",key:"requirements"},
@@ -413,7 +414,7 @@ function renderComponents(p){
   p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return; const has=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l)); if(!has)return;
     html+=`<button class="compbtn ${nid===n.id?'on':''} ${state.answeredCount[n.id]?'done':''}" data-n="${n.id}">${n.name}${state.answeredCount[n.id]?' ·'+state.answeredCount[n.id]:''}</button>`; });
   html+=`</div>`;
-  if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill into it — concept, scaling, durability and failover threads.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
+  if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill into it — concept, scaling, durability and failover threads.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
   const node=p.nodes.find(n=>n.id===nid);
   let all=(p.q[nid]||[]).filter(q=>DIFF_ALLOWED[state.diff].includes(q.l));
   const tagsP=[...new Set(all.map(q=>q.tag||'concept'))];
@@ -426,7 +427,7 @@ function renderComponents(p){
     html+=`<button class="item" data-idx="${gi}" ${dis?'disabled':''}><span class="chip ${q.l}">${q.l}</span><span class="tchip ${tag}"><i class="ti ${TAGS[tag]?TAGS[tag].icon:'ti-bulb'}"></i> ${tag}</span><span class="qt">${q.q}${rev}${asked?' <span style="color:var(--cand)">✓</span>':''}</span><span class="turns">${Math.ceil(q.turns.length/2)}×</span></button>`; });
   html+=askBoxHTML(node.name);
   document.getElementById('panel').innerHTML=html;
-  document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.';
+  document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.';
   document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
   document.querySelectorAll('#panel .fchip').forEach(el=>el.onclick=()=>{state.filter=el.dataset.f||null;renderPanel();});
   document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playThread(nid,parseInt(el.dataset.idx)); });

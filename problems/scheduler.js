@@ -214,6 +214,15 @@ window.DATA['scheduler'] = {
         {title:"Idempotence",url:"https://en.wikipedia.org/wiki/Idempotence"},
         {title:"Hello Interview — Job Scheduler",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much status-polling load do clients generate?",turns:[
+        {who:"intv",text:"Put rough numbers on the client side. With 100M jobs registered and clients watching status, how much traffic does the client tier drive, and what does that imply?"},
+        {who:"cand",text:"Reads dominate, and by a lot. Submits and executions are modest, but every dashboard and programmatic watcher polls for status.<span class='eg'>say 1M jobs are actively watched and each is polled every 5s &rarr; 200K status reads/s, versus ~10K executions/s and a trickle of submits &mdash; status traffic is ~20x the write path.</span>So the client-facing load is a read-amplification problem: a naive design where everyone polls constantly would size the whole system around dashboard refreshes, not real work."},
+        {who:"intv",text:"So do you just let them poll, or push updates? What's the trade-off?"},
+        {who:"cand",text:"Polling is dead simple and needs no delivery infrastructure, but it burns read capacity proportional to watcher count regardless of whether anything changed. Push via completion webhooks costs a callback-delivery mechanism with retries, but a job changes state only a handful of times in its life, so it sends far fewer messages. Given status changes are rare and reads are ~20x writes, I decide: <strong>webhooks for programmatic consumers</strong> so they learn of terminal states without polling, and <strong>relaxed, rate-capped polling</strong> for human dashboards where a second of staleness is harmless. That collapses the 200K/s into something an order of magnitude smaller."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — Job Scheduler",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
     ],
     api:[
       {l:"medium",tag:"concept",q:"What does the Job API own beyond a thin CRUD layer?",turns:[
@@ -242,6 +251,15 @@ window.DATA['scheduler'] = {
       ],resources:[
         {title:"System Design Primer — availability & consistency",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Hello Interview — Job Scheduler",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many Job API instances at peak? Show the math.",turns:[
+        {who:"intv",text:"Concrete numbers. Between submits and status queries, how many <strong>Job API instances</strong> do you run at peak? Show me the sizing, don't just say autoscale."},
+        {who:"cand",text:"The API is stateless and CPU-light &mdash; authenticate, validate, one store read or write, serialize &mdash; so a modern 4-core instance handles on the order of <strong>~5,000 req/s</strong> at low latency (I'd confirm by load test).<span class='eg'>peak status reads ~100K/s + submits ~2K/s &asymp; 102K req/s; 102K &divide; 5K &asymp; 21 instances; +30% headroom &rarr; ~27, spread across &ge;3 AZs so losing one drops ~1/3 of capacity, not the service.</span>The count is dominated by reads, not the write path."},
+        {who:"intv",text:"27 feels heavy for what's mostly a status lookup. What cuts it?"},
+        {who:"cand",text:"The number assumes every status read reaches the API. It shouldn't: status is cache-friendly and tolerates staleness, so I serve it from <strong>read replicas plus a short-TTL cache</strong> and keep the write-primary for submits and the scheduler's transitions. The trade-off is provisioning for a cold cache (cost) versus autoscale lag when a cache flush suddenly lands read load on the fleet (risk). I decide: size the fleet to survive submits plus miss traffic &mdash; low-tens, not driven by dashboard polling &mdash; keep a warm floor of a handful of instances, and autoscale above it on request rate."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
       ]},
     ],
     jobdb:[
@@ -281,6 +299,24 @@ window.DATA['scheduler'] = {
         {title:"Leader election",url:"https://en.wikipedia.org/wiki/Leader_election"},
         {title:"System Design Primer — consistency & availability",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"hard",tag:"capacity",q:"Size the job store — storage and nodes for 100M jobs plus run history.",turns:[
+        {who:"intv",text:"Size the job store. 100M registered jobs with small definitions, plus a run record for every execution. How much storage, and how many nodes do you provision?"},
+        {who:"cand",text:"Two datasets with different growth. The job rows are small and bounded by the catalog; the run history grows with executions and dominates.<span class='eg'>jobs: 100M &times; ~2KB (def + payload + state) &asymp; 200GB. runs: 10K exec/s &asymp; 860M runs/day; retain 30 days &asymp; 26B rows &times; ~300B &asymp; ~8TB. With replication factor 3 &rarr; jobs ~0.6TB, runs ~24TB; at ~2TB usable/node &rarr; ~12 nodes, essentially all for history.</span>Throughput is ~10K exec/s each doing a few state writes, so tens of thousands of writes/s &mdash; well within that node count."},
+        {who:"intv",text:"That's sized to keep 30 days of history hot forever. Wasteful?"},
+        {who:"cand",text:"Yes, and history is the cheap part to move. The <strong>hot</strong> dataset the scheduler scans is only the live jobs indexed by <code>next_run_at</code> &mdash; a few hundred GB &mdash; and that's what needs fast, replicated, strongly-consistent storage. The append-only run history is cold, queried only for monitoring, so I <strong>tier</strong> it: recent runs on the fast cluster, older ones aged to cheaper object storage with a slower lookup path. The trade-off is added complexity and a latency cliff for old-run queries, which I accept because old runs are rarely read. That cuts the hot cluster several-fold and lets retention/TTL reclaim space automatically."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — Job Scheduler (data model)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"hard",tag:"concept",q:"Which database for the job store, and why? Postgres vs Cassandra vs DynamoDB.",turns:[
+        {who:"intv",text:"Name the datastore for the job store and defend it against the alternatives. What are you comparing?"},
+        {who:"cand",text:"The access pattern decides it: a point read/write by <code>job_id</code>, a <strong>range scan on <code>next_run_at</code></strong> for the due-scan, and an <strong>atomic conditional claim</strong> (flip pending &rarr; queued only if still pending). <strong>Postgres</strong> gives me a secondary index on next_run_at and conditional <code>UPDATE ... WHERE status='pending'</code> as first-class operations &mdash; exactly my two hot paths &mdash; with strong consistency, at the cost of manual sharding past one node. <strong>Cassandra</strong> scales writes horizontally but has no cheap secondary-index range scan on next_run_at and its lightweight-transaction conditional writes are expensive. <strong>DynamoDB</strong> is managed with native conditional writes, but a range on next_run_at needs a GSI that risks a hot partition at midnight."},
+        {who:"intv",text:"So which, and does it survive 100M jobs and heavy transition writes?"},
+        {who:"cand",text:"I choose the <strong>strongly-consistent relational store (Postgres, or a NewSQL like CockroachDB as it grows)</strong>, because the atomic conditional claim and the next_run_at index are the requirements that actually gate correctness and timeliness, and it does both natively. For scale I <strong>shard by <code>job_id</code></strong> aligned with the scheduler's partitions, keep the hot near-term tier in a Redis sorted set so the tight polling loop isn't hammering the DB, and persist only state transitions. Cassandra or Dynamo would win if raw write volume dwarfed everything, but here the conditional claim is the deciding factor, so consistency wins over write-scale."},
+      ],resources:[
+        {title:"Hello Interview — Job Scheduler (data model)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+        {title:"System Design Primer — data model",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     worker:[
       {l:"medium",tag:"concept",q:"How does a worker execute a task safely — lease, run, ack?",turns:[
@@ -318,6 +354,15 @@ window.DATA['scheduler'] = {
       ],resources:[
         {title:"Kafka documentation — session & heartbeat",url:"https://kafka.apache.org/documentation/"},
         {title:"Hello Interview — Job Scheduler (leases)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many workers for 10K executions/s? (Little's law)",turns:[
+        {who:"intv",text:"Size the worker pool. Steady-state is 10K executions/s and jobs run for varying durations. How many workers, and how do you get the number?"},
+        {who:"cand",text:"Little's law gives the concurrency I must sustain: in-flight = arrival rate &times; average duration.<span class='eg'>10K/s &times; ~2s average job &asymp; 20K concurrent executions. If a worker process handles ~50 concurrent IO-bound tasks &rarr; 20K &divide; 50 &asymp; 400 workers steady-state; provision ~1.5x for normal peaks &rarr; ~600.</span>That's the floor for the average; the tail of long jobs and bursts is what makes a fixed number wrong."},
+        {who:"intv",text:"Durations vary wildly &mdash; some 10ms, some minutes. A fixed pool either idles or falls behind. So?"},
+        {who:"cand",text:"Because workers are stateless queue consumers, I don't fix the pool &mdash; I <strong>autoscale on queue depth and consumer lag</strong>, using the Little's-law number only as a warm floor. The trade-off with a static pool is cost (over-provision for peak) versus lateness (under-provision and jobs fire late); autoscaling tracks load but lags a sudden spike. I also <strong>separate pools by duration class</strong> so multi-minute jobs don't head-of-line-block thousands of 10ms tasks. So: floor from Little's law, scale on backlog, isolate long jobs &mdash; capacity follows load instead of guessing it."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
       ]},
     ],
     scheduler:[
@@ -357,6 +402,15 @@ window.DATA['scheduler'] = {
         {title:"Leader election",url:"https://en.wikipedia.org/wiki/Leader_election"},
         {title:"System Design Primer — consistency patterns",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many scheduler partitions to clear due jobs within the poll window?",turns:[
+        {who:"intv",text:"Size the scheduler. It polls for due jobs on a ~1s tick. How many partitions or instances do you need so due jobs are cleared within the window, including the midnight burst?"},
+        {who:"cand",text:"Steady-state is easy; the burst sets the number. Each scheduler pops due jobs from its partition's sorted set and does an atomic claim, so throughput is claims/s.<span class='eg'>steady ~10K due/s and one instance sustaining ~10K claims/s &rarr; 1-2 partitions. But 1M jobs land near midnight; smeared by jitter over a ~20s tolerance that's ~50K/s &rarr; 50K &divide; 10K &asymp; 5 partitions; round to ~6 with headroom so each tick finishes inside its 1s interval.</span>"},
+        {who:"intv",text:"Why partition by job id for that, rather than by fire time?"},
+        {who:"cand",text:"Partitioning by <strong>hash of job id</strong> spreads the 100M jobs and their scan work evenly and lets me align partitions with the store's shards. The alternative, partitioning by <em>time</em>, would concentrate the whole midnight tick into one partition &mdash; a self-inflicted hotspot. The trade-off is that id-partitioning means a temporal spike lights up every partition at once rather than one, but that's fine because the load is spread, not stacked. So I decide: partition by id for even parallel scanning, flatten the time axis separately with jitter, and size N so the worst-case tick still completes within the poll interval."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — Job Scheduler (scaling)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
     ],
     queue:[
       {l:"medium",tag:"concept",q:"Why a queue between scheduler and workers, and what semantics?",turns:[
@@ -385,6 +439,15 @@ window.DATA['scheduler'] = {
       ],resources:[
         {title:"Kafka documentation — replication & durability",url:"https://kafka.apache.org/documentation/"},
         {title:"Hello Interview — Job Scheduler (durability)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many task-queue partitions for throughput and the midnight burst?",turns:[
+        {who:"intv",text:"Size the task queue. How many partitions do you provision for steady throughput and the midnight burst without it becoming the bottleneck?"},
+        {who:"cand",text:"Size on peak drain, not average. Both enqueue and dequeue flow through it, and one partition/broker sustains a bounded throughput.<span class='eg'>steady ~10K msgs/s in and ~10K out; if a partition comfortably handles ~5K msgs/s &rarr; ~4 partitions steady. Midnight smeared by jitter is ~50K/s &rarr; 50K &divide; 5K &asymp; 10; round to ~12-16 for headroom and parallel consumer groups.</span>Backlog is fine &mdash; depth just grows and drains &mdash; so I size partitions for throughput, not to avoid buffering."},
+        {who:"intv",text:"More partitions means more parallelism &mdash; any downside to just cranking the count?"},
+        {who:"cand",text:"Yes: each partition adds consumer-assignment and rebalance overhead, more connections, and finer-grained ordering to reason about. The trade-off is parallel throughput and priority isolation versus operational complexity and rebalance churn. So I decide: provision partitions from the <strong>peak drain rate</strong> with modest headroom rather than maxing them out, and split into <strong>separate priority partitions</strong> (urgent vs best-effort) so a low-priority flood can't starve time-critical jobs. Throughput comes from partition count; fairness comes from separating classes."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Kafka documentation",url:"https://kafka.apache.org/documentation/"},
       ]},
     ],
     coordinator:[
@@ -415,6 +478,24 @@ window.DATA['scheduler'] = {
         {title:"Leader election",url:"https://en.wikipedia.org/wiki/Leader_election"},
         {title:"ZooKeeper overview",url:"https://zookeeper.apache.org/doc/current/zookeeperOver.html"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much load does the coordinator take, and how big an ensemble?",turns:[
+        {who:"intv",text:"Size the coordinator. How much load does it actually carry, and how many nodes in the ensemble?"},
+        {who:"cand",text:"Almost none, by design &mdash; it's off the hot path. It handles membership and partition assignment, not per-job traffic, so its load scales with the number of schedulers and how often they renew leases, not with 10K exec/s.<span class='eg'>40 schedulers renewing a lease every 5s &rarr; ~8 renewals/s, plus rare rebalances on membership change &mdash; hundreds of ops/s at most, not thousands.</span>So the coordinator is tiny compute; the real sizing question is the ensemble for fault tolerance."},
+        {who:"intv",text:"So 3 nodes or 5?"},
+        {who:"cand",text:"It's a quorum trade-off. A <strong>3-node</strong> ensemble tolerates 1 failure and has a fast 2-node write quorum; a <strong>5-node</strong> ensemble tolerates 2 failures but every write needs a 3-node quorum, so it's a touch slower and costs more. Since the coordinator is rarely written to and off the hot path, latency barely matters, so the choice is purely how much redundancy I want. I decide: <strong>3 nodes</strong> across AZs as the default, moving to 5 only if losing the coordinator is judged catastrophic enough to want double-fault tolerance. Either way it stays small and out of the per-job path."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ZooKeeper overview",url:"https://zookeeper.apache.org/doc/current/zookeeperOver.html"},
+      ]},
+      {l:"medium",tag:"concept",q:"ZooKeeper vs etcd for coordination — which and why?",turns:[
+        {who:"intv",text:"You keep saying ZooKeeper or etcd. Pick one and justify it against the other for this coordinator role."},
+        {who:"cand",text:"Both give me what I need: linearizable consistency (ZooKeeper via Zab, etcd via Raft), ephemeral membership, and watches. <strong>ZooKeeper</strong> is battle-tested, and its ephemeral znodes plus watches map cleanly onto membership &mdash; a scheduler's node vanishes when its session drops and peers get notified &mdash; but it's a heavier JVM system to operate. <strong>etcd</strong> has a simpler gRPC/HTTP API, lease-based keys, and backs Kubernetes, so it's lighter to run and its lease + revision model is a clean fit for fencing."},
+        {who:"intv",text:"Whichever you pick, where does the fencing token come from?"},
+        {who:"cand",text:"That's actually the deciding lens. Both expose a <strong>monotonic revision</strong> &mdash; etcd's <code>mod_revision</code> or ZooKeeper's <code>zxid</code> / znode version &mdash; that I use directly as the fencing epoch on a partition assignment, so the store can reject a stale owner. Since both give it natively, I decide on operational fit: <strong>if we already run Kubernetes, etcd</strong> (one less system to operate, clean lease/revision API); a shop with existing ZooKeeper expertise and Kafka/Hadoop alongside should stay on ZooKeeper. The point is to delegate consensus to a proven system rather than hand-roll it, not that one is universally better."},
+      ],resources:[
+        {title:"ZooKeeper overview",url:"https://zookeeper.apache.org/doc/current/zookeeperOver.html"},
+        {title:"Leader election",url:"https://en.wikipedia.org/wiki/Leader_election"},
+      ]},
     ],
     deadletter:[
       {l:"medium",tag:"concept",q:"What goes to the dead-letter, and why separate it?",turns:[
@@ -443,6 +524,24 @@ window.DATA['scheduler'] = {
       ],resources:[
         {title:"Idempotence",url:"https://en.wikipedia.org/wiki/Idempotence"},
         {title:"Hello Interview — Job Scheduler (dead-letter & replay)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the dead-letter store — volume and retention.",turns:[
+        {who:"intv",text:"Size the dead-letter store. Given retries and a low failure rate, how much volume does it hold, and how do you set retention?"},
+        {who:"cand",text:"It's small in steady-state because only jobs that exhaust all retries land there.<span class='eg'>say 0.1% of 10K exec/s finally fail &rarr; ~10/s &asymp; 860K entries/day; each carries def + payload + last error, a few KB &rarr; ~a few GB/day; retain 30 days &asymp; ~100GB.</span>Modest &mdash; but it must also absorb a burst, like a bad deploy dead-lettering 50K jobs in an hour, so I size for write spikes, not just the average."},
+        {who:"intv",text:"So how long do you keep entries, and what's the tension?"},
+        {who:"cand",text:"The trade-off is retention cost versus operability: too short and I lose the ability to triage and <strong>replay</strong> after a fix; too long and I pay to store stale failures forever. Since replay after fixing a downstream is the whole point of the dead-letter, I decide: retain long enough to cover realistic triage-and-fix cycles &mdash; on the order of <strong>30 days</strong> &mdash; <strong>partition by <code>failed_at</code></strong> so bursts spread and old entries age out cleanly, and <strong>alert on depth</strong> so a flood pages someone. Storage is cheap here; losing replayability is not."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — Job Scheduler (retries & dead-letter)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
+      ]},
+      {l:"medium",tag:"concept",q:"What backs the dead-letter — a broker DLQ, a Kafka topic, or a table?",turns:[
+        {who:"intv",text:"What actually stores dead-lettered jobs &mdash; a broker's built-in DLQ, a Kafka topic, or a table in your store? Compare the options."},
+        {who:"cand",text:"Three candidates. A <strong>broker-native DLQ</strong> (SQS redrive, RabbitMQ dead-letter exchange) routes automatically after max receives and needs no extra plumbing, but it's poor for querying and triage and has retention caps. A <strong>Kafka topic</strong> is durable, high-throughput, and replayable, but querying by job, owner, or error type is awkward &mdash; it's a log, not an index. A <strong>database table</strong> (my <code>dead_letter</code> table) is queryable by error/owner/time, makes selective replay and depth-based alerting trivial via ordinary queries, at the modest volume this sees."},
+        {who:"intv",text:"And under a 50K bad-deploy flood &mdash; does the table still win?"},
+        {who:"cand",text:"It holds: 50K rows is nothing for a table, and it's append-heavy so I index by <code>failed_at</code> and <code>last_error</code> and partition if needed. Replay is a <strong>rate-limited scan-and-re-enqueue</strong> with a replay-state column so it's resumable after a crash &mdash; something a raw log makes clumsy. Kafka would win on pure throughput, but the dead-letter is an <em>operational surface</em> I need to filter, triage, and selectively replay, so I decide: a <strong>database table as the primary store</strong>, optionally fed by a broker DLQ as the transport that carries exhausted jobs into it. Query ergonomics beat raw throughput for this component."},
+      ],resources:[
+        {title:"Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"Hello Interview — Job Scheduler (retries & dead-letter)",url:"https://www.hellointerview.com/learn/system-design/problem-breakdowns/job-scheduler"},
       ]},
     ],
   }

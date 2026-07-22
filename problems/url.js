@@ -184,8 +184,26 @@ window.DATA['url'] = {
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
         {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many LB/gateway nodes, and what bounds them?",turns:[
+        {who:"intv",text:"Size the edge tier. Reads run ~116K/s, peak 3-5x. How many LB/gateway nodes do you run, and is the limit connections or bandwidth? Show the math."},
+        {who:"cand",text:"The redirect response is tiny, so I expect connections to bind before bandwidth — let me check both.<span class='eg'>Peak &approx; 116K &times; 4 &approx; 464K req/s. A 302 response is ~500 bytes &rarr; 464K &times; 500B &approx; 230 MB/s &approx; 1.9 Gbps of egress, trivial for an edge tier. Connections: at ~50K req/s per L7 node &rarr; 464K &divide; 50K &approx; 10 nodes; add headroom and spread across 3 AZs &rarr; ~15 nodes.</span>So it is request/connection handling, not bandwidth, that sets the node count."},
+        {who:"intv",text:"So connections bound you. What assumption in that math is fragile?"},
+        {who:"cand",text:"The ~50K req/s per node assumes connection reuse. The real cost is the <strong>TLS handshake rate</strong> — if clients open a fresh connection per redirect (common, since a redirect is one-shot), CPU spent on handshakes dominates and per-node throughput collapses well below 50K. The trade-off: terminate TLS at the LB with session resumption and keep-alive to amortise handshakes, versus pushing redirects to the <strong>CDN/edge</strong> so most never reach my LB at all. I'd size the tier on new-connection rate with generous headroom and lean on the edge to shave the bulk of it, rather than trust a steady-state req/s number."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — CDN & load balancing",url:"https://github.com/donnemartin/system-design-primer#content-delivery-network"},
+      ]},
     ],
     svc:[
+      {l:"medium",tag:"capacity",q:"How many service instances do you actually need?",turns:[
+        {who:"intv",text:"Concrete numbers now. You quoted ~116K reads/s and ~1,160 writes/s, peak 3-5x. How many <strong>shortener-service instances</strong> do you run? Show me the math, don't just say 'autoscale'."},
+        {who:"cand",text:"Let me size it from a per-instance throughput budget. The service is stateless and CPU-light — validate, a cache/DB lookup, serialize — so a modern 4-core instance handles maybe <strong>~5,000 req/s</strong> comfortably at low latency (I'd confirm with a load test; this is the estimate).<span class='eg'>Peak reads ≈ 116K × 4 ≈ 464K req/s. 464K ÷ 5K ≈ 93 instances. Add ~30% headroom → ~120. Writes are ~5K/s peak → ~1-2 instances, negligible. So call it ~120 read-serving instances at peak.</span>Round up and spread across ≥3 AZs so losing an AZ drops ~1/3 of capacity, not the service."},
+        {who:"intv",text:"120 feels like a lot for what's basically a cache lookup. What would cut it?"},
+        {who:"cand",text:"The number is dominated by the assumption that every read hits the service. It shouldn't — with the <strong>CDN/edge</strong> serving hot redirects and a high cache-hit ratio, most reads never reach the fleet, so the origin might need <em>10-20</em> instances, not 120. That's the real lever: the instance count is a function of cache-hit ratio, so I'd quote the range and say 'the honest answer is single-digit-to-low-tens once the edge is doing its job; I size the fleet to survive a cold cache, then let it scale down.' The trade-off is provisioning for the worst case (cost) vs autoscaling lag (risk during a cache flush) — I'd keep a warm floor of ~20 and autoscale above it."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Latency numbers every programmer should know",url:"https://github.com/donnemartin/system-design-primer#latency-numbers-every-programmer-should-know"},
+      ]},
       {l:"easy",tag:"concept",q:"Walk me through a create request end to end.",turns:[
         {who:"intv",text:"Take me through exactly what the service does on <code>POST /shorten {url: https://example.com/very/long/path}</code>. Every step."},
         {who:"cand",text:"<ul><li><strong>Validate</strong> — well-formed, http/https, length bound.</li><li><strong>Get a unique key</strong> from key-gen, say <code>aX9bQ</code>.</li><li><strong>Persist</strong> <code>aX9bQ → {longURL, userId, createdAt, expiry}</code> to the KV store.</li><li><strong>Warm the cache</strong> (best-effort).</li><li><strong>Return</strong> <code>https://sho.rt/aX9bQ</code>.</li></ul>The handler is thin and <strong>stateless</strong> — all durable state is in the DB, so any instance serves any request."},
@@ -224,6 +242,15 @@ window.DATA['url'] = {
       ]},
     ],
     db:[
+      {l:"medium",tag:"capacity",q:"How many DB shards / nodes, and how much storage?",turns:[
+        {who:"intv",text:"Size the datastore. You said ~180B mappings at ~500 bytes. How much storage, and how many shards/nodes do you provision?"},
+        {who:"cand",text:"Storage first, then throughput — they give different answers and I take the max.<span class='eg'>Storage: 180B × 500B ≈ 90 TB raw. With replication factor 3 → ~270 TB. At ~2 TB usable/node → ~135 nodes for space alone.<br>Throughput: peak writes ~5K/s, peak reads (cold cache) ~464K/s. A wide-column node does ~10-20K ops/s → reads would want ~25-45 nodes, but the cache absorbs almost all reads, so steady-state the DB sees far less.</span>Storage dominates here, so I'd provision on the order of <strong>~135 nodes</strong> (say 150 with headroom), which comfortably covers throughput too."},
+        {who:"intv",text:"That's sized for 5 years of data sitting hot forever. Wasteful?"},
+        {who:"cand",text:"Yes, and I'd push back on keeping everything hot. Most links are cold within days of creation, so I'd <strong>tier</strong>: recent/active mappings on the fast cluster, and age out old-but-not-expired links to cheaper cold storage, with a slower lookup path for the rare cold hit. That could cut the hot cluster several-fold. The trade-off is added complexity and a latency cliff for cold links — acceptable because cold links are, by definition, rarely clicked. I'd also let TTL/expiry reclaim space automatically so the 90 TB is an over-estimate in practice."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Amazon Dynamo paper (partitioning)",url:"https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"},
+      ]},
       {l:"medium",tag:"concept",q:"SQL or NoSQL, schema, and how do you shard?",turns:[
         {who:"intv",text:"Pick your datastore and defend it, then give me the schema and how you shard 180B rows."},
         {who:"cand",text:"<strong>Key-value / wide-column NoSQL</strong> — DynamoDB or Cassandra. The access pattern is a point lookup by primary key, no joins, needing huge horizontal write throughput and storage. Schema: <code>key (PK) → {longURL, userId, createdAt, expiry}</code>. Shard by <strong>hash of the key</strong> so a lookup goes straight to one shard and writes spread uniformly."},
@@ -271,6 +298,24 @@ window.DATA['url'] = {
         {title:"Count-min sketch (heavy hitters)",url:"https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch"},
         {title:"System Design Primer — cache",url:"https://github.com/donnemartin/system-design-primer#cache"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much memory and how many Redis nodes?",turns:[
+        {who:"intv",text:"Size the cache. You lean on a ~95% hit ratio at 116K reads/s. How much memory does Redis need, and how many nodes? Give me numbers."},
+        {who:"cand",text:"Memory is driven by the hot working set, not all 180B mappings.<span class='eg'>Per entry &approx; 11B key + ~200B URL + overhead &approx; ~300 bytes. Caching the hot ~100M links &rarr; 100M &times; 300B &approx; 30 GB. Throughput: peak ~464K reads/s &divide; ~100K ops/s per node &approx; 5 nodes. Take the max of memory and throughput &rarr; ~5-6 nodes, replicated across AZs.</span>So ~30-64 GB of RAM on a handful of replicated nodes covers it."},
+        {who:"intv",text:"Why cache only ~100M and not all 180B mappings?"},
+        {who:"cand",text:"Caching everything would need <strong>180B &times; 300B &approx; 54 TB of RAM</strong> — absurd against putting it on disk in the DB. Access is heavily skewed, so ~30 GB already captures ~95% of reads. The trade-off is the shape of the hit-ratio curve: more RAM buys a higher hit ratio, but the gains flatten fast into the long tail while cost grows linearly. So I size the cache to the <em>knee</em> of that curve — tens of GB — and let the DB plus read-replicas absorb the cold-tail misses, rather than paying to cache links almost nobody clicks."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Redis: eviction policies",url:"https://redis.io/docs/latest/operate/oss_and_stack/management/config/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Redis or Memcached for the cache — which and why?",turns:[
+        {who:"intv",text:"You keep saying Redis. Defend it — why Redis over Memcached for this cache?"},
+        {who:"cand",text:"Both are in-memory KV stores, and my access pattern — point lookups of an immutable <code>key &rarr; url</code> — is exactly what <strong>Memcached</strong> nails: multithreaded, dead simple, superb raw get/set throughput per core. <strong>Redis</strong> is single-threaded per shard but brings replication, persistence, and cluster-mode failover. For a pure disposable cache Memcached would be tempting on cost and speed."},
+        {who:"intv",text:"So if Memcached is faster per core, why not take it?"},
+        {who:"cand",text:"Because my expensive component is the <em>DB</em>, not the cache. A cold or emptied cache triggers a thundering herd onto the DB — so cache <strong>high availability</strong> matters more to me than raw per-core speed. Redis replication + persistence lets a restarted node come back <em>warm</em> off a replica instead of empty, and cluster mode lets me shard and fan out hot keys. The trade-off is accepting Redis's single-threaded-per-shard model and heavier ops for that HA story. Given the cold-cache blast radius, I take Redis; I'd only pick Memcached if the backing store were cheap enough that an empty cache didn't hurt."},
+      ],resources:[
+        {title:"Redis: high availability & replication",url:"https://redis.io/docs/latest/operate/oss_and_stack/management/replication/"},
+        {title:"System Design Primer — cache",url:"https://github.com/donnemartin/system-design-primer#cache"},
+      ]},
     ],
     key:[
       {l:"hard",tag:"scaling",q:"Generate unique IDs across many servers, no central bottleneck.",turns:[
@@ -290,6 +335,24 @@ window.DATA['url'] = {
       ],resources:[
         {title:"Apache ZooKeeper overview",url:"https://zookeeper.apache.org/doc/current/zookeeperOver.html"},
         {title:"System Design Primer — unique IDs",url:"https://github.com/donnemartin/system-design-primer#use-good-indices"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How big should each ID block be?",turns:[
+        {who:"intv",text:"Size the block-allocation scheme. At ~1,160 creates/s (peak ~5K/s) across ~30 instances, how big is each ID block, and how often does an instance hit the coordinator?"},
+        {who:"cand",text:"Let me work it from a 1M-ID block.<span class='eg'>Peak ~5K creates/s &divide; ~30 instances &approx; 170 creates/s per instance. A 1M block lasts 1M &divide; 170 &approx; 5,900 s &approx; 98 min. So each instance coordinates &lt; once/hour; fleet-wide &approx; 30 blocks/hour &approx; 0.008 allocations/s on the coordinator.</span>The coordinator is almost idle, and the <code>id_ranges</code> table is a few hundred rows — storage is a non-issue."},
+        {who:"intv",text:"Why 1M per block and not 1K or 1B?"},
+        {who:"cand",text:"It is a direct trade-off between coordinator load and waste. <strong>Smaller blocks</strong> (1K) mean an instance re-coordinates every ~6s — constant pressure on the coordinator and more exposure to its downtime — but almost no wasted IDs on a crash. <strong>Bigger blocks</strong> (1B) mean near-zero coordination but a crash strands up to a billion IDs and the key length grows faster as I burn the space. At 1M I coordinate sub-hourly (cheap, and survives a coordinator blip via prefetch) while crash waste is negligible against the 3.5T key space. So 1M sits at the balance point; I'd only shrink it if coordinator downtime tolerance mattered more than ID density."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+      ]},
+      {l:"hard",tag:"concept",q:"What backs ID allocation — ZooKeeper, a DB sequence, or Snowflake?",turns:[
+        {who:"intv",text:"For minting the unique integers, what technology backs it — a DB sequence, ZooKeeper, Redis INCR, or Snowflake-style local generation? Pick and defend."},
+        {who:"cand",text:"Weighing the options against 'short dense keys, no central bottleneck': a <strong>DB auto-increment</strong> is simplest but is the hotspot/SPOF I am trying to kill. <strong>Redis INCR</strong> is a fast atomic counter but adds a critical central dependency. <strong>ZooKeeper</strong> gives strongly-consistent leasing, battle-tested, but is a heavy ensemble to operate. <strong>Snowflake</strong> is fully local with zero coordination and time-sortable, but produces longer keys. Since a shortener wants short, dense keys, I favour block allocation over Snowflake as the primary."},
+        {who:"intv",text:"You picked block allocation. ZooKeeper or a DB sequence to hand out the blocks?"},
+        {who:"cand",text:"The capacity math is the deciding factor: blocks are leased &lt; once/hour/instance, so the allocator sees well under one request/second — the old auto-increment hotspot simply evaporates at that rate. That means I do not need ZooKeeper's coordination throughput. The trade-off: ZK gives clean ephemeral-lease and leader-election semantics for free but is another system to run; a strongly-consistent conditional-update on my existing DB is one less moving part. So I lease blocks with a conditional write on the DB I already operate, and keep <strong>Snowflake</strong> as the coordination-free fallback if I ever want to drop the allocator entirely. The choice is driven by ops cost, since throughput is a non-issue here."},
+      ],resources:[
+        {title:"Instagram Engineering: sharding & IDs",url:"https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c"},
+        {title:"Twitter/X: announcing Snowflake",url:"https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake"},
       ]},
     ],
     replica:[
@@ -311,6 +374,15 @@ window.DATA['url'] = {
         {title:"Raft consensus",url:"https://raft.github.io/"},
         {title:"Fencing tokens (Martin Kleppmann)",url:"https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many read replicas per shard do you run?",turns:[
+        {who:"intv",text:"Size the read-replica tier. Per shard, how many replicas do you run, and what read rate must they sustain — steady-state versus a cold cache?"},
+        {who:"cand",text:"The two cases give very different numbers.<span class='eg'>Steady state: the cache absorbs ~95%, so the DB tier sees ~5.8K reads/s + ~1.2K writes/s spread across shards — a couple of replicas per shard is ample. Cold cache: up to ~464K reads/s hits the DB. At ~15K reads/s per replica &rarr; 464K &divide; 15K &approx; 31 replicas fleet-wide; across ~10 shards &rarr; ~3 replicas/shard.</span>Both roads land near ~3 replicas per shard, which also matches what durability wants."},
+        {who:"intv",text:"So you are sizing for a cold cache that is rare. Isn't that over-provisioning?"},
+        {who:"cand",text:"It would be if I provisioned the full cold-cache fleet to sit idle 99% of the time — that is pure cost. But the floor is set by something I need anyway: a <strong>3-node replica group</strong> per shard for quorum durability and AZ failure tolerance. That floor already covers steady-state reads with room to spare. For the cold-cache surge I lean on <strong>request coalescing</strong> and the edge to cap the spike at the source rather than buying 31 replicas that idle. So durability sets the replica count, and stampede control — not extra hardware — absorbs the peak. The trade-off is a brief elevated-latency window on a cold start, which I accept over permanent over-provisioning."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — replication",url:"https://github.com/donnemartin/system-design-primer#replication"},
+      ]},
     ],
     analytics:[
       {l:"medium",tag:"scaling",q:"Aggregate billions of click events without melting.",turns:[
@@ -318,6 +390,24 @@ window.DATA['url'] = {
         {who:"cand",text:"Row-per-click is the mistake — it couples ingest rate to DB write rate. Instead: events land in <strong>Kafka</strong> (which happily absorbs 500K/s and buffers the spike), and stream consumers do <strong>windowed aggregation</strong> — roll up per-key counts in, say, 1-minute tumbling windows and write <em>aggregates</em>, not raw rows, to an OLAP/column store. That's a ~million-fold reduction in write volume. Raw events also archive to object storage for replay."},
         {who:"intv",text:"The redirect path emits to Kafka synchronously. If Kafka is briefly unavailable, does that stall redirects?"},
         {who:"cand",text:"It must not — analytics is best-effort and off the critical path. The producer is <strong>async, fire-and-forget with a bounded local buffer</strong>: if Kafka is slow/unreachable, events queue in-memory up to a cap and then I <em>drop</em> them (or spill to a local log) rather than block or delay the 302. Losing a slice of analytics during a Kafka blip is acceptable; adding latency to a billion redirects is not. Exact counts aren't the goal — approximate, timely counts are."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"System Design Primer — async & message queues",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many Kafka partitions and consumers?",turns:[
+        {who:"intv",text:"Size the analytics pipeline. Click events peak at ~500K/s during a marketing blast. How many Kafka partitions and consumer instances do you provision? Show the math."},
+        {who:"cand",text:"I size partitions from both bandwidth and consumer parallelism, then take the max.<span class='eg'>Event ~200 bytes &rarr; 500K/s &times; 200B &approx; 100 MB/s ingest. At ~10 MB/s per partition &rarr; ~10 partitions on bandwidth. Consumers: windowed aggregation at ~20K events/s each &rarr; 500K &divide; 20K &approx; 25 consumers, and one consumer reads one partition, so I need &ge; 25 partitions. Max &rarr; ~32 partitions, ~25-32 consumers at peak.</span>I round to 32 for clean rebalancing and headroom."},
+        {who:"intv",text:"Why size partitions for the occasional blast rather than the steady ~116K/s?"},
+        {who:"cand",text:"Because partition count is the one number that is painful to change later — repartitioning reshuffles keys — and it hard-caps my maximum consumer parallelism. So I over-provision partitions up front (they are cheap) and autoscale <em>consumers</em> between ~6 at steady-state and ~32 at peak on consumer lag. Kafka's disk buffering means consumers need not even keep up in real time — they drain the backlog after the spike. The trade-off is a bit of ingest latency during a blast versus a hard scaling ceiling; since analytics is not on the critical path, I take the latency. So: 32 partitions fixed, consumers autoscaled on lag, retention sized to hold a multi-hour backlog."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Kafka, Kinesis, or SQS for the click stream?",turns:[
+        {who:"intv",text:"You default to Kafka for the click stream. Why Kafka over Kinesis or SQS?"},
+        {who:"cand",text:"I match each to the access pattern — high-volume ingest, windowed aggregation, and replay to object storage. <strong>SQS</strong> is a work-queue: consumers delete messages, there is no ordered partitioned log and no replay, so it cannot feed windowed aggregation or re-processing — it is out. <strong>Kinesis</strong> is a managed partitioned log (shards), very Kafka-like with far less ops, but throughput is priced/capped per shard and it is AWS-locked. <strong>Kafka</strong> is a high-throughput partitioned log with retention, replay, and a mature stream-processing ecosystem. The replay requirement alone rules out SQS."},
+        {who:"intv",text:"Kafka versus Kinesis, then — both are logs. What decides it?"},
+        {who:"cand",text:"It comes down to ops capacity versus scale and cost, not raw capability. <strong>Kinesis</strong> wins on operations — no brokers or coordination to run, shards autoscale, tight AWS integration — so it is the right call for a smaller team already all-in on AWS. <strong>Kafka</strong> wins on raw throughput ceiling, cost at sustained 500K/s, portability, and the Kafka Streams/Flink ecosystem for the aggregation. At this scale the per-shard limits and cost of Kinesis add up. So I would run <strong>Kafka</strong> (or managed MSK) if we operate at this volume and can staff it, and reach for Kinesis if minimizing broker ops matters more than the throughput ceiling. The decision follows team and scale, not a feature gap."},
       ],resources:[
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"System Design Primer — async & message queues",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},

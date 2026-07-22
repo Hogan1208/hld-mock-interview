@@ -246,6 +246,15 @@ window.DATA['ticketmaster'] = {
         {title:"Redis — replication & high availability",url:"https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"},
         {title:"System Design Primer — availability",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many gateway instances at the on-sale peak?",turns:[
+        {who:"intv",text:"Numbers. Steady-state browse is ~10K req/s, but at the on-sale a million users poll their queue position every few seconds. How many gateway nodes do you run — and don't just say autoscale?"},
+        {who:"cand",text:"The gateway is thin — TLS, auth, rate-limit, route — so I size it by request rate, and most peak volume is waiting-room polls the edge can absorb.<span class='eg'>1M users polling every ~3s ≈ 330K poll req/s; if the CDN/edge serves ~95%, origin sees ~17K/s. Add steady browse ~10K/s and admitted reserve ~5K/s ≈ 32K/s. At ~10K req/s per node → ~3-4 nodes, +30% headroom → ~5, across 3 AZs.</span>"},
+        {who:"intv",text:"That leans hard on the edge holding. What if the edge is cold or bypassed?"},
+        {who:"cand",text:"Then the gateway eats the full ~330K/s and would need 35+ nodes — a 7x swing — so the real lever is edge cache-hit ratio, not gateway count. The trade-off is provisioning for the cold-edge worst case (cost) versus autoscale lag (risk during a cache flush). I keep a warm floor sized for the edge-working case (~5-6 nodes) and autoscale on request rate above it, and I rely on the waiting room to cap how much reserve traffic ever reaches origin — so the gateway never actually sees the raw million."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
     ],
     booking:[
       {l:"medium",tag:"concept",q:"Two users grab seat 14A at once — who wins?",turns:[
@@ -293,6 +302,15 @@ window.DATA['ticketmaster'] = {
         {title:"System Design Primer — availability & jobs",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"HelloInterview — Ticketmaster",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ticketmaster"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many booking instances — size it off admission, not the stampede.",turns:[
+        {who:"intv",text:"The scary number is a million concurrent buyers. Do you size the booking fleet for that? Show me the math."},
+        {who:"cand",text:"No — sizing for 1M is the trap, because the waiting room caps admitted concurrency at what the backend can absorb.<span class='eg'>Admit ~5K concurrent checkouts; each does a handful of calls (reserve, confirm) over a ~3-min window → ~2-3K short ops/s. A stateless booking node handles ~1K short ops/s → ~3 nodes, +headroom → ~5, across 3 AZs.</span>The fleet is sized to the admission ceiling — a number I choose — not to raw demand."},
+        {who:"intv",text:"So the whole fleet hinges on the admission rate you picked. What sets that?"},
+        {who:"cand",text:"The admission rate is set by the weakest downstream link — inventory-DB write throughput and the payment gateway's limit — and I size booking just above it. The trade-off: admit too high and the DB or payment starve; too low and the line crawls while the backend idles. Since booking is cheap and stateless I keep it a touch over the admission ceiling so it's never the bottleneck, and let the DB and payment ceilings be the real governor. Scaling booking past that buys nothing — the stampede is absorbed in the queue, not here."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"HelloInterview — Ticketmaster",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ticketmaster"},
+      ]},
     ],
     db:[
       {l:"medium",tag:"concept",q:"Why strong/ACID inventory, and how do you model a seat's state?",turns:[
@@ -331,6 +349,15 @@ window.DATA['ticketmaster'] = {
         {title:"Two-phase commit protocol",url:"https://en.wikipedia.org/wiki/Two-phase_commit_protocol"},
         {title:"System Design Primer — consistency & availability",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size the inventory DB — tiny data, but write-contended.",turns:[
+        {who:"intv",text:"Give me storage and node count for inventory. Careful — this isn't like sizing a 90TB store; the data here is small."},
+        {who:"cand",text:"Right — the data is tiny; the constraint is contention and durability, not space.<span class='eg'>~100K seats/event × ~1KB ≈ 100MB per event; even 10K live events ≈ 1TB — trivial. Peak writes are bounded by admission (~5K checkouts) → ~5-10K single-row conditional writes/s. Reads are off-loaded to the seat-map cache.</span>So I don't provision for storage — I provision for HA and write distribution."},
+        {who:"intv",text:"So why not one beefy node, if a terabyte fits comfortably?"},
+        {who:"cand",text:"Because a single node is a durability and split-brain risk for the one store that must never double-sell. Each shard is a 3-replica group across AZs with quorum writes, and I partition a hot event's 100K seats across several partitions so contention spreads over distinct rows. The trade-off is paying replication and partition overhead for data that would physically fit on one box — but here I'm buying correctness and failover, not capacity. Node count is driven by AZ redundancy and hot-event write spread, never by TB."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — sharding",url:"https://github.com/donnemartin/system-design-primer#sharding"},
+      ]},
     ],
     queue:[
       {l:"medium",tag:"concept",q:"How does a virtual waiting room actually work?",turns:[
@@ -359,6 +386,24 @@ window.DATA['ticketmaster'] = {
       ],resources:[
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Redis — locks & leader coordination",url:"https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Millions queued in memory — how much, and is memory the limit?",turns:[
+        {who:"intv",text:"You buffer a million people in Redis. How much memory is that, and is memory what you scale for?"},
+        {who:"cand",text:"Memory is a non-issue; throughput is the real constraint.<span class='eg'>Each entry is small — userId, arrival timestamp, position, status ≈ ~200 bytes. 1M queued ≈ 200MB; even 5M ≈ 1GB, comfortably inside one Redis node's RAM.</span>What stresses the tier is request rate — ~100K joins/s in the first seconds plus millions polling position."},
+        {who:"intv",text:"So if memory is easy, where does the scaling effort actually go?"},
+        {who:"cand",text:"Into throughput and HA, not capacity. Joins are cheap appends to a sorted set, spread across stateless join nodes; position polls — the real volume — are identical for everyone, so I serve one cached 'admitted through position N' value from the edge instead of hitting Redis millions of times a second. The trade-off: I could shard the queue store for headroom, but with only ~1GB of state that adds coordination for zero memory benefit — so I keep a single replicated store (primary + failover) and spend the effort collapsing polls at the edge."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Redis sorted sets",url:"https://redis.io/docs/latest/develop/data-types/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store backs the waiting room — Redis, Kafka, or SQS?",turns:[
+        {who:"intv",text:"The waiting room needs ordering, live positions, and controlled admission. Redis, Kafka, or a managed queue like SQS — pick and defend."},
+        {who:"cand",text:"SQS is a managed work queue but gives no stable position or strict global ordering, so I can't tell a user 'you are number 480,000' — wrong fit. Kafka is a durable, strictly-ordered append log — excellent for a FIFO admission record and for replay. Redis sorted sets give me live positions and atomic admit operations in memory, which is what the real-time 'your place in line' needs."},
+        {who:"intv",text:"Redis is volatile; Kafka is durable but not built for random position reads. So which?"},
+        {who:"cand",text:"I use each for what it's best at rather than forcing one. A Redis sorted set is the live position and admission-control layer — fast atomic reads and pops — while a durable append log (Kafka-style) records admissions so a Redis failover can rebuild who was already let in. The trade-off: Redis alone risks losing ordering on a crash; Kafka alone can't cheaply answer 'what is my position now.' Pairing a fast in-memory position store with a durable admission log gives real-time UX and crash-safe fairness — and the admission rate stays the hard governor regardless."},
+      ],resources:[
+        {title:"Redis sorted sets",url:"https://redis.io/docs/latest/develop/data-types/"},
+        {title:"System Design Primer — asynchronism & queues",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
     ],
     cache:[
@@ -389,6 +434,24 @@ window.DATA['ticketmaster'] = {
         {title:"System Design Primer — caching & availability",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Redis — replication",url:"https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much memory does the seat-map cache need?",turns:[
+        {who:"intv",text:"Size the seat-map cache. How much memory, and is memory what you worry about here?"},
+        {who:"cand",text:"The footprint is small; memory isn't the pressure point.<span class='eg'>A seat's cached state — status plus section/row/num — is ~50 bytes; a 100K-seat event ≈ ~5MB. Thousands of active events ≈ a few GB, easily one Redis node's RAM.</span>The pressure is read throughput — a hot event's map can be ~450K reads/s."},
+        {who:"intv",text:"So what do you actually scale, if not memory?"},
+        {who:"cand",text:"Read fan-out. One event's map being ~90% of reads pins a single node no matter how much RAM I have, so I scale by replicating the hot key across nodes and, above all, serving the map from the CDN/edge with a 1-2s TTL so most reads never reach Redis. The trade-off: replication and edge copies add mild staleness, but the map is already a display hint re-checked at reserve, so that costs nothing. I size the tier for throughput and hot-key spread and treat memory as effectively free."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — cache",url:"https://github.com/donnemartin/system-design-primer#cache"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which cache — Redis or Memcached, and why?",turns:[
+        {who:"intv",text:"You keep saying Redis. Defend it against Memcached for the seat-map cache and the reservation locks — why Redis specifically?"},
+        {who:"cand",text:"Memcached is a lean, multi-threaded, pure-LRU key-value cache — perfect if all I needed was to stash blobs. But I need more than GET/SET: atomic <code>SET NX EX</code> for reservation locks, sorted sets for the waiting room, and pub/sub to fan seat-state changes out to the cached map. Redis gives all of that plus replication and failover; Memcached has none of the data structures or pub/sub."},
+        {who:"intv",text:"Memcached is simpler and multi-threaded — doesn't it win on raw per-node throughput?"},
+        {who:"cand",text:"It can edge Redis on pure key-value throughput per core, yes. But that axis isn't my bottleneck — hot-key fan-out and edge caching already handle read volume — and I'd rather run one technology that also does locks, queue positions, and change pub/sub than bolt Memcached alongside a separate lock and queue system. So I choose Redis: the trade-off is giving up a little raw KV speed to get atomic locks, sorted-set queues, pub/sub, and replication in one store — decisive given how much of this design leans on those."},
+      ],resources:[
+        {title:"Redis distributed locks",url:"https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"},
+        {title:"System Design Primer — caching",url:"https://github.com/donnemartin/system-design-primer#cache"},
+      ]},
     ],
     payment:[
       {l:"medium",tag:"concept",q:"Charge on a held seat — how does confirm work?",turns:[
@@ -418,6 +481,15 @@ window.DATA['ticketmaster'] = {
         {title:"System Design Primer — asynchronism & backpressure",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Saga pattern",url:"https://microservices.io/patterns/data/saga.html"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size payment for the end-of-hold charge burst.",turns:[
+        {who:"intv",text:"Near the end of the hold window, admitted buyers all submit cards at once. How do you size payment, and what bounds it?"},
+        {who:"cand",text:"Payment throughput is bounded by the third-party gateway, not my compute.<span class='eg'>~5K admitted buyers → a burst of ~5K charges in a few seconds; each round-trips the gateway in ~1-2s. To clear 5K in ~30s at ~1.5s each I need ~250 charges in flight → a small async worker pool, not a big fleet.</span>The workers are I/O-bound waiters, so a few instances cover it."},
+        {who:"intv",text:"So why not just fire all 5K at the gateway at once?"},
+        {who:"cand",text:"Because the gateway rate-limits and occasionally 503s, so bursting drops charges. I enqueue charge intents and drain them through the worker pool at a rate the gateway accepts, with idempotent retries and backoff. The trade-off is added latency — the user sees 'processing' — versus lost sales, an easy call since the hold protects the seat meanwhile. I size workers to the gateway's ceiling, then backpressure that ceiling up to the waiting room so I never admit more buyers than I can charge inside a hold window."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Saga pattern",url:"https://microservices.io/patterns/data/saga.html"},
+      ]},
     ],
     search:[
       {l:"easy",tag:"concept",q:"How does browse/search differ from the booking path?",turns:[
@@ -445,6 +517,24 @@ window.DATA['ticketmaster'] = {
         {who:"cand",text:"Serve <strong>fallbacks</strong>: the CDN keeps serving cached popular queries and category pages with its last-good copy, so common browses still render (slightly stale). For uncached queries I fall back to a simpler path — a static 'featured/trending events' list or a basic metadata lookup — rather than a blank error, and show a soft 'search is temporarily limited' banner. Because the index is a rebuildable read model fed from the durable catalog and event log, I can also <strong>rebuild it from the stream</strong> after recovery with no data loss. The user-facing principle: discovery degrades to a reduced experience, buying stays fully available."},
       ],resources:[
         {title:"System Design Primer — availability & graceful degradation",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"HelloInterview — Ticketmaster",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ticketmaster"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many search nodes for the browse load?",turns:[
+        {who:"intv",text:"Steady-state you get ~50K search/browse queries/s, spiking when a marquee tour is announced. Size the search tier."},
+        {who:"cand",text:"Storage is small; query throughput drives the node count.<span class='eg'>Event metadata is maybe a few million events × ~1KB ≈ a few GB — fits in memory across a handful of shards. A node serves ~5-10K queries/s → ~50K/s wants ~6-8 nodes; with replicas for HA call it ~10, plus a CDN caching popular query pages.</span>None of this touches the inventory DB — search reads its own index."},
+        {who:"intv",text:"The announcement spike is unpredictable. Provision for peak or autoscale?"},
+        {who:"cand",text:"I lean on the CDN first — 'concerts in Chicago' is asked by thousands, so cached result pages collapse the spike before it reaches the index. Behind that I keep replicas sized for steady ~50K/s with headroom and autoscale read replicas for the spike. The trade-off is index-replica cost versus spike risk, and because browse is eventually consistent and never blocks a sale, I under-provision relative to worst case and let the CDN plus autoscale absorb the marquee moments — a slightly slower browse is harmless."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which search backend — Elasticsearch or Postgres full-text?",turns:[
+        {who:"intv",text:"For discovery, why a dedicated Elasticsearch-style index instead of just Postgres full-text search on the events table?"},
+        {who:"cand",text:"Postgres full-text (<code>tsvector</code> + GIN) is genuinely good and means one less system to run — fine at a modest catalog size. But discovery needs relevance ranking, faceted filters (city, date, price, genre), typo tolerance, and autocomplete, and it must scale reads independently of any transactional store. Elasticsearch is built for exactly that — inverted index, BM25 relevance, aggregations for facets, and horizontal read scaling."},
+        {who:"intv",text:"Running Elasticsearch is real operational cost. When is Postgres full-text the right call?"},
+        {who:"cand",text:"If the catalog were small and search a secondary feature, I'd keep it in Postgres full-text to avoid operating a second datastore and a sync pipeline — simplicity wins there. Here browse is a primary, high-QPS, spiky workload with rich ranking and faceting needs, so the trade-off flips: I pay the operational cost and the change-data-capture sync complexity of Elasticsearch to get relevance, facets, typo tolerance, and independent scaling. The clincher is isolation — a browse spike must never compete with booking, and a separate index guarantees it."},
+      ],resources:[
+        {title:"System Design Primer — search & eventual consistency",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"HelloInterview — Ticketmaster",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ticketmaster"},
       ]},
     ],

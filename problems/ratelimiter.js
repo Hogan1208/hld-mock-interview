@@ -197,6 +197,15 @@ window.DATA['ratelimiter'] = {
         {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
         {title:"Redis: EVAL and Lua scripting",url:"https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many limiter instances do you actually need?",turns:[
+        {who:"intv",text:"Concrete numbers. ~1M req/s across the fleet, and decision overhead must stay p99 &lt; 5ms. How many <strong>limiter instances</strong> do you run? Show me the math, don't just say autoscale."},
+        {who:"cand",text:"Size it from a per-instance budget. A limiter decision is thin — an in-memory rule lookup plus one atomic round-trip to the counter store — so a modern 4-core instance handles maybe <strong>~25K decisions/s</strong> at low latency (I'd confirm with a load test; this is the estimate).<span class='eg'>1M req/s &divide; 25K/s &asymp; 40 instances. Add ~30% headroom &rarr; ~52, spread across 3 AZs so losing one AZ drops ~1/3 of capacity, not the service.</span>The instance is stateless, so it scales linearly — the count is really set by the store round-trip time on the hot path, not by CPU."},
+        {who:"intv",text:"40-ish is dominated by that store hop. What changes the number, and what does it cost you?"},
+        {who:"cand",text:"Anything that removes the round-trip shrinks the fleet, so this is a latency-vs-accuracy trade. <strong>Local counting</strong> (decide in-process, reconcile deltas every interval) turns a decision into microseconds, so per-instance throughput jumps and I might need a third of the instances — but I pay in bounded overshoot between syncs. <strong>Pipelining/batching</strong> store ops cuts the effective per-decision cost while keeping central accuracy.<span class='eg'>Local counting at ~200K decisions/s/instance &rarr; 1M &divide; 200K &asymp; 5-8 instances, versus ~52 strict-central.</span>So I keep a warm floor sized for strict-central on the accuracy-critical tiers and lean on local counting only for high-volume tiers where a few percent overshoot is fine — the instance count is a function of how much accuracy each tier demands."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
+      ]},
     ],
     store:[
       {l:"medium",tag:"concept",q:"How are counters stored — key shape, TTL, memory?",turns:[
@@ -244,6 +253,24 @@ window.DATA['ratelimiter'] = {
         {title:"Redis: EVAL and Lua scripting",url:"https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much memory and how many Redis nodes for the counters?",turns:[
+        {who:"intv",text:"Size the counter store from the framing: ~10M active keys and ~1M ops/s. How much memory, and how many Redis nodes?"},
+        {who:"cand",text:"Memory and throughput give different answers, so I compute both and take the max.<span class='eg'>Memory: 10M keys &times; ~100 bytes &asymp; 1GB. Token-bucket or sliding-window-counter is 1-2 keys per api-key, so still ~1-2GB; &times; replication factor 3 &asymp; 3-6GB — trivial for RAM.<br>Throughput: 1M ops/s &divide; ~100K ops/s per Redis shard &asymp; 10-12 shards.</span>So <strong>throughput</strong>, not memory, sets the node count — I'd provision ~12 shards, each a primary + replica for failover, which is ~24 nodes and leaves memory almost empty."},
+        {who:"intv",text:"Memory is tiny but you want a dozen shards for ops. What could blow up the memory side, and what's the trade?"},
+        {who:"cand",text:"The algorithm is what blows up memory: <strong>sliding-window-log</strong> stores a timestamp per request, so per key goes from ~16 bytes (two integers) to kilobytes.<span class='eg'>10M keys &times; 1000 timestamps &times; 8 bytes &asymp; 80GB+, versus ~160MB for the counter form — a ~500x swing.</span>And richer atomic ops (Lua <code>EVAL</code>) raise per-op CPU, cutting the 100K/s/shard figure. The trade is shard count vs per-key structure: more shards buys ops headroom but adds cross-shard cost for hot-key fan-out. So my decision is to provision on ops (~12 shards + replicas) and keep every per-key structure to O(1) integers, so memory never becomes the binding constraint and the store stays cheap."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Cloudflare: counting things, a lot of different things",url:"https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which counter store — Redis, Memcached, or in-memory + gossip?",turns:[
+        {who:"intv",text:"You keep saying Redis. Defend it against the real alternatives — why Redis and not Memcached or a pure in-memory-plus-gossip layer?"},
+        {who:"cand",text:"The counter store's job is <strong>atomic read-modify-write per key</strong> with TTL and failover, and that filters the field. <strong>Redis</strong> gives atomic <code>INCR</code>, multi-step atomicity via Lua <code>EVAL</code> (token-bucket refill in one indivisible op), native <code>EXPIRE</code>, and primary/replica failover — it hits every requirement. <strong>Memcached</strong> is a fast KV cache with atomic incr/decr, but no server-side scripting and weak replication, so multi-step algorithms race. <strong>In-memory + gossip</strong> (counters in each node's RAM, deltas gossiped) is the fastest — no network hop — but only eventually consistent, so the global limit drifts and it's far more complex to reason about."},
+        {who:"intv",text:"Memcached also has atomic incr. Why not take the simpler, cheaper option?"},
+        {who:"cand",text:"Because a bare counter isn't the whole job. Token bucket needs read-check-refill-decrement as one atomic unit, and Memcached can't run that server-side — I'd be back to a client-side compare-then-write race, the exact bug I'm trying to kill. Redis Lua collapses it into one server-side step, and its replication + TTL give me failover and self-cleaning buckets for free.<span class='eg'>Memcached: GET + compute + CAS = 2 round-trips and a retry loop under contention; Redis EVAL = 1 atomic round-trip, no retry.</span>So my decision is <strong>Redis as the source-of-truth counter store</strong> for its atomicity, and I reserve the in-memory-plus-gossip pattern only as a local-counting layer on top for the highest-volume tiers that can trade accuracy for latency. Memcached's simplicity doesn't pay off once the algorithm is more than a raw counter."},
+      ],resources:[
+        {title:"Redis: EVAL and Lua scripting",url:"https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"},
+        {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
+      ]},
     ],
     gw:[
       {l:"medium",tag:"concept",q:"Where do you enforce — gateway, sidecar, or in-app library?",turns:[
@@ -290,6 +317,15 @@ window.DATA['ratelimiter'] = {
       ],resources:[
         {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many gateway nodes for the full firehose?",turns:[
+        {who:"intv",text:"Numbers for the edge. ~1M req/s hits the gateway fleet. How many <strong>gateway nodes</strong>, and what actually dominates their capacity?"},
+        {who:"cand",text:"Size from a per-node throughput budget. A gateway node terminates TLS, authenticates, and makes one limiter decision call — the TLS and connection handling dominate, not the limiter hop.<span class='eg'>1M req/s &divide; ~20K req/s per node &asymp; 50 nodes — which matches the 50 in the framing. Add ~30% headroom &rarr; ~65, spread across 3 AZs.</span>The fleet is horizontally stateless, so it scales by adding nodes; capacity is set by connection/TLS cost per node, and the limiter RPC is a small slice of that."},
+        {who:"intv",text:"You said a rejected request must be cheaper than an allowed one. How does that change sizing when a flood pushes arrivals to 8M/s?"},
+        {who:"cand",text:"That's the whole trick — I don't size for 8M/s of full-cost requests. Once a key is flagged over-limit the gateway rejects it <strong>in-process</strong> from a short local cache, without a limiter or store call, so junk traffic costs a fraction of a real decision.<span class='eg'>If 7M/s of the 8M is a few abusive keys rejected locally at ~5x cheaper, the effective load is ~1M full-cost + 7M cheap &asymp; the equivalent of ~2.4M/s, not 8M — so ~120 nodes at peak, not 400.</span>The trade is provisioning for the legit peak (cost) vs autoscaling lag (risk in the first minute). My decision: size the warm floor for the legitimate 3-5x peak, shed abusers in-process so the flood is cheap, and autoscale plus lean on L3/L4 upstream for the rest — the gateway is part of the DDoS defense, not a victim sized to absorb it head-on."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Cloudflare: counting things, a lot of different things",url:"https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"},
       ]},
     ],
     client:[
@@ -358,6 +394,15 @@ window.DATA['ratelimiter'] = {
         {title:"Token bucket",url:"https://en.wikipedia.org/wiki/Token_bucket"},
         {title:"Redis: EVAL and Lua scripting",url:"https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"},
       ]},
+      {l:"medium",tag:"capacity",q:"Does the algorithm engine's compute cost anything at 1M/s?",turns:[
+        {who:"intv",text:"The algorithm engine runs on every one of the ~1M decisions/s. Is its compute a real capacity concern, and does the algorithm choice change that?"},
+        {who:"cand",text:"For the O(1) algorithms it's essentially free. Token bucket and sliding-window-counter are a handful of arithmetic ops per decision.<span class='eg'>Token bucket: compute elapsed &times; refill rate, compare, decrement — a few ops, sub-microsecond. &times; 1M/s &asymp; a small fraction of one core across the fleet.</span>The engine co-locates inside the limiter, so it adds no separate fleet, and it holds no durable state — the counters live in the store. So engine CPU is a non-issue by construction; the cost that matters is the store's ops and memory, not the arithmetic."},
+        {who:"intv",text:"Is there any algorithm whose cost actually shows up at 1M/s?"},
+        {who:"cand",text:"Yes — <strong>sliding-window-log</strong> breaks the pattern. It stores a timestamp per request and must trim expired entries on every call, so both CPU and store footprint scale with traffic instead of staying O(1).<span class='eg'>1000 req/min/key &rarr; ~1000 entries to scan/trim per decision, and ~10B live entries across 10M keys — versus 2 integers per key for the counter form.</span>The trade is exactness vs cost: the log is exact but pays O(requests); the counter is approximate-within-a-few-percent but O(1). My decision is to default to O(1) algorithms so the engine stays free and the store stays 1-2 keys per api-key, and reserve the log only for the low-volume tiers that genuinely need exactness — per-tier selection driven by config, so I pay the cost only where it's worth it."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Token bucket",url:"https://en.wikipedia.org/wiki/Token_bucket"},
+      ]},
     ],
     config:[
       {l:"medium",tag:"concept",q:"How is the rule set modeled and resolved?",turns:[
@@ -392,6 +437,24 @@ window.DATA['ratelimiter'] = {
         {who:"cand",text:"None of 'no limits' or 'crash-loop.' A node must be able to start into a safe state without the config plane. So each node persists a <strong>last-known-good config snapshot</strong> locally (on disk / cache) and boots from that if the store is unreachable, then reconciles once the store returns. If it has <em>no</em> snapshot at all (a truly fresh node), it starts with a <strong>conservative built-in default</strong> rule set (safe floor limits) rather than either unlimited or fully-closed — the same fail-direction philosophy as the rest of the design. The config store being down should degrade freshness of rules, never availability of enforcement."},
         {who:"intv",text:"If it's serving stale rules from the snapshot, how do you avoid it silently running old limits for hours?"},
         {who:"cand",text:"The same convergence machinery: the node keeps retrying the config store in the background and reports the config <strong>version</strong> it's actually enforcing to a central monitor. A node stuck on an old version past a threshold raises an alert, so 'stale forever' is visible and paged, not silent. The staleness itself is low-risk (rules change rarely and a slightly old limit is tolerable), but I never rely on that — I make the enforced version observable fleet-wide. So durability of config = local snapshot for availability + version reporting for correctness, mirroring how the counter store is source-of-truth but the hot path caches."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How big is the rule set, and does config need its own cluster?",turns:[
+        {who:"intv",text:"Size the config plane. How big is the rule set, how much does each node hold, and does it need a big cluster of its own?"},
+        {who:"cand",text:"It's tiny, which is the whole point of keeping it off the hot path.<span class='eg'>A handful of tier rules plus, say, 10K per-key overrides &times; ~100 bytes &asymp; ~1MB — it fits in memory on every one of the ~80 nodes many times over.</span>There's no per-request store hit — each node caches the full rule set in memory. The config store itself only sees rare writes plus ~80 node subscriptions, not request traffic, so its ops/s is trivial. It doesn't need a big cluster, just a small highly-available one."},
+        {who:"intv",text:"If it's 1MB and cached everywhere, what actually sizes it, and where's the risk?"},
+        {who:"cand",text:"It's sized by <strong>change propagation, not data volume</strong>: on each edit the store fans the new version out to ~80 nodes and they hot-swap. The trade is push vs poll — push (watch/pub-sub) propagates in ~1-2s but holds a connection per node; poll is simpler but converges slower.<span class='eg'>80 nodes &times; a watch event on each change &asymp; a burst of ~80 fetches per edit — nothing, since edits are rare.</span>So the real constraint isn't capacity at all, it's <em>correctness of a change</em> — a bad push is a global outage. My decision: a small 3-node consensus store (etcd-class), push for speed with a periodic poll as backstop, and treat capacity as a solved non-problem so the engineering goes into safe rollout instead."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store holds the rules — etcd, an RDBMS, or a versioned file?",turns:[
+        {who:"intv",text:"Where do the rules actually live? Name the options and pick one."},
+        {who:"cand",text:"The rule store needs three things: <strong>versioning/audit</strong> (a limit is a security control), <strong>fast fan-out</strong> to the fleet, and <strong>HA</strong>. Three candidates. <strong>etcd/Consul</strong>: a consensus KV with native watches (push), revision numbers as versions, and built-in HA — hits all three. <strong>An RDBMS</strong>: durable, queryable, easy to audit with a history table, but no native watch, so I'd bolt on polling or a notify channel. <strong>A versioned file in git / object storage</strong>: excellent review-and-audit trail (every change is a reviewed commit), but propagation needs an extra delivery mechanism and it's slow to push."},
+        {who:"intv",text:"You need both an audit trail and sub-second push. Which wins?"},
+        {who:"cand",text:"They pull in different directions, so I split the roles rather than force one store to do both. <strong>etcd-class KV</strong> is the runtime source of truth for distribution — its watch gives the sub-second push and its revision number is a natural version the nodes report back.<span class='eg'>Publish rev 43 &rarr; ~80 nodes get the watch event &rarr; hot-swap within ~1-2s; each node reports the rev it's enforcing so I can watch fleet convergence.</span>For the human audit/review path I mirror every change through a git PR or a versioned control-plane record — two-person review, immutable history — that then writes to etcd. So my decision is etcd for propagation + versioning on the hot path, git/control-plane for the review and audit trail; reads are all cached, so the store choice is about push and versioning, never read throughput."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
         {title:"Stripe: scaling your API with rate limiters",url:"https://stripe.com/blog/rate-limiters"},
@@ -433,6 +496,15 @@ window.DATA['ratelimiter'] = {
       ],resources:[
         {title:"Cloudflare: counting things, a lot of different things",url:"https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How much load and state does the sync aggregator carry?",turns:[
+        {who:"intv",text:"Size the sync layer. 50 limiter nodes report deltas every ~500ms for up to 10M keys. What load does the aggregator carry, and does it fit on one node?"},
+        {who:"cand",text:"It fits comfortably, because it's bandwidth-bound, not message-bound.<span class='eg'>50 nodes &times; one batched report every 500ms = ~100 reports/s — a trivial message rate; each report batches many keys. Holding one budget per active key: 10M keys &times; ~50 bytes &asymp; ~500MB — one node's RAM.</span>So a single aggregator plus a standby handles it. And it holds only <em>derived</em> state — the authoritative counts live in the store — so it needs no persistence, just enough redundancy that budget allocation isn't paused on a restart."},
+        {who:"intv",text:"10M keys of budget state on one aggregator — what if that working set or the report bandwidth outgrows one node?"},
+        {who:"cand",text:"Two levers, and the trade is simplicity vs scale. First, most of the 10M keys are idle at any instant, so I only track budgets for <strong>active/high-volume</strong> keys — the real working set is far smaller than 10M. Second, I can <strong>shard the aggregator by key-hash</strong> so both the budget state and the report fan-in spread across N aggregators.<span class='eg'>Shard 4 ways &rarr; ~125MB and ~25 reports/s each — but a single hot key's budget still lands on one shard, so it inherits the same hot-key risk as the counter store.</span>My decision: run a single HA aggregator to start, since the state is small and fully reconstructable from node deltas plus the store, and shard by key only once the active-key budget set or report bandwidth actually outgrows one node — I don't pay sharding complexity for a 500MB problem."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Cloudflare: counting things, a lot of different things",url:"https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"},
       ]},
     ],
   }

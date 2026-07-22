@@ -200,6 +200,15 @@ window.DATA['chat'] = {
         {title:"Idempotence (Wikipedia)",url:"https://en.wikipedia.org/wiki/Idempotence"},
         {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
       ]},
+      {l:"medium",tag:"capacity",q:"Size local storage and the reconnect delta.",turns:[
+        {who:"intv",text:"Size the client's footprint. The phone caches history locally and syncs on reconnect. Roughly how much on-device storage does a heavy user need, and how big is a typical reconnect delta?"},
+        {who:"cand",text:"Per-user volume is modest: ~2B users against 100B messages/day is ~50 sent per user/day, and even a chatty user receiving a few hundred a day at ~1 KB stored (ciphertext plus metadata) is tiny. A year for a heavy user at ~300/day is ~110K messages ≈ ~100 MB — nothing for a modern phone. The outbox holds only <em>unacked</em> sends, normally zero and a handful in a tunnel. A reconnect delta is just messages with <code>seq &gt; cursor</code> — usually single digits per active conversation, not the backlog.<span class='eg'>300 msgs/day × 365 ≈ 110K × ~1 KB ≈ 110 MB local; reconnect after a 5-min blip ≈ a few msgs per active chat.</span>"},
+        {who:"intv",text:"Storing a year locally is cheap. So why not keep <em>everything</em> on the device and never read server history at all?"},
+        {who:"cand",text:"Because local-only breaks the moment there's a second device, a reinstall, or storage pressure — the phone is a cache, not the source of truth. Trade-off: unbounded local history gives instant scroll-back but loses on multi-device sync, recovery after a wipe, and low-end devices. Decision: cap the local cache to a rolling recent window and page older messages from the store on demand, keeping the phone lean while the store stays authoritative.<span class='eg'>keep recent ~N months hot on device → older scroll-back pages from the store by seq range.</span>"},
+      ],resources:[
+        {title:"MDN — WebSockets API",url:"https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     gw:[
       {l:"medium",tag:"concept",q:"Why persistent WebSockets and not polling?",turns:[
@@ -246,6 +255,24 @@ window.DATA['chat'] = {
       ],resources:[
         {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
         {title:"Redis documentation",url:"https://redis.io/docs/"},
+      ]},
+      {l:"hard",tag:"capacity",q:"How many gateway nodes for 500M connections?",turns:[
+        {who:"intv",text:"Size the gateway tier. You have to hold ~500M concurrent WebSocket connections. Given a per-node connection budget, how many nodes is that, and what's the binding resource?"},
+        {who:"cand",text:"Connections, not CPU, bind a gateway node — an idle socket costs a file descriptor, send/receive buffers, and a little per-connection state, call it ~10 KB, with near-zero CPU. A conservatively tuned node holds ~500K sockets (WhatsApp famously pushed millions per box). So 500M ÷ 500K ≈ 1000 nodes, or ~500 at 1M/node. The binding resources are memory and fd density, so I tune the kernel (fd limits, buffer sizes) and size by socket count, not by message logic that lives elsewhere.<span class='eg'>500M ÷ 500K conns/node ≈ 1000 nodes; 500K × ~10 KB ≈ 5 GB RAM/node just for socket state.</span>"},
+        {who:"intv",text:"Why not push each node to 2-3M connections to cut the node count and the bill?"},
+        {who:"cand",text:"You can, but density trades against blast radius and tail behaviour. A denser node is cheaper but a crash drops far more users at once — a 2M-socket node failing is a 2M reconnect storm versus 500K — and huge per-process socket counts strain GC, epoll, and kernel buffers, hurting p99. Decision: target ~500K-1M sockets/node to balance cost against blast radius, and scale horizontally by adding nodes, since routing is an explicit registry lookup rather than a hash ring."},
+      ],resources:[
+        {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store for the connection registry, and why?",turns:[
+        {who:"intv",text:"The connection registry maps userId to gateway node — read on the hot delivery path, written on every connect and disconnect. Which store backs it, and why?"},
+        {who:"cand",text:"Three candidates. <strong>Redis</strong>: in-memory, sub-millisecond reads, native TTL, and it shrugs off connection churn — a natural fit. <strong>etcd / ZooKeeper</strong>: strongly consistent, but they are low-write-throughput coordination stores and would fall over under millions of connect/disconnect writes a second. <strong>The message DB (Cassandra/Dynamo)</strong>: durable, but higher latency on the delivery path and overkill for throwaway routing state. The registry is high-churn and read-hot, which pulls hard toward an in-memory store.<span class='eg'>connect → SET userId to {node,conn} with a TTL; deliver → GET userId → forward to that node.</span>"},
+        {who:"intv",text:"Redis isn't strongly consistent and can lose a little on failover. Isn't a stale registry entry dangerous?"},
+        {who:"cand",text:"It's tolerable by construction — a stale entry just makes a forward fail or time out, and I already treat that as offline: the message is durable, so it falls through to the cursor-pull plus push path, and <em>delivered</em> only fires on a real device ack. So I don't need strong consistency; I need speed, TTL-based self-healing, and churn tolerance. Decision: sharded Redis keyed by userId with a TTL and heartbeat refresh, accepting soft state because the registry is a routing hint, not a source of truth."},
+      ],resources:[
+        {title:"Redis documentation",url:"https://redis.io/docs/"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
     ],
     chat:[
@@ -294,6 +321,15 @@ window.DATA['chat'] = {
         {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"hard",tag:"capacity",q:"How many chat-service instances at peak msg/s?",turns:[
+        {who:"intv",text:"Size the chat service. At ~1M msg/s average and ~5M/s at peak, how many stateless instances do you provision, and what work does each instance do per message?"},
+        {who:"cand",text:"Per message the service validates, dedupes on client-msg-id, assigns a seq, kicks off a persist, and enqueues fan-out — mostly I/O wait, so one instance comfortably handles ~10K msg/s. At peak that's 5M ÷ 10K ≈ 500 instances, and ~120 at the 1.16M/s average. Because the service is <strong>stateless</strong> — all durable state is in the store, registry, and queue — this scales linearly by adding instances behind a load balancer.<span class='eg'>5M msg/s ÷ 10K per instance ≈ 500 at peak; 1.16M/s ÷ 10K ≈ 120 at average.</span>"},
+        {who:"intv",text:"Group fan-out means one send becomes thousands of deliveries. Doesn't that blow up this instance count?"},
+        {who:"cand",text:"No — the accept path is decoupled from delivery. An instance does one persist plus one enqueue regardless of group size; the thousands of deliveries drain on queue <em>workers</em>, which I size separately against delivery-event throughput. Trade-off: I could size to peak and eat idle boxes at 3am, or autoscale. Decision: autoscale on msg/s but keep a warm floor, because connection-bound spikes like reconnect storms arrive faster than cold instances boot — stateless makes the warm floor cheap insurance."},
+      ],resources:[
+        {title:"How Discord stores billions of messages",url:"https://discord.com/blog/how-discord-stores-billions-of-messages"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
     ],
     store:[
       {l:"medium",tag:"concept",q:"Datastore and schema for billions of messages.",turns:[
@@ -341,6 +377,24 @@ window.DATA['chat'] = {
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
         {title:"How Discord stores billions of messages",url:"https://discord.com/blog/how-discord-stores-billions-of-messages"},
       ]},
+      {l:"hard",tag:"capacity",q:"Shards and storage for the message history.",turns:[
+        {who:"intv",text:"Size the message store. ~100B messages/day at ~200 bytes of ciphertext. How much storage per year, how many write ops, and roughly how many shards?"},
+        {who:"cand",text:"Storage: ~20 TB/day of history logical, × 365 ≈ ~7 PB/year, and with 3× replication ≈ ~21 PB/year. Writes: 5M msg/s at peak × 3 replicas = 15M replica-writes/s; if a node sustains ~75K writes/s that is ~200 shard-nodes just for the hot write tier. It has to be a sharded wide-column cluster — never one box — sharded by hash of conversationId so writes and bytes spread uniformly.<span class='eg'>20 TB/day × 365 ≈ 7 PB/yr logical → × 3 ≈ 21 PB; 5M/s × 3 ÷ ~75K/node ≈ 200 write shards.</span>"},
+        {who:"intv",text:"That grows forever. Do you keep all 21 PB a year in the hot cluster?"},
+        {who:"cand",text:"No — almost all reads are recent, so hot storage should be bounded. Trade-off: everything-hot gives uniform low-latency history at a runaway cost, while tiering adds a slow path for old data. Decision: tiered retention — keep recent history (weeks to a few months) in the wide-column cluster, and age cold history out to cheap object storage, fetched on demand for rare deep scroll-back. That keeps the hot cluster sized to the working set, not to all-time volume."},
+      ],resources:[
+        {title:"How Discord stores billions of messages",url:"https://discord.com/blog/how-discord-stores-billions-of-messages"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which wide-column store for messages, and why?",turns:[
+        {who:"intv",text:"You picked wide-column. Which actual store — Cassandra, HBase, or a managed option like DynamoDB — and what decides it?"},
+        {who:"cand",text:"<strong>Cassandra / ScyllaDB</strong>: masterless, tunable quorum, excellent write throughput, and clustering by seq within a conversationId partition matches the access pattern exactly — Discord moved to Scylla for tail latency. <strong>HBase</strong>: strongly consistent, but HDFS plus region-server ops are heavy and region hotspots bite on skewed conversations. <strong>DynamoDB / Spanner</strong>: managed, with fencing and failover built in, but per-partition throughput caps and cost climb at this volume. The axes are write throughput, operational burden, and how much consistency I actually need.<span class='eg'>partition = conversationId, clustering = seq asc → open chat is one ordered single-partition scan.</span>"},
+        {who:"intv",text:"So which, and what's the deciding factor?"},
+        {who:"cand",text:"For self-managed at this scale I'd take <strong>ScyllaDB/Cassandra</strong>: the workload is write-heavy with per-partition-ordered reads and needs no global consistency beyond one conversation, which is exactly masterless wide-column's sweet spot, and masterless means no single write-primary to fail. I'd reach for <strong>DynamoDB</strong> instead only if I wanted managed failover and could absorb the cost. Decision: masterless wide-column, because partition-by-conversation and seq-clustering fit the store's job and there's no cross-partition transaction to justify HBase or Spanner."},
+      ],resources:[
+        {title:"How Discord stores billions of messages",url:"https://discord.com/blog/how-discord-stores-billions-of-messages"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     queue:[
       {l:"hard",tag:"scaling",q:"A 100K-member group storms the fan-out.",turns:[
@@ -369,6 +423,24 @@ window.DATA['chat'] = {
       ],resources:[
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"Idempotence (Wikipedia)",url:"https://en.wikipedia.org/wiki/Idempotence"},
+      ]},
+      {l:"hard",tag:"capacity",q:"How many partitions for the fan-out log?",turns:[
+        {who:"intv",text:"Size the queue. Accepted sends plus group fan-out flow through it. Given peak throughput, how many partitions do you need, and why that count?"},
+        {who:"cand",text:"The accept rate is ~5M msg/s at peak, but fan-out multiplies it — deliveries and push tasks push effective throughput to maybe ~10-20M events/s. If one partition-consumer safely sustains ~50K events/s, that is 20M ÷ 50K ≈ 400 partitions as a floor. I'd over-provision to a couple thousand for parallelism headroom, future growth, and sub-keying hot conversations, and partition by conversationId so each conversation stays ordered on one partition.<span class='eg'>~20M events/s ÷ ~50K/s per partition ≈ 400 partitions floor → provision ~2000 for headroom + hot-key buckets.</span>"},
+        {who:"intv",text:"Why not just crank it to 100K partitions for maximum parallelism?"},
+        {who:"cand",text:"Because partitions are not free. Trade-off: more partitions buy parallelism but cost open files, longer rebalances, more leader elections, replication overhead, and they fragment ordering into more streams to reason about. Decision: size partition count to target-throughput ÷ per-partition budget with modest headroom — thousands, not 100K — keep the conversationId partitioning for order, and sub-key only the genuinely hot conversations rather than shattering everything."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which queue — Kafka, RabbitMQ, or SQS?",turns:[
+        {who:"intv",text:"Which messaging system backs fan-out — Kafka, RabbitMQ, or a managed queue like SQS — and why?"},
+        {who:"cand",text:"<strong>Kafka</strong>: a durable, replicated, partitioned log with per-partition ordering, consumer offsets, and retention for replay — it fits ordering-by-conversationId, at-least-once with idempotent consumers, and replay after a worker crash. <strong>RabbitMQ</strong>: rich routing and per-message acks, but it is a broker, not a retained log — ordered high-throughput streaming and replay are awkward, and deep backlogs strain it. <strong>SQS</strong>: fully managed and simple, but standard queues don't guarantee order and FIFO caps throughput, with no real replay. The deciding needs are ordering, replay, and millions of events/s.<span class='eg'>conversationId → partition 7 → consumed in seq order; worker crash → resume at last committed offset.</span>"},
+        {who:"intv",text:"So which, and the deciding property?"},
+        {who:"cand",text:"<strong>Kafka</strong> — because I need partition-level ordering keyed by conversationId, durable retention so a crashed consumer replays from its committed offset, and headroom for tens of millions of events/s, none of which RabbitMQ's per-message model or SQS's ordering and replay limits deliver. Decision: Kafka, partitioned by conversationId, acks=all with min.insync.replicas=2, and idempotent at-least-once consumers rather than fragile exactly-once."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"System Design Primer — asynchronism",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
       ]},
     ],
     presence:[
@@ -399,6 +471,24 @@ window.DATA['chat'] = {
         {title:"Redis documentation",url:"https://redis.io/docs/"},
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
       ]},
+      {l:"hard",tag:"capacity",q:"Heartbeat volume and Redis memory for presence.",turns:[
+        {who:"intv",text:"Size presence. Up to 500M connections heartbeat to keep their status fresh. What's the write rate into the presence store, and how much memory does the keyspace need?"},
+        {who:"cand",text:"A naive heartbeat every 30s is 500M ÷ 30 ≈ 17M writes/s — the number the framing flagged. I don't send that to Redis: heartbeats <strong>terminate at the gateway</strong>, which already knows socket liveness, and it rolls up and bulk-writes presence, so Redis sees far fewer ops — call it ~100K-1M/s. Memory is small: 500M keys × ~100 bytes (userId, node, timestamp, TTL overhead) ≈ ~50 GB, sharded across a Redis cluster of ~10-20 nodes.<span class='eg'>500M ÷ 30s ≈ 17M raw hb/s → gateway rollup → ~100K-1M Redis ops/s; 500M × ~100 B ≈ 50 GB sharded.</span>"},
+        {who:"intv",text:"Could you shorten the heartbeat interval to make presence more accurate?"},
+        {who:"cand",text:"I could, but it trades directly against load and battery. A 10s interval triples the write rate and drains phone radio and battery, while a 60s interval is cheaper but makes last-seen and the online dot staler. Decision: a ~30s heartbeat with a 45-60s TTL, because presence is <strong>soft state</strong> — slightly stale is completely acceptable — so I bias toward lower write load and better battery over pinpoint freshness."},
+      ],resources:[
+        {title:"Redis documentation",url:"https://redis.io/docs/"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store for presence, and why?",turns:[
+        {who:"intv",text:"Presence is high-churn, ephemeral, TTL-driven state. Which store backs it — Redis, Memcached, or your message DB — and why?"},
+        {who:"cand",text:"<strong>Redis</strong>: in-memory with native TTL expiry and pub/sub, sharded as a cluster — online-is-a-key-that-exists and subscribe-on-view map straight onto it. <strong>Memcached</strong>: also in-memory with TTL, but no pub/sub and LRU eviction can drop live keys unpredictably, which is the wrong semantics for liveness. <strong>The message DB (Cassandra)</strong>: durable, but heartbeat churn would hammer a store built for permanence and it is wasteful for state that rebuilds itself in one TTL window. The job wants fast, expiring, subscribable state.<span class='eg'>SET presence:userId with a 45s TTL on heartbeat; key exists = online; publish on change to viewers.</span>"},
+        {who:"intv",text:"So which, and the deciding factor?"},
+        {who:"cand",text:"<strong>Redis</strong> — TTL-as-liveness plus pub/sub for targeted presence subscriptions is exactly the model, Memcached's eviction semantics and missing pub/sub rule it out, and a durable DB is both overkill and a churn magnet for throwaway state. Decision: a sharded, replicated Redis cluster keyed by userId, accepting soft state precisely because the whole keyspace repopulates within one TTL window after any loss."},
+      ],resources:[
+        {title:"Redis documentation",url:"https://redis.io/docs/"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     push:[
       {l:"medium",tag:"concept",q:"Deliver a notification to an offline iPhone.",turns:[
@@ -427,6 +517,15 @@ window.DATA['chat'] = {
       ],resources:[
         {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
+      ]},
+      {l:"hard",tag:"capacity",q:"Size the morning push burst and worker fleet.",turns:[
+        {who:"intv",text:"Size the notification tier. A morning backlog can spike to ~2M push events/s toward APNs and FCM. How many workers and connections, and what does coalescing buy you first?"},
+        {who:"cand",text:"Coalescing is the first lever: one push per conversation-burst per device instead of per message can cut volume ~10:1, so ~2M raw events/s becomes ~200K actual sends/s. Each worker holds multiplexed HTTP/2 connections to APNs/FCM and pushes maybe ~5K/s, so ~200K ÷ 5K ≈ 40 workers as a floor, provisioned higher for retries, backoff, and the APNs/FCM split. The tasks sit in a durable queue so the fleet drains at the rate the providers accept.<span class='eg'>2M raw events/s → ~10:1 coalesce → ~200K sends/s ÷ ~5K/s per worker ≈ 40 workers + retry headroom.</span>"},
+        {who:"intv",text:"Why not just add workers and blast the raw 2M/s straight through?"},
+        {who:"cand",text:"Because the ceiling is the provider, not my fleet — APNs and FCM rate-limit and will throttle or ban a blaster, so more workers can't beat their limit and just waste effort and battery. Trade-off: raw blasting is simple but hits a wall and spams users; a metered drain is slightly slower but safe. Decision: aggressive coalescing plus a durable retry queue drained at the provider-accepted rate, because push is a best-effort <em>alert</em> and the store-plus-cursor is the real delivery — so smooth and prune, never blast."},
+      ],resources:[
+        {title:"WhatsApp architecture (HighScalability)",url:"http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html"},
+        {title:"System Design Primer — back-of-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
       ]},
     ],
   }

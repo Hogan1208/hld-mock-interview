@@ -274,6 +274,24 @@ window.DATA['adclick'] = {
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many Kafka partitions, and what does retention cost?",turns:[
+        {who:"intv",text:"Concrete numbers for the event log. At peak <b>10M clicks/s</b>, how many partitions do you provision on the clicks topic, and how much storage does retention cost? Show the math."},
+        {who:"cand",text:"Partitions come from throughput ÷ what one partition sustains, storage from volume × retention. A single partition comfortably takes a few MB/s, so at ~100 bytes/event I budget ~250K events/s per partition.<span class='eg'>10M/s ÷ ~250K events/s ≈ 40 partitions floor; round to ~120 for headroom and hot-ad salting. Retention: 86B/day × 100B ≈ 8.6 TB/day; a 7-day hot window × RF3 ≈ 180 TB.</span>Consumer parallelism is capped by partition count, so I over-provision partitions a bit rather than repartition a live topic."},
+        {who:"intv",text:"Then why not massively over-partition up front so you never have to touch it?"},
+        {who:"cand",text:"Because partitions are not free: each adds open file handles, replication and metadata overhead, longer rebalances, and more consumer tasks to schedule — thousands of idle partitions hurt latency and recovery. Too few and I hit a throughput ceiling and worse hot-spotting. The trade-off is elasticity vs overhead, so I size to <strong>~2-3x peak</strong> with salting room, keep Kafka retention short (the hot replay window) and <strong>tier older raw events to object storage</strong>, which is far cheaper for the long tail the batch layer needs."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which log — Kafka, Kinesis, or Pulsar?",turns:[
+        {who:"intv",text:"You keep saying Kafka. At this scale, which event log do you actually pick — Kafka, Kinesis, or Pulsar — and why?"},
+        {who:"cand",text:"<strong>Kafka</strong> is my default: very high per-partition throughput, durable replay, and the ecosystem I lean on downstream (Streams, Connect, transactions for exactly-once). <strong>Kinesis</strong> is attractive operationally — fully managed, no brokers to run — but its capacity is shard-bound and gets expensive at a firehose.<span class='eg'>Kinesis shard ≈ 1 MB/s ingest; 10M/s × 100B ≈ 1 GB/s → ~1,000+ shards to manage and pay for.</span><strong>Pulsar</strong> separates compute from storage with native tiered storage, which fits my long-retention need nicely."},
+        {who:"intv",text:"You are likely on AWS already — why not just take Kinesis and skip running brokers?"},
+        {who:"cand",text:"For a smaller stream I would — the ops savings are real. Here the trade-offs cut the other way: at ~1 GB/s the shard math is punishing on cost and rebalancing, and I depend on Kafka transactions and RocksDB-backed stream state for exactly-once, which Kinesis doesn't give me as cleanly. Pulsar's tiered storage genuinely tempts me for the retention story, but its operational maturity and ecosystem are thinner. <strong>Decision: Kafka</strong> for throughput, replay, and the exactly-once ecosystem — revisiting Pulsar specifically if tiered-storage retention dominates cost."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
+      ]},
     ],
     agg:[
       {l:"medium",tag:"concept",q:"What does it emit, and where do reads go? (adds OLAP + query)",reveal:["olap","query"],turns:[
@@ -321,6 +339,15 @@ window.DATA['adclick'] = {
         {title:"Lambda architecture",url:"https://en.wikipedia.org/wiki/Lambda_architecture"},
         {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many aggregator tasks do you run?",turns:[
+        {who:"intv",text:"Numbers for the aggregator. At <b>10M events/s</b>, how many aggregation tasks/instances do you run, and how much memory does the window state need? Show the math."},
+        {who:"cand",text:"Task count is bounded by partitions and by per-task throughput. A stateful task doing a keyed windowed count sustains maybe ~200K events/s, and memory is (active ads) × (windows held open in the grace period) × bytes.<span class='eg'>10M/s ÷ ~200K events/s ≈ 50 tasks; I align to the ~120 partitions so parallelism = partitions. State ≈ up-to-10M active ads × ~15 open windows × ~50B ≈ single-digit GB per task shard.</span>Local pre-aggregation shrinks the volume before any combine hop, so the counting stays cheap."},
+        {who:"intv",text:"Why peg task count to partitions instead of scaling the aggregator independently?"},
+        {who:"cand",text:"Because in the Kafka consumer model parallelism <em>can't exceed</em> partition count — extra tasks beyond partitions just sit idle, while too few means one task owns several partitions and lags. State size also grows with the grace window, which drives checkpoint cost. The trade-off is elasticity vs wasted tasks and checkpoint overhead. <strong>Decision:</strong> tasks ≈ partitions, size memory for the grace-window state and checkpoint it, and to scale beyond that I raise partition count (with salting for hot ads) rather than adding orphan tasks."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+      ]},
     ],
     olap:[
       {l:"medium",tag:"concept",q:"Which store, and what's the schema?",turns:[
@@ -359,6 +386,15 @@ window.DATA['adclick'] = {
         {title:"System Design Primer — availability patterns",url:"https://github.com/donnemartin/system-design-primer#availability-patterns"},
         {title:"ByteByteGo",url:"https://bytebytego.com/"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many OLAP nodes, and how much storage for aggregates?",turns:[
+        {who:"intv",text:"Size the OLAP store. How much storage do the aggregates need, and how many nodes do you provision? Don't hand-wave — show the math."},
+        {who:"cand",text:"Storage is driven by <em>aggregate rows</em>, not raw events — that's the whole point of pre-aggregating. Rows ≈ active (adId, minute) pairs per day.<span class='eg'>~1M ads active per minute × 1,440 min ≈ 1.44B rows/day × ~80B (with dim columns) ≈ 115 GB/day; 90-day retention × RF2 ≈ ~20 TB → ~10 nodes at ~2 TB usable. Hour/day rollups add ~10%.</span>Throughput is modest — upserts scale with active ads, not the 10M/s firehose — so storage, not write rate, sets the node count."},
+        {who:"intv",text:"Why not just keep everything at minute granularity forever and skip the rollups?"},
+        {who:"cand",text:"Because minute granularity forever explodes the row count and makes long-range scans slow — a 90-day-by-day query would sum ~130K minute rows per ad instead of 90 day rows. Coarser rollups make long queries cheap but lose fine detail. The trade-off is query speed and storage vs resolution. <strong>Decision:</strong> keep minute granularity for the recent window (days) on the hot cluster, roll up to hour/day for older data, and tier cold history off the fast nodes — so the hot cluster stays small and every query hits the coarsest rollup that answers it."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
     ],
     dedup:[
       {l:"medium",tag:"concept",q:"How do you dedup a stream at millions/s?",turns:[
@@ -393,6 +429,24 @@ window.DATA['adclick'] = {
         {who:"cand",text:"This is the read-process-write atomicity gap. The clean fix is <strong>Kafka transactions / exactly-once semantics</strong>: bundle the offset commit and the output write into one transaction so either both commit or neither. On replay, the uncommitted output is aborted and the events are reprocessed exactly once. Producer-side duplicates are still caught by <code>clickId</code> dedup; this closes the consumer-side replay hole."},
         {who:"intv",text:"EOS across an <em>external</em> store like OLAP, not just Kafka-to-Kafka — how?"},
         {who:"cand",text:"Two ways. Either make the external write <strong>idempotent</strong> — upsert keyed by <code>(adId, minute)</code> with a monotonic version so a replay overwrites rather than adds — or, cleaner, write aggregates <strong>back to a Kafka topic transactionally</strong> and let the OLAP store ingest from that topic. The latter keeps exactly-once fully inside Kafka's transactional boundary and makes the OLAP ingestion a dumb, replayable consumer. I'd prefer that — it avoids trusting an external store to participate in the transaction."},
+      ],resources:[
+        {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
+        {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the dedup seen-set state.",turns:[
+        {who:"intv",text:"Numbers for the dedup store. How much state does the seen-set actually need, given <b>86B clicks/day</b>? Show the math."},
+        {who:"cand",text:"Only the bounded window matters — a duplicate arrives close in time, so I size for the TTL window, not all history.<span class='eg'>24h window: 86B clickIds × ~40B (id + overhead) ≈ 3.4 TB total ÷ ~120 partitions ≈ ~29 GB/partition on RocksDB. A recent 5-min exact hot set: 5M/s × 300s × ~40B ≈ 60 GB total ≈ ~0.5 GB/partition in memory.</span>Co-partitioning by key keeps every lookup on-box, so this state is local per partition, not one shared store."},
+        {who:"intv",text:"A 24h exact set is a lot of disk per partition — shrink it."},
+        {who:"cand",text:"The lever is exact-vs-probabilistic over the window. A longer exact window catches more dupes in the speed layer but costs state; a shorter one is cheaper but pushes more to batch. A <strong>bloom/cuckoo filter</strong> cuts memory ~8-10x, at the cost of a false-positive that wrongly drops a real click — an under-count. <strong>Decision:</strong> keep a small <em>exact</em> recent hot window in memory, back the rest with RocksDB + a bloom filter to the TTL horizon, and lean on the <strong>batch layer</strong> as the authoritative backstop that re-dedups from raw events — so speed-layer state stays cheap and money stays correct."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store backs the seen-set — Redis, RocksDB, or Cassandra?",turns:[
+        {who:"intv",text:"The dedup stage needs a fast check-and-set per event. Which store backs the seen-set — Redis, embedded RocksDB, or Cassandra — and why?"},
+        {who:"cand",text:"<strong>Embedded RocksDB</strong> co-partitioned with the stream is my pick: the seen-set lives on the same task that processes the partition, so check-and-set is an O(1) on-box lookup with no network hop, and it survives crashes via a compacted changelog. <strong>Redis</strong> is a fast external cache but every check is a network round-trip to a shared service. <strong>Cassandra</strong> is durable and scales, but it's a remote write per event with higher latency."},
+        {who:"intv",text:"Redis is dead simple and microsecond-fast — why embed RocksDB instead?"},
+        {who:"cand",text:"At <b>10M events/s</b> the trade-off is decisive: a remote seen-set means 10M network round-trips/s against a shared hot service that becomes its own bottleneck and failure domain, whereas embedded state scales exactly with partition count — add partitions, add dedup capacity, no shared tier. Redis makes sense if the seen-set must be <em>shared</em> across independent consumers, and Cassandra if I needed cross-datacenter durability of the set itself. <strong>Decision:</strong> embedded RocksDB co-partitioned by key, changelog-backed — dedup scales the same way aggregation does."},
       ],resources:[
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
@@ -471,6 +525,15 @@ window.DATA['adclick'] = {
         {who:"cand",text:"Only if it's unexplained, so I <strong>label it</strong>: recent buckets are marked <em>provisional</em> and visibly <em>settle to final</em> after the reconciliation window closes. This is standard in ad analytics — advertisers expect live numbers to firm up. What matters is that the <strong>final number is stable and correct</strong> for billing; the provisional value is a real-time estimate, clearly flagged as such, not a promise. Transparency turns a confusing discrepancy into an expected settling process."},
       ],resources:[
         {title:"Lambda architecture",url:"https://en.wikipedia.org/wiki/Lambda_architecture"},
+        {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many query API instances and brokers for the read load?",turns:[
+        {who:"intv",text:"Size the read tier. With ~1M advertisers and dashboards on auto-refresh, peak reads hit <b>~50K queries/s</b>. How many query-API instances and OLAP brokers do you run? Show the math."},
+        {who:"cand",text:"The API is stateless and light — parse, cache-check, fan-out — so I size it from a per-instance budget and put a result cache in front to shield the brokers.<span class='eg'>50K queries/s ÷ ~5K qps per stateless instance ≈ 10 instances; +30% headroom ≈ 13, spread across 3 AZs. With a 15-30s result cache at ~90% hit, OLAP brokers see only ~5K scan qps → a handful of brokers.</span>Most dashboard traffic is repeated reads of the same recent rollups, so the cache does the heavy lifting."},
+        {who:"intv",text:"Why not just size the OLAP brokers for the full 50K/s so you don't depend on the cache?"},
+        {who:"cand",text:"Because OLAP scan nodes are far more expensive than stateless API pods, and sizing them for uncached peak leaves costly capacity idle in steady state — while relying purely on cache risks a cold-cache or cache-outage surge onto the brokers. The trade-off is cost vs cold-cache safety. <strong>Decision:</strong> size the API fleet for peak qps, size brokers for the cache-<em>miss</em> rate plus a warm floor, and <strong>pre-warm the top advertisers'</strong> common views since traffic is heavily skewed — so brokers ride a fraction of peak and a cache blip degrades gracefully rather than toppling them."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
         {title:"Hello Interview — Ad Click Aggregator",url:"https://www.hellointerview.com/learn/system-design/answer-keys/ad-click-aggregator"},
       ]},
     ],

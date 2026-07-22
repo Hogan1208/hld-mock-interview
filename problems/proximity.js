@@ -168,6 +168,15 @@ window.DATA['proximity'] = {
   ],
   q:{
     gw:[
+      {l:"medium",tag:"capacity",q:"How many edge nodes to terminate the driver fleet?",turns:[
+        {who:"intv",text:"Concrete numbers. This edge terminates ~1M persistent driver streams, absorbs ~250K updates/s, and fronts the rider queries. How many gateway nodes do you run? Show the math."},
+        {who:"cand",text:"The edge here is <strong>connection-bound</strong>, not CPU-bound — the expensive thing is holding a million long-lived sockets, not the tiny frames on them. So I size on connection count first, then check request rate.<span class='eg'>1M driver streams ÷ ~250K connections/node ≈ 4 nodes for connections. Query side: ~20K queries/s x ~4 peak ≈ 80K req/s ÷ ~10K req/s/node ≈ 8 nodes. Take the max and add headroom ≈ ~12 nodes across 3 AZs.</span>Connections dominate, so that is the number I provision against."},
+        {who:"intv",text:"Why size on connections rather than the 250K/s update rate, and what does undersizing cost you?"},
+        {who:"cand",text:"Because a persistent stream costs memory and a file descriptor whether or not a frame is in flight, and the frames themselves are cheap fire-and-forget writes — 250K x ~100 bytes ≈ 25 MB/s is trivial bandwidth. The real trade-off is <strong>memory and socket headroom vs node cost</strong>: undersize and a node runs out of descriptors and starts dropping reconnects, which under a mass reconnect becomes a thundering herd. So I keep spare connection capacity per node and spread across 3 AZs, so losing an AZ sheds ~1/3 of streams, not the service — I pay for headroom to make reconnect storms a non-event."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — communication",url:"https://github.com/donnemartin/system-design-primer#communication"},
+      ]},
       {l:"medium",tag:"concept",q:"Rider queries vs driver updates — what splits at the edge?",turns:[
         {who:"intv",text:"Both a rider's nearby query and a driver's location update hit this gateway. Walk me through what each one needs here, and be precise."},
         {who:"cand",text:"They're opposite workloads. A <strong>driver update</strong> is a tiny, extremely frequent, loss-tolerant write — 'I'm at this lat/lng now', latest-wins. A <strong>rider query</strong> is a less frequent read that must return a fresh, ranked set fast. The gateway owns the shared edge concerns — TLS, auth (both sides are authenticated), rate limiting, routing — then sends updates down a write path and queries to the match service. I want them on separate paths so the write firehose can never starve the query path."},
@@ -199,6 +208,15 @@ window.DATA['proximity'] = {
       ]},
     ],
     match:[
+      {l:"medium",tag:"capacity",q:"How many match-service instances for the query load?",turns:[
+        {who:"intv",text:"Numbers now. You quoted ~20K nearby-queries/s, peak 3-5x. How many match-service instances do you run? Show the math, do not just say autoscale."},
+        {who:"cand",text:"The match service is <strong>stateless and CPU-light</strong> per query — compute the rider cell-ring, one index lookup, then haversine on a small candidate set. So I size from a per-instance throughput budget.<span class='eg'>A modern 4-core node handles ~5K queries/s at low latency. Peak ≈ 20K/s x 4 ≈ 80K/s ÷ 5K/s ≈ 16 instances; add ~30% headroom ≈ ~20, spread across 3 AZs.</span>Writes never touch this tier — they go down the ingest path — so it is sized purely by read/query rate."},
+        {who:"intv",text:"That budget assumes candidate sets stay small. In a dense downtown cell they do not — does your number still hold?"},
+        {who:"cand",text:"That is the real trade-off: per-instance throughput tracks candidates-per-query, and a hot cell can drag back thousands to filter, so effective capacity drops right where load spikes. I lean on <strong>capping candidates</strong> (nearest N, so per-query work stays bounded) and <strong>caching hot cells</strong> candidate sets for a sub-second TTL, trading a beat of freshness for flat query cost. Decision: size the warm floor for normal spread load (~20 instances), autoscale on request rate above it, and rely on the cap to keep a surge from blowing the per-query budget."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — application layer",url:"https://github.com/donnemartin/system-design-primer#application-layer"},
+      ]},
       {l:"easy",tag:"concept",q:"How does 'find drivers near me' actually work? (adds geo index)",reveal:["index"],turns:[
         {who:"intv",text:"A rider at a lat/lng wants drivers within 2km. The naive version scans every driver and computes distance. At 1M drivers per query that's dead on arrival. How do you actually do it?"},
         {who:"cand",text:"I can't scan all drivers, so I need a <strong>spatial index</strong> that buckets the earth's surface into cells and lets me jump straight to the cells near the query point. Look up the rider's cell, gather the drivers bucketed there, and only then compute exact distances on that small candidate set. Let me add a <strong>geo index</strong> — it turns 'search 1M drivers' into 'search a few dozen in a handful of cells'.<span class='eg'>2km radius, ~1km cells → ~9 cells to check; each holds tens of drivers, not a million.</span>"},
@@ -248,6 +266,15 @@ window.DATA['proximity'] = {
       ],resources:[{title:"Quadtree — hierarchical spatial search",url:"https://en.wikipedia.org/wiki/Quadtree"}]},
     ],
     db:[
+      {l:"medium",tag:"capacity",q:"How much memory and how many nodes for the location store?",turns:[
+        {who:"intv",text:"Size the location store. ~1M drivers at ~100 bytes each, 250K writes/s, ~20K reads/s peak. How much RAM, and how many nodes?"},
+        {who:"cand",text:"Storage is almost a non-issue here; throughput is what forces the node count.<span class='eg'>Working set: 1M drivers x ~150 bytes (position + status + ts) ≈ 150 MB — trivially in RAM on one box. Throughput: 250K writes/s ÷ ~100K ops/s/node ≈ 3 shards; x replica factor 2 (primary + AZ replica) ≈ 6 nodes; peak reads ~80K/s spread over the same shards add headroom, not new shards.</span>So I provision ~6 nodes driven by write ops, not by bytes."},
+        {who:"intv",text:"If the whole working set fits in a few hundred MB on one node, why shard at all?"},
+        {who:"cand",text:"Exactly the trade-off — I am sharding for <strong>write throughput and blast radius</strong>, not capacity. One node cannot take 250K writes/s, and a single node is one failure domain. The cost is that geo-sharding follows population, so a Manhattan shard bakes while a rural shard idles. Decision: shard by <strong>density not land area</strong> — split hot metros into more shards, merge sparse regions — and run each shard as a replica group across AZs. I spend nodes on ops/s and availability, and treat the tiny memory footprint as free."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Redis geospatial data type",url:"https://redis.io/docs/latest/develop/data-types/geospatial/"},
+      ]},
       {l:"medium",tag:"concept",q:"What store holds current positions, and what's the schema?",turns:[
         {who:"intv",text:"Pick the datastore for current driver positions and defend it. Give me the schema too."},
         {who:"cand",text:"An <strong>in-memory key-value store with geo support</strong> — Redis (GEO) or equivalent. The access pattern is: overwrite one driver's position 250K times/s, and read 'members near a point' 20K times/s. There's no history, no joins, no big rows — just current state, tiny and hot. Schema: <code>driverId → {lat, lng, ts, status}</code>, latest-wins overwrite. Redis GEO even stores it as a geohash-scored sorted set, so radius queries are a native operation.<span class='eg'>Full working set ≈ 1M drivers x ~100 bytes ≈ 100-200 MB — comfortably in RAM.</span>"},
@@ -286,6 +313,15 @@ window.DATA['proximity'] = {
       ]},
     ],
     index:[
+      {l:"medium",tag:"capacity",q:"How much memory and how many nodes for the geo index?",turns:[
+        {who:"intv",text:"Size the geo index. It buckets ~1M drivers into cells and takes the same update stream. How much memory does it hold, and how many nodes?"},
+        {who:"cand",text:"The index is <strong>derived, compact state</strong> — a mapping of cell to the driver ids bucketed there, plus per-cell counts — so its footprint is small.<span class='eg'>1M drivers x (id + cell reference + overhead) ~ a few tens of bytes ≈ ~50-100 MB, plus cell metadata. Op load: 250K updates/s arrive, but only ~1 in 15 crosses a cell boundary ≈ ~17K index moves/s, on top of the query lookups (~80K/s peak).</span>So index writes are far below the raw firehose; I size nodes from lookups + hot cells, not from 250K/s."},
+        {who:"intv",text:"It is small and rebuildable — so why not just run one node?"},
+        {who:"cand",text:"Because availability, not memory, sets the count. The trade-off: one node is cheapest but a crash blanks the busiest region mid-surge. Since the index is <strong>derived from the location store</strong> it rebuilds in seconds, so I do not pay for durability — but I do run <strong>replica groups</strong> so a failover needs no rebuild, and I <strong>shard hot metros</strong> so no single node owns a scorching cell. Decision: a handful of nodes sized by lookup rate and per-cell density, replicated per AZ, with the cheap rebuild as the backstop rather than the primary defense."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Uber H3 — hexagonal hierarchical index",url:"https://www.uber.com/blog/h3/"},
+      ]},
       {l:"medium",tag:"concept",q:"Geohash vs quadtree vs H3 — how do you bucket the earth?",turns:[
         {who:"intv",text:"You added a geo index. How do you actually partition the earth's surface into buckets? Walk me through the options and what you'd pick."},
         {who:"cand",text:"Three main schemes. <strong>Geohash</strong>: interleave lat/lng bits into a base32 string; nearby points share a prefix, so it's dead simple and range-scannable.<span class='eg'>'9q8yy' is a ~150m cell in SF; drop a char → a coarser ~1km cell.</span><strong>Quadtree</strong>: recursively split each square into four, subdividing deeper only where it's dense — naturally adaptive. <strong>Uber H3</strong>: tile the globe with <em>hexagons</em> at fixed resolutions. My default is H3, because for moving objects and distance the hexagon geometry matters."},
@@ -324,6 +360,15 @@ window.DATA['proximity'] = {
       ]},
     ],
     location:[
+      {l:"medium",tag:"capacity",q:"How many ingest instances and partitions for the firehose?",turns:[
+        {who:"intv",text:"Size the ingest tier. ~1M persistent driver streams landing ~250K updates/s. How many ingest nodes and how do you partition them?"},
+        {who:"cand",text:"Like the edge, ingest is <strong>connection-bound plus write-op-bound</strong>, so I size against both and take the max.<span class='eg'>Connections: 1M streams ÷ ~250K/node ≈ 4 nodes. Writes: 250K updates/s, batched 50-100ms and collapsed to latest-per-driver, so effective downstream writes are well under 250K/s; at ~50K normalized ops/s/node ≈ 5 nodes. Max ≈ 5, add headroom ≈ ~8 nodes.</span>I partition by driver id so each node owns a fixed slice of streams and batches within it."},
+        {who:"intv",text:"Batching to hit those numbers adds latency, and pinning drivers to nodes adds routing rigidity. Worth it?"},
+        {who:"cand",text:"Yes on both, and it is a deliberate trade. The batch window is 50-100ms against a freshness budget of a few seconds — the dominant staleness is the 4s report interval, so batching is effectively free while it slashes downstream op count. Sticky per-driver routing lets a node keep latest-wins state locally and dedupe before writing. Decision: partition by driver id, autoscale on <strong>queue lag and connection count</strong> rather than CPU, and load-shed stale updates under pressure so ingest stays near real-time instead of buffering work nobody wants."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — asynchronism",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
+      ]},
       {l:"hard",tag:"scaling",q:"Index 250K moving-object writes/s without write amplification.",turns:[
         {who:"intv",text:"<span class='scenario'><b>Scenario:</b> 250K updates/s arrive. If each one writes the store AND updates the index — remove from old cell, add to new — that's 500K+ ops/s of write amplification, and it kills you. Design the ingest write path.</span>"},
         {who:"cand",text:"I cut the work per update to the minimum. Ingest terminates the driver streams, <strong>batches</strong> updates (say 50-100ms windows), and for each driver writes only the <em>latest</em> position — intermediate samples in the batch are dropped, latest-wins. The store write is a single overwrite. The index write is <strong>conditional</strong>: only touch the index when the driver's cell changed, which is the minority of updates. That turns '500K index ops/s' into a fraction of that.<span class='eg'>250K updates/s, ~1 in 15 crosses a cell → ~17K index moves/s, not 250K.</span>"},
@@ -361,6 +406,15 @@ window.DATA['proximity'] = {
       ]},
     ],
     notify:[
+      {l:"medium",tag:"capacity",q:"How many dispatch nodes for surge offer load?",turns:[
+        {who:"intv",text:"Size dispatch. During surge you have tens of thousands of ride requests a second, each fanning offers to nearby drivers. How many dispatch nodes, and how much offer state?"},
+        {who:"cand",text:"Dispatch is driven by <strong>ride requests, not the 250K location firehose</strong>, which keeps it far smaller than ingest.<span class='eg'>Surge ~50K ride requests/s; offering sequentially or in 2-3 small parallel batches means ~100-150K live offers at any instant, not 500K. Offer state is tiny — request id, candidate list, timeout — say ~1 KB each ≈ ~150 MB in a short-TTL store. Nodes: 50K req/s ÷ ~5K/s/node ≈ 10, add headroom ≈ ~12.</span>The heavy state is per-offer and short-lived, so the tier is compute-light."},
+        {who:"intv",text:"Where does that offer state live, and how do you keep surge in one city from swamping the whole tier?"},
+        {who:"cand",text:"The trade-off is holding offer state in-process (fast, but lost on crash) versus externalizing it (survives failover, small latency cost). Decision: keep it in a <strong>short-TTL external store</strong> keyed by request id so a node crash becomes a timeout-and-rematch, not a lost ride. And I <strong>partition dispatch by region</strong> like everything else, so a surging city loads only its own dispatch shards and autoscales them locally — the rest of the world is untouched. I spend a little latency on external state to buy crash-safety and regional isolation."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"bytebytego — real-time system patterns",url:"https://bytebytego.com/"},
+      ]},
       {l:"medium",tag:"concept",q:"How does a ride offer reach the driver's phone?",turns:[
         {who:"intv",text:"Dispatch picks a driver and sends a ride offer. How does that actually reach their phone, and how do you know they got it?"},
         {who:"cand",text:"Over a <strong>persistent connection</strong> to the driver app — the same streaming channel the app already holds for reporting location works in reverse to receive offers, giving low-latency two-way messaging. Dispatch pushes the offer, starts a timeout, and waits for an accept/decline frame back. If the socket is dead, I fall back to a <strong>push notification</strong> (APNs/FCM) to wake the app, which then reconnects and pulls the pending offer."},
@@ -398,6 +452,15 @@ window.DATA['proximity'] = {
       ]},
     ],
     client:[
+      {l:"medium",tag:"capacity",q:"How big is the firehose the driver fleet generates?",turns:[
+        {who:"intv",text:"Before we size servers, size the source. Where does 250K writes/s actually come from, and what does it cost per device and in aggregate?"},
+        {who:"cand",text:"It falls straight out of the fleet and the report interval.<span class='eg'>1M active drivers x 1 report / 4s ≈ 250K updates/s. Each frame ~100 bytes → 250K x 100 ≈ 25 MB/s aggregate ingress — trivial bandwidth. Per device it is ~100 bytes every 4s ≈ ~25 B/s, negligible for battery or a data plan.</span>So the cost is never volume — it is the <strong>1M persistent connections</strong> and the <strong>250K ops/s</strong> those reports drive downstream."},
+        {who:"intv",text:"So the aggregate is small — is there any reason to touch the client side at all?"},
+        {who:"cand",text:"Yes, because the op count and connection load scale with report frequency, and that is a client-side lever. The trade-off is <strong>report interval vs freshness and downstream op cost</strong>: report faster and matches are fresher but the firehose grows; slower and you cut load but risk showing stale cars. Decision: drive the interval <strong>adaptively</strong> — full rate for moving or actively-matched drivers, slow (every 20-30s) for parked ones — which cuts the aggregate substantially without hurting the drivers who might actually be matched. Sizing the fleet this way is what keeps the ingest and edge numbers modest."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope calculations",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer — communication",url:"https://github.com/donnemartin/system-design-primer#communication"},
+      ]},
       {l:"easy",tag:"concept",q:"What do the rider and driver apps each do?",turns:[
         {who:"intv",text:"There are two very different clients behind this one box — the rider app and the driver app. What does each do, and why lump them together?"},
         {who:"cand",text:"They share the edge but do opposite things. The <strong>driver app</strong> is a <em>producer</em>: it streams position continuously over a persistent connection and receives ride offers. The <strong>rider app</strong> is a <em>consumer</em>: it issues nearby queries and shows cars on a map. I draw them as one 'client' box for the skeleton because they hit the same gateway, but their traffic profiles — constant small writes vs occasional reads — are what justify the separate ingest and query paths behind it."},

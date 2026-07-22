@@ -205,6 +205,15 @@ window.DATA['gdocs'] = {
       ],resources:[
         {title:"Figma: how multiplayer works",url:"https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much does the client actually have to hold and process?",turns:[
+        {who:"intv",text:"Numbers for the client itself. On a hot doc your client receives the doc's whole op stream plus everyone's cursors and holds a local replica. Roughly how much is it processing and storing, and where does a browser tab fall over?"},
+        {who:"cand",text:"Let me size the streams; edits are the cheap one.<span class='eg'>A 500-editor doc peaks at ~1-2.5K tiny ops/s, each ~tens of bytes, so under ~100KB/s of edit traffic — nothing for a socket. My own typing is ~2-5 ops/s, trivial.</span>The local replica is just the current document — a big 200KB doc is a few hundred KB in memory plus the editor's own structures. So edits and state are comfortable; the real pressure is cursor churn, which I keep off this budget by throttling."},
+        {who:"intv",text:"So what actually threatens the tab?"},
+        {who:"cand",text:"Two things, both about <em>rate</em> not total size. First, applying ops to the DOM — if I re-layout the whole doc per op I choke, so I apply incrementally to just the changed range and <strong>virtualize</strong> rendering to the visible viewport. Second, the presence storm: 500 cursors moving ~10x/s is the heavy stream, so I take it pre-<strong>coalesced</strong> as one batched snapshot per ~100-200ms tick rather than per-move. Net: the client is bound by <strong>render rate</strong>, capped by incremental apply plus viewport virtualization, so one tab holds a hot doc on ~1 core. I deliberately do <em>not</em> hold full op history client-side — I fetch snapshot + tail on open and keep only a recent window."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Figma: how multiplayer works",url:"https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"},
+      ]},
     ],
     gw:[
       {l:"easy",tag:"concept",q:"Why persistent connections, and what does the gateway own?",turns:[
@@ -240,6 +249,15 @@ window.DATA['gdocs'] = {
         {who:"cand",text:"Every op carries a <strong>(clientId, client sequence number)</strong>. The collab service tracks the highest sequence it has accepted per client, so a re-sent op with a seq it already applied is <strong>idempotently ignored</strong> and just re-acked. That makes reconnection safe by construction: the client can blindly re-send its unacked tail without fear of duplicates. Combined with local-first apply, a gateway failure is a brief blip — the cursor freezes for a moment and then everything resyncs."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"How many gateway nodes for the connection load?",turns:[
+        {who:"intv",text:"Size the gateway tier. You cited ~2M users in live docs at the Monday-9am peak, each on a persistent WebSocket, and ~50K connections per node before FD and memory limits bite. How many nodes, and what dominates the cost?"},
+        {who:"cand",text:"Straight division sets the floor.<span class='eg'>2M concurrent sockets ÷ ~50K per node ≈ 40 nodes. Add ~30% headroom and spread across 3 AZs so losing one AZ drops ~1/3 not the tier → call it ~60 nodes.</span>The cost is dominated by <strong>idle-socket memory and file descriptors</strong>, not CPU — most of those 2M sockets belong to people reading, not typing, so per-connection RAM and FD limits set the ceiling. That is why ~50K/node is the real constraint rather than op throughput."},
+        {who:"intv",text:"What if you sized on throughput instead?"},
+        {who:"cand",text:"It would badly under-count. CPU-wise the gateway is thin — it routes ops and fans out batches, and even a hot doc is only ~1-2.5K small ops/s, so a node could push far more than 50K connections' worth of <em>traffic</em>. But it cannot <em>hold</em> more than ~50K live sockets in memory. So I size on <strong>connection count, not op rate</strong>, and keep nodes as stateless-ish routers so I add them linearly behind an L4 LB as concurrency grows. The trade-off is paying for mostly-idle capacity at peak; I autoscale on connection count with a warm floor so a Monday-morning ramp does not outrun provisioning."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Figma: how multiplayer works",url:"https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"},
       ]},
     ],
     collab:[
@@ -296,6 +314,15 @@ window.DATA['gdocs'] = {
         {title:"CRDT resources",url:"https://crdt.tech/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How many collab processes for 50M docs?",turns:[
+        {who:"intv",text:"Size the collab fleet. You have ~50M daily active docs but claim one authoritative owner process per live doc, at ~10K live sessions per node. How many nodes do you actually run, and what is the unit you size on?"},
+        {who:"cand",text:"I size on <strong>concurrent live sessions, not total docs</strong> — an idle doc owns no process.<span class='eg'>Say ~2M concurrent editing sessions at peak across all docs; at ~10K sessions per node that is ~200 nodes. Even if a large fraction of the 50M docs were live at once it stays a few thousand nodes — but concurrency, not the 50M corpus, is the driver.</span>One node handles ~10K sessions because per-doc work is tiny: transform + append + publish on ~1-2.5K ops/s for even a hot doc, and most docs are 1-3 editors emitting a handful of ops/s."},
+        {who:"intv",text:"Does a single hot doc break that per-node budget?"},
+        {who:"cand",text:"No — one 500-editor doc is still ~1-2.5K tiny ops/s, which fits one core because fan-out is offloaded to gateways and pub/sub, so the owner is not holding 500 sockets. The budget only breaks on <em>count</em> of sessions, so I shard docs across the fleet by consistent hashing on doc id and size by peak concurrent sessions. The trade-off is that sessions cluster unevenly — a few hot docs plus a long tail — so I keep ~30% headroom per node and can split a pathologically hot doc into per-section owners if measurement ever demands it. I provision for concurrent sessions with headroom, not for the total doc count."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
     ],
     doc:[
       {l:"medium",tag:"concept",q:"What's stored — op log, snapshots, schema?",turns:[
@@ -341,6 +368,24 @@ window.DATA['gdocs'] = {
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"Op throughput and storage for the op log plus snapshots.",turns:[
+        {who:"intv",text:"Put numbers on the document store. Across ~50M daily active docs at a few ops each, plus hot docs, what write throughput does the op log take, and how much storage do op logs and snapshots need?"},
+        {who:"cand",text:"Throughput first, then storage.<span class='eg'>Assume ~50M active docs averaging ~200 ops/day → ~10B ops/day ≈ ~120K ops/s average, peak 3-5x → ~400-600K ops/s of tiny appends across the fleet. Storage: ~10B ops/day × ~50 bytes ≈ ~500GB/day of raw log; snapshots add a folded copy per doc periodically.</span>Appends are sequential and tiny, so throughput is fine on a sharded log; the growth is what bites."},
+        {who:"intv",text:"So how do you keep storage from running away?"},
+        {who:"cand",text:"Two levers I have already leaned on. <strong>Compaction</strong>: once a snapshot at seq S is durable I archive and truncate log segments before S, so the hot tier holds only a recent op window per doc — its size tracks <em>active</em> docs, not two years of history. <strong>Snapshot cadence</strong>: every ~1,000 ops or 60s, retaining only the latest snapshot or two on the hot tier and aging the rest to cold storage. So the hot store is O(recent ops + current snapshots) ≈ tens of TB, while full history lives cheaply in the cold tier. I shard by doc id so both the ~500K-ops/s append load and the storage spread across nodes with no global hotspot."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which store for the op log, and why?",turns:[
+        {who:"intv",text:"Pick the actual technology for the op log and defend it. The access pattern is append per doc and read snapshot + tail by doc id. Kafka? A Postgres table? Cassandra? Walk the trade-offs."},
+        {who:"cand",text:"The pattern is append-only, ordered-per-key, point-and-range reads by doc id, no joins — so I compare three. <strong>A relational table</strong> (Postgres) gives easy per-doc ordering and transactions, but ~500K appends/s of tiny rows means index bloat, vacuum pressure, and painful sharding across 50M keys — it fights the workload. <strong>Kafka</strong> is a natural append-only log with per-partition ordering, but it is a <em>transport</em> log, not a random-access store: reading 'snapshot + tail for doc X' or seeking to an arbitrary seq for history is awkward when a partition multiplexes many docs. <strong>A wide-column store</strong> (Cassandra or Bigtable) keyed <code>(docId, seq)</code> gives ordered rows per doc, huge horizontal append throughput, and cheap range reads of the tail."},
+        {who:"intv",text:"So which, and where does the loser still show up?"},
+        {who:"cand",text:"I choose the <strong>wide-column store keyed by (docId, seq)</strong> as the source-of-truth op log: it matches the access pattern (append + ordered range scan per doc), shards by doc id with no global hotspot, and replicates per-partition for the quorum durability I need. Kafka still earns a place — but as the <strong>pub/sub fan-out layer</strong> broadcasting accepted ops to gateways, not as the durable store. And a small <strong>relational or KV table</strong> holds doc metadata and ACLs, where transactions and conditional writes (claiming access) actually matter. So it is not one box: wide-column for the log, a stream for transport, relational for metadata — each where its strengths fit."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
     ],
     engine:[
       {l:"medium",tag:"concept",q:"How OT actually transforms operations.",turns:[
@@ -379,6 +424,15 @@ window.DATA['gdocs'] = {
         {title:"CRDT resources",url:"https://crdt.tech/"},
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
       ]},
+      {l:"medium",tag:"capacity",q:"How much compute and memory does the engine need?",turns:[
+        {who:"intv",text:"Quantify the engine's cost. It transforms each op against the ops since a client's base version and holds live per-doc state. On a 500-editor hot doc, how much work per op and how much memory, and does it scale across millions of docs?"},
+        {who:"cand",text:"Per-op work is bounded by how far behind a client is, which I keep tiny.<span class='eg'>Healthy clients get ordered ops pushed continuously, so each is only a few ops behind → transform is O(handful) per op. At ~1-2.5K ops/s on a hot doc that is a few thousand cheap transforms/s — well within one core.</span>Memory is the current materialized doc (~hundreds of KB) plus a recent op window, not full history. So a hot doc is ~1 core and sub-MB of live state."},
+        {who:"intv",text:"And across the corpus?"},
+        {who:"cand",text:"The engine is <strong>co-located with the doc's collab owner</strong> and only holds state for <em>actively edited</em> docs, so its footprint scales with <strong>concurrent sessions, sharded by doc id</strong> — the same envelope as the collab fleet, a few thousand nodes at peak, not the 50M-doc corpus. Idle docs cost nothing; they live as snapshot + log in the store until reopened. The one spike is a reconnecting client 2,000 ops behind: I refuse to dribble 2,000 transforms through the hot path and instead catch it up in a batch or hand it a fresh snapshot + short tail. So steady-state is O(small) per op and memory tracks live editing — the engine is not the bottleneck once I bound transform distance."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"Operational transformation",url:"https://en.wikipedia.org/wiki/Operational_transformation"},
+      ]},
     ],
     presence:[
       {l:"easy",tag:"concept",q:"Why cursor presence is a different kind of data.",turns:[
@@ -413,6 +467,15 @@ window.DATA['gdocs'] = {
         {who:"intv",text:"Typing indicators — 'Alice is typing' — same mechanism?"},
         {who:"cand",text:"Yes, it's just another ephemeral presence field. When I emit edit ops the client also sets a transient <code>typing=true</code> in its presence, which the service fans out and which <strong>auto-clears on a short timeout</strong> if no further edits arrive (or on idle). It's LWW, TTL-backed, and best-effort like cursors — if a 'stopped typing' update is dropped, the timeout cleans it up anyway. Keeping all of this in the presence tier means these fun-but-nonessential signals never add load or risk to the durable edit path."},
       ],resources:[
+        {title:"Figma: how multiplayer works",url:"https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the presence tier — update rate and memory.",turns:[
+        {who:"intv",text:"Numbers for presence. On a 500-editor doc each client emits ~10 cursor updates/s, and you run this as its own tier. What message rate must it handle, and how much does it store?"},
+        {who:"cand",text:"Raw fan-out is the scary number, so I never serve it raw.<span class='eg'>500 senders × ~10 updates/s × 499 receivers ≈ ~2.5M messages/s for one doc if delivered naively — dwarfing the ~1-2.5K/s of edits.</span>I collapse it: clients throttle to ~5-10/s, the tier <strong>coalesces</strong> to the latest position per user and flushes one batched snapshot per ~100-200ms tick → ~500 users × ~5-10 ticks/s = a few thousand batched messages/s. Storage is trivial — only the <em>current</em> value per (docId, userId) in memory with a short TTL, a few hundred bytes each."},
+        {who:"intv",text:"So how do you size the tier across all docs?"},
+        {who:"cand",text:"It is <strong>stateless and horizontally scaled</strong>, sized on concurrent editors, and because entries are tiny and in-memory, memory is a non-issue — 2M concurrent editors at a few hundred bytes each is well under a GB spread across the tier. The real budget is <strong>fan-out CPU and bandwidth</strong>, which I bound with per-tick batching and, past a threshold, <strong>degrading to aggregate presence</strong> ('+N others') plus viewport-scoping so I never pay N-squared. Since none of it is durable I can shard freely and drop under load with zero consistency risk. I size presence for coalesced fan-out, not raw cursor events — the throttle plus tick is what makes the number sane."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
         {title:"Figma: how multiplayer works",url:"https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"},
       ]},
     ],
@@ -450,6 +513,24 @@ window.DATA['gdocs'] = {
         {who:"cand",text:"Neither — restore is <strong>append, not rewrite</strong>. To restore to seq S, I compute the diff between the current state and the state at S and apply it as <strong>new ops on the head of the log</strong>. So 'restore' is itself an edit that everyone converges on through the normal path, and the intervening history is preserved (you can undo the restore, or restore forward again). This keeps the log immutable and auditable, avoids the correctness hazard of deleting committed ops, and works cleanly even while other people are live in the doc — the restore ops just flow through the engine like any concurrent edit."},
       ],resources:[
         {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+      ]},
+      {l:"medium",tag:"capacity",q:"Size the durable snapshot and archive storage.",turns:[
+        {who:"intv",text:"Size the persistence tier — the durable snapshots and archived log segments in object storage. Across ~50M docs with continuous snapshotting, how much do you store and at what write rate, and what governs the growth?"},
+        {who:"cand",text:"Archive storage is the big number, so I bound it rather than store everything.<span class='eg'>~50M active docs; at a few hundred KB of retained history per active doc → order of tens of TB of hot-relevant history. But naive full-copy-per-1,000-ops on a busy 200KB doc alone is GBs/day, and raw archived log across the corpus is ~500GB/day if kept whole — that is the runaway I must prevent.</span>The write rate to object storage is background, not per-op — snapshots every ~1,000 ops or 60s per active doc, batched."},
+        {who:"intv",text:"So how do you keep the archive from exploding?"},
+        {who:"cand",text:"Four controls I have leaned on. <strong>Retain few snapshots</strong> — keep the latest one or two for recovery, GC the rest. <strong>Incremental snapshots</strong> — a base plus deltas instead of a full doc copy each interval. <strong>Coarsening retention</strong> — fine-grained ops for recent edits, then thin old history to hourly, then daily snapshots. <strong>Lifecycle tiering</strong> — age old segments into cheaper cold or glacier classes. So steady-state is O(current doc size + recent history) per doc, not O(all edits ever × full copies). The write path is unaffected because live durability is served by the quorum hot log; object storage only takes background, batched, retriable writes, so its throughput and latency never gate acks."},
+      ],resources:[
+        {title:"System Design Primer — back-of-the-envelope",url:"https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
+      ]},
+      {l:"medium",tag:"concept",q:"Which storage for snapshots and archives, and why?",turns:[
+        {who:"intv",text:"Pick the technology for snapshots and archived segments and defend it. Options on the table: dump them in a database, keep them on replicated block volumes, or push them to an object store like S3. Trade-offs?"},
+        {who:"cand",text:"The data is large, immutable-once-written blobs, read rarely (recovery, cold history), written by background jobs — so I weigh three. <strong>A database</strong> would let me query history richly, but storing multi-hundred-KB blobs as rows is expensive, bloats the DB, and wastes its transactional machinery on write-once objects. <strong>Replicated block volumes</strong> (attached disks) are fast but costly per GB, capacity-capped, and I would hand-roll cross-AZ redundancy and lifecycle myself. <strong>Object storage</strong> (S3-class) is purpose-built for this: ~11-nines durability, cross-AZ by default, cheap per GB, versioned immutable keys, and native lifecycle tiering to colder classes."},
+        {who:"intv",text:"Object storage is slower and eventually consistent — doesn't that hurt you?"},
+        {who:"cand",text:"It would if it were on the hot path, so I keep it strictly off it: live durability is the <strong>quorum-replicated hot op log</strong>, and object storage only holds snapshots plus sealed segments written by <strong>background jobs</strong>. Its latency never touches op acks, and eventual consistency is a non-issue because I read a <em>specific versioned, immutable key</em> for a snapshot, never a mutable one. So I choose <strong>object storage for snapshots and archives</strong>, keep a small hot fast tier for the live log tail, and only truncate a hot segment after its snapshot is confirmed durable in the object store. The trade-off — slower cold reads for 'restore to last Tuesday' — is fine because that path is rare; I trade cold-read speed for durability and cost, which is the right call for history."},
+      ],resources:[
+        {title:"System Design Primer",url:"https://github.com/donnemartin/system-design-primer"},
+        {title:"ByteByteGo",url:"https://bytebytego.com/"},
       ]},
     ],
   }
