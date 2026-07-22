@@ -18,6 +18,60 @@ window.DATA['url'] = {
   edges:[["client","lb"],["lb","svc"],["svc","db"],["svc","cache"],["cache","db"],["svc","key"],["db","replica"],["svc","analytics"]],
   core:["client","lb","svc","db"],
   basic:["client","lb","svc","db"],
+  schema:{tables:[
+    {name:"urls",pk:"short_key",columns:[
+      ["short_key","varchar(11)","base62 key, primary key"],
+      ["long_url","text","destination URL"],
+      ["user_id","bigint NULL","owner (null = anonymous)"],
+      ["created_at","timestamptz","creation time"],
+      ["expires_at","timestamptz NULL","null = never expires"],
+      ["is_custom","boolean","true if user-chosen alias"],
+    ],rows:[
+      ["15ftgG","https://example.com/very/long/path?ref=x","42","2026-07-22 10:00:00","(null)","false"],
+      ["my-sale","https://shop.example.com/summer-sale","7","2026-07-20 09:12:00","2026-08-01 00:00:00","true"],
+      ["9kQ2aZ","https://docs.example.com/guide","(null)","2026-07-22 11:30:00","(null)","false"],
+    ]},
+    {name:"id_ranges",pk:"range_start",columns:[
+      ["range_start","bigint","first id in the block"],
+      ["range_end","bigint","last id in the block"],
+      ["instance_id","varchar(64)","service instance that owns it"],
+      ["assigned_at","timestamptz","when the block was leased"],
+    ],rows:[
+      ["1000000000","1000999999","svc-7f3a","2026-07-22 09:59:50"],
+      ["1001000000","1001999999","svc-b12c","2026-07-22 10:01:14"],
+    ]},
+    {name:"click_events",pk:"event_id",columns:[
+      ["event_id","uuid","dedup key"],
+      ["short_key","varchar(11)","which link (indexed)"],
+      ["ts","timestamptz","click time"],
+      ["country","char(2)","geo from IP"],
+      ["referrer","text","HTTP referrer"],
+    ],rows:[
+      ["a1b2…","15ftgG","2026-07-22 10:05:11","US","https://twitter.com/"],
+      ["c3d4…","15ftgG","2026-07-22 10:05:12","IN","(direct)"],
+    ]},
+  ]},
+  flows:[
+    {id:"create",name:"Create URL (write)",steps:[
+      {node:"client",text:"Client sends <code>POST /shorten {url}</code>."},
+      {node:"lb",text:"Gateway terminates TLS, authenticates, <strong>rate-limits</strong> the create, routes to a service instance."},
+      {node:"svc",text:"Service validates the URL and length."},
+      {node:"key",requires:["key"],text:"Requests the next id from its local block (key-gen); base62-encodes it to <code>15ftgG</code>."},
+      {node:"db",text:"Writes the row into <code>urls</code> (conditional insert if it's a custom alias)."},
+      {node:"cache",requires:["cache"],text:"Warms the cache with <code>15ftgG → long_url</code> (best-effort)."},
+      {node:"client",text:"Returns <code>https://sho.rt/15ftgG</code>."},
+    ]},
+    {id:"read",name:"Redirect (read)",steps:[
+      {node:"client",text:"Browser issues <code>GET /15ftgG</code>."},
+      {node:"lb",text:"Gateway routes the (anonymous) read — or an edge cache may answer it outright."},
+      {node:"cache",requires:["cache"],text:"Checks Redis first — a <strong>hit</strong> (~95% of reads) returns the long URL immediately."},
+      {node:"svc",text:"On a miss, the service looks the key up."},
+      {node:"replica",requires:["replica"],text:"Reads from a <strong>read-replica</strong>, sparing the write primary; populates the cache."},
+      {node:"db",text:"Fetches <code>long_url</code> from the datastore (source of truth)."},
+      {node:"analytics",requires:["analytics"],text:"Fires a click event to the queue <strong>async</strong> — never blocks the redirect."},
+      {node:"client",text:"Returns <code>302 Location: long_url</code>; browser follows it."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Create a short URL from a long one, with optional custom alias and expiry",

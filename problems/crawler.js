@@ -18,6 +18,72 @@ window.DATA['crawler'] = {
   edges:[["seed","frontier"],["frontier","fetcher"],["fetcher","parser"],["parser","frontier"],["parser","store"],["fetcher","dns"],["fetcher","politeness"],["parser","dedup"]],
   core:["seed","frontier","fetcher","parser"],
   basic:["seed","frontier","fetcher","parser"],
+  schema:{tables:[
+    {name:"frontier_queue",pk:"url_hash",columns:[
+      ["url_hash","char(16)","canonical URL hash, primary key"],
+      ["url","text","canonical URL to fetch"],
+      ["host","varchar(255)","registered domain, drives partitioning"],
+      ["priority","smallint","0 = highest (homepages) .. 4 = deep archive"],
+      ["depth","int","hops from a seed URL"],
+      ["scheduled_at","timestamptz","earliest time this URL may be fetched"],
+    ],rows:[
+      ["9f3a1c…","https://example.com/","example.com","0","0","2026-07-22 10:00:00"],
+      ["b21e77…","https://example.com/products/42","example.com","2","1","2026-07-22 10:00:10"],
+      ["4cd902…","https://news.example.org/live","news.example.org","0","0","2026-07-22 10:00:00"],
+    ]},
+    {name:"seen_urls",pk:"url_hash",columns:[
+      ["url_hash","char(16)","canonical URL hash — membership key"],
+      ["bloom_segment","int","which Bloom-filter shard holds this key"],
+      ["first_seen_at","timestamptz","when the URL first entered the seen-set"],
+    ],rows:[
+      ["9f3a1c…","7","2026-07-22 09:59:50"],
+      ["b21e77…","3","2026-07-22 10:00:11"],
+    ]},
+    {name:"pages",pk:"url_hash",columns:[
+      ["url_hash","char(16)","canonical URL hash, primary key"],
+      ["url","text","page URL"],
+      ["content_hash","char(32)","SimHash / checksum for content dedup"],
+      ["http_status","smallint","last fetch status code"],
+      ["storage_url","text","object-store key for compressed raw HTML"],
+      ["fetched_at","timestamptz","last successful fetch time"],
+    ],rows:[
+      ["9f3a1c…","https://example.com/","3b9d…c1","200","s3://raw/9f3a1c.gz","2026-07-22 10:00:05"],
+      ["4cd902…","https://news.example.org/live","7ea0…9f","200","s3://raw/4cd902.gz","2026-07-22 10:00:04"],
+    ]},
+    {name:"host_politeness",pk:"host",columns:[
+      ["host","varchar(255)","registered domain, primary key"],
+      ["last_crawled_at","timestamptz","time of the most recent fetch to this host"],
+      ["crawl_delay_ms","int","min gap between fetches (from robots.txt or default)"],
+      ["robots_rules","text","parsed robots.txt disallow rules"],
+      ["robots_fetched_at","timestamptz","when robots.txt was last cached"],
+    ],rows:[
+      ["example.com","2026-07-22 10:00:05","1000","disallow: /cart","2026-07-22 09:30:00"],
+      ["news.example.org","2026-07-22 10:00:04","10000","disallow: /admin","2026-07-22 09:45:00"],
+    ]},
+    {name:"dns_cache",pk:"host",columns:[
+      ["host","varchar(255)","hostname, primary key"],
+      ["ip","varchar(45)","resolved A / AAAA address"],
+      ["ttl_expires_at","timestamptz","when this entry must be re-resolved"],
+    ],rows:[
+      ["example.com","93.184.216.34","2026-07-22 10:05:00"],
+      ["news.example.org","203.0.113.7","2026-07-22 10:03:30"],
+    ]},
+  ]},
+  flows:[
+    {id:"crawl",name:"Crawl one URL end-to-end",steps:[
+      {node:"frontier",text:"Frontier pops the next due URL, chosen by priority and by the host whose politeness delay has elapsed."},
+      {node:"dns",requires:["dns"],text:"Resolves the host to an IP via the DNS cache, falling through to the resolver only on a miss."},
+      {node:"politeness",requires:["politeness"],text:"Checks robots.txt rules and the per-host crawl-delay; holds the URL if the host was fetched too recently."},
+      {node:"fetcher",text:"Fetcher downloads the page over async IO with connect/read timeouts and a response-size cap."},
+      {node:"parser",text:"Parser extracts visible text and metadata from the raw HTML."},
+      {node:"store",requires:["store"],text:"Persists the compressed raw HTML plus extracted text and content_hash to the content store."},
+    ]},
+    {id:"discover",name:"Discover + enqueue new links",steps:[
+      {node:"parser",text:"Parser pulls out outbound links and normalises each to a single canonical URL."},
+      {node:"dedup",requires:["dedup"],text:"Checks each canonical URL against the Bloom-filter seen-set and drops any already crawled."},
+      {node:"frontier",text:"Pushes the genuinely new URLs back into the frontier, scored and scheduled for a later fetch."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Crawl outward from a set of seed URLs, downloading every page reached",

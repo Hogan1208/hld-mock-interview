@@ -18,6 +18,88 @@ window.DATA['ticketmaster'] = {
   edges:[["client","gw"],["gw","booking"],["booking","db"],["booking","cache"],["gw","queue"],["booking","payment"],["gw","search"]],
   core:["client","gw","booking","db"],
   basic:["client","gw","booking","db"],
+  schema:{tables:[
+    {name:"events",pk:"event_id",columns:[
+      ["event_id","bigint","primary key"],
+      ["name","varchar(200)","event / show title"],
+      ["venue_id","bigint","FK to venues"],
+      ["starts_at","timestamptz","when the show starts"],
+      ["on_sale_at","timestamptz","when tickets go on sale"],
+    ],rows:[
+      ["evt-501","Taylor Swift - Eras Tour","ven-11","2026-09-01 20:00:00","2026-07-22 10:00:00"],
+      ["evt-502","Coldplay - Music of the Spheres","ven-12","2026-10-15 19:30:00","2026-08-01 12:00:00"],
+    ]},
+    {name:"venues",pk:"venue_id",columns:[
+      ["venue_id","bigint","primary key"],
+      ["name","varchar(200)","venue name"],
+      ["seat_map_id","bigint","layout used to render the seat map"],
+    ],rows:[
+      ["ven-11","Gillette Stadium","map-900"],
+      ["ven-12","MetLife Stadium","map-901"],
+    ]},
+    {name:"seats",pk:"seat_id",columns:[
+      ["seat_id","varchar(24)","primary key"],
+      ["event_id","bigint","FK to events (sharded on this)"],
+      ["section","varchar(24)","section label"],
+      ["row","varchar(8)","row label"],
+      ["num","int","seat number"],
+      ["status","varchar(12)","state machine: available -> held -> sold; held -> available on expiry"],
+      ["hold_expires_at","timestamptz NULL","when a held seat frees itself (null unless held)"],
+      ["held_by","varchar(32) NULL","user holding the seat (null unless held)"],
+    ],rows:[
+      ["s-101","evt-501","Floor A","1","14","sold","(null)","(null)"],
+      ["s-102","evt-501","Floor A","1","15","held","2026-07-22 10:03:00","user-9001"],
+      ["s-103","evt-501","Floor A","1","16","available","(null)","(null)"],
+    ]},
+    {name:"orders",pk:"order_id",columns:[
+      ["order_id","varchar(24)","primary key"],
+      ["user_id","varchar(32)","who is buying"],
+      ["event_id","bigint","FK to events"],
+      ["seat_ids","jsonb","seats in this order"],
+      ["status","varchar(12)","pending -> confirmed"],
+      ["payment_id","varchar(24) NULL","FK to payments (null until charged)"],
+      ["created_at","timestamptz","order creation time"],
+    ],rows:[
+      ["ord-8001","user-42","evt-501","[s-101]","confirmed","pay-7001","2026-07-22 10:01:30"],
+      ["ord-8002","user-9001","evt-501","[s-102]","pending","(null)","2026-07-22 10:02:55"],
+    ]},
+    {name:"payments",pk:"payment_id",columns:[
+      ["payment_id","varchar(24)","primary key"],
+      ["order_id","varchar(24)","FK to orders"],
+      ["amount","numeric(10,2)","charge amount"],
+      ["status","varchar(12)","authorized -> captured -> refunded"],
+    ],rows:[
+      ["pay-7001","ord-8001","250.00","captured"],
+      ["pay-7002","ord-8003","180.00","authorized"],
+    ]},
+  ]},
+  flows:[
+    {id:"browse",name:"Browse / search an event",steps:[
+      {node:"client",text:"User types <code>Taylor Swift Boston</code> and opens an event."},
+      {node:"gw",text:"Gateway terminates TLS and routes the anonymous read."},
+      {node:"search",requires:["search"],text:"Search service matches events by name / artist / city / date over its inverted index."},
+      {node:"booking",text:"Booking service assembles the event page and its seat map."},
+      {node:"cache",requires:["cache"],text:"Seat-map availability is read from the cache (a slightly-stale display hint)."},
+      {node:"client",text:"Renders the event and live-ish seat availability."},
+    ]},
+    {id:"book",name:"Reserve a seat, pay, confirm",steps:[
+      {node:"client",text:"User taps seat <code>14A</code> and sends <code>POST /reserve</code> with an idempotency key."},
+      {node:"gw",text:"Gateway authenticates and per-user rate-limits the reserve."},
+      {node:"booking",text:"Booking service attempts the reservation for the seat."},
+      {node:"cache",requires:["cache"],text:"Takes the hold via a Redis lock - <code>SET seat:14A userId NX EX 600</code> (10-min TTL) so no seat is stuck forever."},
+      {node:"db",text:"Short transaction flips the seat to <code>held</code> with an expiry and writes a pending order."},
+      {node:"payment",requires:["payment"],text:"Payment service authorizes the card outside any DB lock."},
+      {node:"db",text:"On charge success a second short transaction commits the held -> sold transition and confirms the order."},
+      {node:"client",text:"Returns the confirmed order and ticket."},
+    ]},
+    {id:"onsale",name:"High-demand on-sale entry",steps:[
+      {node:"client",text:"At the on-sale second, a million users hit <code>Buy</code> for one event."},
+      {node:"gw",text:"Gateway sends unadmitted users to the waiting room instead of booking."},
+      {node:"queue",requires:["queue"],text:"Waiting room buffers arrivals and admits them at a controlled rate the backend can absorb, handing out short-lived admission tokens."},
+      {node:"booking",text:"An admitted user reaches booking and attempts an atomic reserve."},
+      {node:"db",text:"The inventory DB serializes the single-row conditional write - exactly one buyer wins the seat."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Browse and view events, venues, and live seat availability",

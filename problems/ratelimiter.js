@@ -17,6 +17,60 @@ window.DATA['ratelimiter'] = {
   edges:[["client","gw"],["gw","limiter"],["limiter","store"],["limiter","algo"],["limiter","config"],["store","sync"]],
   core:["client","gw","limiter","store"],
   basic:["client","gw","limiter","store"],
+  schema:{tables:[
+    {name:"rate_limit_rules",pk:"rule_id",columns:[
+      ["rule_id","varchar(40)","primary key (config DB, not Redis)"],
+      ["scope","varchar(16)","user / api-key / ip"],
+      ["tier","varchar(16)","free / pro / enterprise"],
+      ["limit","int","max requests per window"],
+      ["window_seconds","int","window length in seconds"],
+      ["algorithm","varchar(24)","token_bucket / sliding_window / fixed_window"],
+    ],rows:[
+      ["free-default","api-key","free","1000","60","sliding_window"],
+      ["pro-default","api-key","pro","100000","60","token_bucket"],
+      ["ent-k_ent_3","api-key","enterprise","5000000","60","token_bucket"],
+    ]},
+    {name:"counters",pk:"key",columns:[
+      ["key","string","Redis key, e.g. rl:user:42:1m (api-key + minute bucket)"],
+      ["count","integer","requests seen in this window (INCR)"],
+      ["window_start","epoch","start of the current window"],
+      ["ttl","seconds","auto-expire ~2 windows so stale buckets self-delete"],
+    ],rows:[
+      ["rl:user:42:1m","975","1718000460","118"],
+      ["rl:api-key:k_pro_9:1m","30412","1718000460","119"],
+      ["rl:ip:203.0.113.7:1m","1000","1718000460","117"],
+    ]},
+    {name:"token_buckets",pk:"key",columns:[
+      ["key","string","Redis key per api-key, e.g. tb:k_pro_9"],
+      ["tokens","float","tokens currently available in the bucket"],
+      ["last_refill_ts","epoch-ms","last time tokens were added (drives refill math)"],
+    ],rows:[
+      ["tb:k_pro_9","41287.5","1718000487320"],
+      ["tb:k_ent_3","4998200.0","1718000487295"],
+    ]},
+  ]},
+  flows:[
+    {id:"allow",name:"Request under the limit (allowed)",steps:[
+      {node:"client",text:"Client sends an API request with key <code>k_free_42</code>."},
+      {node:"gw",text:"Gateway authenticates and forwards an allow-or-deny check to the limiter."},
+      {node:"config",requires:["config"],text:"Limiter resolves key &rarr; free tier &rarr; rule <strong>1000/min, sliding_window</strong> from cached rules."},
+      {node:"algo",requires:["algo"],text:"Algorithm engine computes the current window estimate for this key."},
+      {node:"store",text:"Atomically <code>INCR</code>s the counter for <code>rl:user:42:1m</code>; new value 976."},
+      {node:"algo",requires:["algo"],text:"Engine sees 976 &le; 1000, so the decision is <strong>allow</strong> with 24 remaining."},
+      {node:"gw",text:"Gateway forwards the request upstream and returns <code>X-RateLimit-Remaining: 24</code>."},
+      {node:"client",text:"Client receives a normal <code>200</code> response."},
+    ]},
+    {id:"throttle",name:"Request over the limit (429)",steps:[
+      {node:"client",text:"Client sends another request for <code>k_free_42</code>, already near its cap."},
+      {node:"gw",text:"Gateway forwards the allow-or-deny check to the limiter."},
+      {node:"config",requires:["config"],text:"Limiter resolves the same rule: <strong>1000/min, sliding_window</strong>."},
+      {node:"store",text:"Atomically <code>INCR</code>s <code>rl:user:42:1m</code>; new value 1001."},
+      {node:"algo",requires:["algo"],text:"Algorithm engine sees 1001 &gt; 1000 and returns <strong>deny</strong>."},
+      {node:"sync",requires:["sync"],text:"Cluster sync had reconciled per-node deltas into this counter, so the global limit holds across the fleet."},
+      {node:"gw",text:"Gateway rejects with <code>429 Too Many Requests</code> and <code>Retry-After: 30</code>."},
+      {node:"client",text:"Client honors <code>Retry-After</code> and backs off for 30 seconds."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Enforce a request limit per API key / user, by tier (free / pro / enterprise)",

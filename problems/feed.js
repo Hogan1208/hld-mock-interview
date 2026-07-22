@@ -17,6 +17,75 @@ window.DATA['feed'] = {
   edges:[["client","lb"],["lb","feed"],["feed","db"],["feed","cache"],["cache","db"],["feed","fanout"],["fanout","cache"],["feed","media"]],
   core:["client","lb","feed","db"],
   basic:["client","lb","feed","db"],
+  schema:{tables:[
+    {name:"posts",pk:"post_id",columns:[
+      ["post_id","bigint","snowflake id, primary key"],
+      ["author_id","bigint","who wrote it (indexed)"],
+      ["text","text","post body"],
+      ["media_ids","jsonb NULL","object keys for attached media (null = text only)"],
+      ["created_at","timestamptz","creation time"],
+    ],rows:[
+      ["1487200000001","42","just shipped the new release","[\"med_9f2a\"]","2026-07-22 10:00:00"],
+      ["1487200000002","7","good morning","(null)","2026-07-22 10:01:12"],
+      ["1487200000003","901","tour dates announced","[\"med_1b3c\",\"med_1b3d\"]","2026-07-22 10:02:30"],
+    ]},
+    {name:"follows",pk:"follower_id + followee_id",columns:[
+      ["follower_id","bigint","the user who follows (indexed)"],
+      ["followee_id","bigint","the user being followed (indexed)"],
+      ["created_at","timestamptz","when the edge was created"],
+    ],rows:[
+      ["42","901","2026-06-01 08:00:00"],
+      ["7","901","2026-06-02 09:30:00"],
+      ["42","7","2026-06-10 12:15:00"],
+    ]},
+    {name:"users",pk:"user_id",columns:[
+      ["user_id","bigint","primary key"],
+      ["handle","varchar(30)","unique @handle"],
+      ["follower_count","bigint","denormalized count"],
+      ["is_celebrity","boolean","true if above fan-out threshold"],
+    ],rows:[
+      ["42","@ada","318","false"],
+      ["7","@grace","512","false"],
+      ["901","@popstar","51000000","true"],
+    ]},
+    {name:"timelines",pk:"user_id",columns:[
+      ["user_id","bigint","whose home timeline this is"],
+      ["post_ids","list<bigint>","ordered, length-capped list of post ids"],
+      ["updated_at","timestamptz","last fan-out write"],
+    ],rows:[
+      ["42","[1487200000002, 1487200000001]","2026-07-22 10:01:12"],
+      ["7","[1487200000001]","2026-07-22 10:00:00"],
+    ]},
+  ]},
+  flows:[
+    {id:"post",name:"Create a post (write / fan-out)",steps:[
+      {node:"client",text:"Client sends <code>POST /post {text, media?}</code>."},
+      {node:"lb",text:"Gateway terminates TLS, authenticates, <strong>rate-limits</strong> the write, routes to a feed-service instance."},
+      {node:"media",requires:["media"],text:"If media is attached, the client uploads bytes <strong>directly to object storage</strong>; the post keeps only an object-key reference."},
+      {node:"feed",text:"Feed service validates the post and mints a snowflake <code>post_id</code>."},
+      {node:"db",text:"Writes the row into <code>posts</code> (canonical, durable), then looks up the author's follower list."},
+      {node:"fanout",requires:["fanout"],text:"Fan-out service pushes the <code>post_id</code> into each follower's feed list <strong>async</strong> (skipped for celebrities)."},
+      {node:"cache",requires:["cache"],text:"Fan-out writes append the id to each <code>timeline:userId</code> Redis list; the author's own list is updated synchronously for read-your-writes."},
+      {node:"client",text:"Returns <code>200</code> with the created post."},
+    ]},
+    {id:"timeline",name:"Load home timeline (read)",steps:[
+      {node:"client",text:"Client issues <code>GET /timeline?cursor=...</code>."},
+      {node:"lb",text:"Gateway authenticates and routes the read to the nearest feed-service instance."},
+      {node:"cache",requires:["cache"],text:"Range-reads the page of post ids from the user's <code>timeline:userId</code> list — sub-millisecond."},
+      {node:"fanout",requires:["fanout"],text:"Merges in recent posts from the handful of <strong>celebrities</strong> the user follows (not fanned out at write time)."},
+      {node:"feed",text:"Hydrates the page of ids with a parallel multi-get."},
+      {node:"db",text:"Fetches canonical post bodies and author profiles from the post + graph store on cache miss."},
+      {node:"media",requires:["media"],text:"Client fetches images and video from the <strong>CDN edge</strong> in parallel with rendering the text."},
+      {node:"client",text:"Renders the ranked page; returns a cursor for the next page."},
+    ]},
+    {id:"media",name:"Attach and view media (CDN)",steps:[
+      {node:"client",text:"Client requests a <strong>pre-signed URL</strong> and uploads the file straight to object storage."},
+      {node:"media",requires:["media"],text:"An async pipeline transcodes the source into multiple bitrate renditions behind the CDN."},
+      {node:"feed",text:"The post carries only the media reference — bytes never flow through the feed path."},
+      {node:"db",text:"Persists the post row with the object-key reference in <code>media_ids</code>."},
+      {node:"media",requires:["media"],text:"On view, the <strong>CDN edge</strong> serves the right rendition close to the user via adaptive bitrate streaming."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Create a post — text plus an optional photo or video",

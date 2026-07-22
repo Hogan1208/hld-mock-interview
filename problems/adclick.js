@@ -18,6 +18,66 @@ window.DATA['adclick'] = {
   edges:[["client","gw"],["gw","stream"],["stream","agg"],["agg","olap"],["stream","dedup"],["agg","batch"],["olap","query"]],
   core:["client","gw","stream","agg"],
   basic:["client","gw","stream","agg"],
+  schema:{tables:[
+    {name:"raw_click_events",pk:"click_id",columns:[
+      ["click_id","varchar(32)","client-minted id, primary key + dedup key"],
+      ["ad_id","bigint","which ad (partition key)"],
+      ["user_id","varchar(32)","anonymised user/device id"],
+      ["ts","timestamptz","client event-time of the click"],
+      ["ip","inet","source IP (geo enrichment)"],
+    ],rows:[
+      ["c-8f3a","42","u-19d2","2026-07-22 12:00:59","203.0.113.7"],
+      ["c-8f3b","42","u-77aa","2026-07-22 12:01:03","198.51.100.4"],
+      ["c-91cd","108","u-19d2","2026-07-22 12:01:04","203.0.113.7"],
+    ]},
+    {name:"aggregates",pk:"(ad_id, minute_bucket)",columns:[
+      ["ad_id","bigint","which ad"],
+      ["minute_bucket","timestamptz","start of the 1-minute tumbling window"],
+      ["count","bigint","clicks in that window"],
+      ["batch_version","int","0 = speed layer, higher = finalized by batch"],
+    ],rows:[
+      ["42","2026-07-22 12:00:00","18432","0"],
+      ["42","2026-07-22 12:01:00","17190","0"],
+      ["108","2026-07-22 12:01:00","231","2"],
+    ]},
+    {name:"dedup_keys",pk:"click_id",columns:[
+      ["click_id","varchar(32)","seen click id (co-partitioned by ad_id)"],
+      ["seen_at","timestamptz","when first observed"],
+      ["ttl_expires_at","timestamptz","short TTL, ~24h, then evicted"],
+    ],rows:[
+      ["c-8f3a","2026-07-22 12:00:59","2026-07-23 12:00:59"],
+      ["c-8f3b","2026-07-22 12:01:03","2026-07-23 12:01:03"],
+    ]},
+    {name:"batch_recompute_runs",pk:"run_id",columns:[
+      ["run_id","uuid","reconciliation job id"],
+      ["window_start","timestamptz","first minute recomputed"],
+      ["window_end","timestamptz","last minute recomputed"],
+      ["status","varchar(16)","queued | running | done | failed"],
+    ],rows:[
+      ["r-4401","2026-07-22 12:00:00","2026-07-22 13:00:00","done"],
+      ["r-4402","2026-07-22 13:00:00","2026-07-22 14:00:00","running"],
+    ]},
+  ]},
+  flows:[
+    {id:"ingest",name:"Ingest a click event",steps:[
+      {node:"client",text:"Ad / browser fires a compact beacon with a client-minted <code>clickId</code>."},
+      {node:"gw",text:"Ingest gateway validates the schema, authenticates the source, and enriches with geo + receive-time."},
+      {node:"stream",text:"Gateway produces the event to the durable event log (Kafka), keyed by <code>adId</code>."},
+      {node:"dedup",requires:["dedup"],text:"Dedup stage drops the event if its <code>clickId</code> was already seen within the window."},
+      {node:"agg",text:"Aggregator does a windowed rollup — a running count per <code>(adId, minute)</code>."},
+      {node:"olap",requires:["olap"],text:"On window close, the per-minute count is written to the OLAP store."},
+    ]},
+    {id:"query",name:"Advertiser queries metrics",steps:[
+      {node:"query",requires:["query"],text:"Advertiser calls the query API for an ad's last-24h metrics."},
+      {node:"olap",requires:["olap"],text:"The API scans pre-aggregated minute-buckets in the OLAP store and sums them in ms."},
+      {node:"query",requires:["query"],text:"Query API returns the rollup — recent buckets flagged provisional, older ones final."},
+    ]},
+    {id:"reconcile",name:"Batch reconciliation of a bad window",steps:[
+      {node:"stream",text:"Retained raw events in the log are the ground truth for a window."},
+      {node:"batch",requires:["batch"],text:"Batch recompute reads the raw events and recomputes authoritative per-minute counts."},
+      {node:"olap",requires:["olap"],text:"It idempotently overwrites the affected <code>(adId, minute)</code> aggregates with a higher batch version."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Ingest a firehose of ad-click events at very high throughput without dropping clicks",

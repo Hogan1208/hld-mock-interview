@@ -18,6 +18,80 @@ window.DATA['scheduler'] = {
   edges:[["client","api"],["api","jobdb"],["jobdb","worker"],["scheduler","jobdb"],["scheduler","queue"],["queue","worker"],["coordinator","scheduler"],["worker","deadletter"]],
   core:["client","api","jobdb","worker"],
   basic:["client","api","jobdb","worker"],
+  schema:{tables:[
+    {name:"jobs",pk:"job_id",columns:[
+      ["job_id","bigint","primary key"],
+      ["owner_id","bigint","user who submitted"],
+      ["type","varchar(16)","one_time or cron"],
+      ["cron_expr","varchar(64) NULL","cron spec (null for one_time)"],
+      ["next_run_at","timestamptz","next fire time (indexed)"],
+      ["status","varchar(16)","pending/queued/running/succeeded/failed"],
+      ["payload_json","jsonb","handler input"],
+      ["created_at","timestamptz","submit time"],
+    ],rows:[
+      ["1001","42","one_time","(null)","2026-07-22 14:00:00","pending","{export: true}","2026-07-22 09:10:00"],
+      ["1002","7","cron","0 0 * * *","2026-07-23 00:00:00","pending","{report: daily}","2026-07-20 08:00:00"],
+      ["1003","42","cron","*/5 * * * *","2026-07-22 12:05:00","queued","{sync: 1}","2026-07-21 16:30:00"],
+    ]},
+    {name:"job_runs",pk:"run_id",columns:[
+      ["run_id","uuid","primary key"],
+      ["job_id","bigint","which job (indexed)"],
+      ["attempt","int","retry attempt number"],
+      ["started_at","timestamptz","execution start"],
+      ["finished_at","timestamptz NULL","null while running"],
+      ["status","varchar(16)","running/succeeded/failed"],
+      ["worker_id","varchar(64)","worker that ran it"],
+      ["error","text NULL","last error (null on success)"],
+    ],rows:[
+      ["7a1b...","1003","1","2026-07-22 12:00:01","2026-07-22 12:00:03","succeeded","wkr-3f2a","(null)"],
+      ["9c4d...","1001","2","2026-07-22 14:00:02","(null)","running","wkr-b71c","(null)"],
+      ["2e8f...","1002","3","2026-07-22 00:00:00","2026-07-22 00:00:07","failed","wkr-a90d","timeout calling report svc"],
+    ]},
+    {name:"leases",pk:"job_id",columns:[
+      ["job_id","bigint","leased job (primary key)"],
+      ["run_id","uuid","current run holding the lease"],
+      ["worker_id","varchar(64)","lease owner"],
+      ["lease_expires_at","timestamptz","visibility timeout; renewed by heartbeat"],
+    ],rows:[
+      ["1001","9c4d...","wkr-b71c","2026-07-22 14:00:32"],
+      ["1003","7a1b...","wkr-3f2a","2026-07-22 12:00:31"],
+    ]},
+    {name:"scheduler_partitions",pk:"partition_id",columns:[
+      ["partition_id","int","hash slice of the job space (primary key)"],
+      ["owner_scheduler","varchar(64)","scheduler instance that owns this partition"],
+      ["epoch","bigint","fencing token, bumped on reassignment"],
+    ],rows:[
+      ["0","sched-1","17"],
+      ["1","sched-2","17"],
+      ["2","sched-1","18"],
+    ]},
+    {name:"dead_letter",pk:"job_id",columns:[
+      ["job_id","bigint","exhausted job (primary key)"],
+      ["run_id","uuid","final failing run"],
+      ["failed_at","timestamptz","when it was dead-lettered"],
+      ["attempts","int","total attempts before giving up"],
+      ["last_error","text","final error for triage"],
+    ],rows:[
+      ["1002","2e8f...","2026-07-22 00:04:30","5","timeout calling report svc"],
+      ["980","5b2c...","2026-07-21 03:11:09","5","handler threw NullPointer"],
+    ]},
+  ]},
+  flows:[
+    {id:"submit",name:"Submit a job",steps:[
+      {node:"client",text:"Client sends <code>POST /jobs</code> with a handler, payload, schedule (run-at or cron), and an <strong>idempotency key</strong>."},
+      {node:"api",text:"Job API authenticates, validates the schedule (parses the cron expression), and dedups on the idempotency key so a retry returns the same job id."},
+      {node:"jobdb",text:"Persists the job row durably with <code>status=pending</code> and <code>next_run_at</code> set to the first fire time, then acks only after a quorum-durable write."},
+      {node:"client",text:"Returns the <code>job_id</code>; the client polls status or receives a completion webhook later."},
+    ]},
+    {id:"execute",name:"Execute a due job",steps:[
+      {node:"scheduler",requires:["scheduler"],text:"Scans its owned partition for jobs where <code>next_run_at &le; now</code> and atomically flips each <code>pending &rarr; queued</code>."},
+      {node:"coordinator",requires:["coordinator"],text:"Assigns the scheduler that partition with a fencing epoch, guaranteeing exactly one owner scans each job."},
+      {node:"queue",requires:["queue"],text:"The due task is enqueued so dispatch is decoupled from execution and bursts buffer as queue depth."},
+      {node:"worker",text:"A worker leases the task (visibility timeout), transitions it to <code>running</code>, and executes the handler using the execution id for idempotency."},
+      {node:"jobdb",text:"On success writes <code>succeeded</code> and a run record; for a cron job it computes the next fire time and returns the row to <code>pending</code>."},
+      {node:"deadletter",requires:["deadletter"],text:"If retries are exhausted the job is routed to the dead-letter store with its last error for operator triage and replay."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Submit a one-time job to run at a specific time T, and submit recurring cron jobs (e.g. every 5 min, daily at midnight)",

@@ -65,6 +65,31 @@
   .node.new{animation:pop .5s cubic-bezier(.2,1.3,.5,1) both;transform-box:fill-box;transform-origin:center}
   .node.new rect{stroke:var(--accent2);stroke-width:2.5}
   .edge.new{animation:edgein .6s ease .2s both}
+  @keyframes flowpulse{0%,100%{stroke:var(--accent2);stroke-width:2}50%{stroke:#a99bff;stroke-width:3.5}}
+  .node.flowon rect{animation:flowpulse 1s ease-in-out infinite;fill:#221a3a}
+  .difftools{display:flex;gap:7px;align-items:center;flex-wrap:wrap;padding:0 10px 8px}
+  .difftools .lab{font-size:11px;color:var(--muted);margin-left:4px}
+  .difftools button{font-size:11.5px;padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+  .difftools button:hover:not(:disabled){border-color:var(--accent);background:#222c38}
+  .difftools button:disabled{opacity:.5;cursor:not-allowed}
+  .difftools button.flowbtn{border-color:rgba(124,92,255,.4);color:#c3b6ff}
+  .difftools button.on{border-color:var(--accent);background:#1c2836}
+  .schemaBox{padding:6px 12px 12px}
+  .schemaBox .tbl{margin-bottom:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .schemaBox .tname{background:#12161d;padding:7px 11px;font-size:12.5px;font-weight:600;color:#c3b6ff;display:flex;justify-content:space-between}
+  .schemaBox .tname .pk{color:var(--muted);font-weight:400;font-size:11px}
+  .schemaBox table{width:100%;border-collapse:collapse;font-size:11.5px}
+  .schemaBox th,.schemaBox td{text-align:left;padding:5px 9px;border-top:1px solid var(--line);vertical-align:top}
+  .schemaBox th{color:var(--muted);font-weight:500}
+  .schemaBox td.col{color:#e6edf3;font-family:ui-monospace,Menlo,monospace}
+  .schemaBox td.typ{color:#7ad;font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
+  .schemaBox td.note{color:var(--muted)}
+  .schemaBox .rows{margin-top:2px}
+  .schemaBox .rows caption{caption-side:top;text-align:left;font-size:10.5px;color:var(--muted);padding:6px 9px 2px}
+  .schemaBox .rows td{font-family:ui-monospace,Menlo,monospace;color:#cdd8e3;font-size:11px}
+  .bubble.flow .body{border-left-color:var(--accent2);background:#161327}
+  .bubble.flow .body ol{margin:4px 0;padding-left:20px}.bubble.flow .body li{margin:5px 0}
+  .bubble.flow .body .comp{color:#c3b6ff;font-weight:600}
 
   .panel{margin-top:18px}
   .panel .empty{color:var(--muted);font-size:14px;padding:20px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
@@ -182,7 +207,8 @@ const PHASE_META = [
 ];
 
 let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
-  reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null};
+  reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null,
+  flowNode:null, showSchema:false};
 
 const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
 
@@ -223,13 +249,17 @@ function startInterview(pk){
     <div id="stepper" class="stepper"></div>
     <div class="stage">
       <div>
-        <div class="card"><div class="hd"><h3>High-level design</h3><span class="hint" id="dhint"></span></div><div class="diagram" id="diagram"></div></div>
+        <div class="card"><div class="hd"><h3>High-level design</h3><span class="hint" id="dhint"></span></div>
+          <div class="difftools" id="difftools"></div>
+          <div class="diagram" id="diagram"></div>
+          <div class="schemaBox" id="schemaBox" style="display:none"></div>
+        </div>
         <div class="panel" id="panel"></div>
         <div class="tip" id="ptip"></div>
       </div>
       <div class="card"><div class="hd"><h3>Interview transcript</h3><span class="hint" id="tcount"></span></div><div class="transcript" id="transcript"></div></div>
     </div>`;
-  renderStepper(); renderDiagram(); renderPanel();
+  renderStepper(); renderDifftools(); renderDiagram(); renderPanel();
   addBubble('intv',p.prompt); addBubble('cand',p.opening);
 }
 function renderStepper(){
@@ -257,6 +287,65 @@ function setPhase(n){
   if(state.justRevealed.size) setTimeout(()=>{state.justRevealed=new Set();},700);
 }
 
+/* ---------------- toolbar: data model + walk-the-flow ---------------- */
+function renderDifftools(){
+  const p=DATA[state.prob], el=document.getElementById('difftools'); if(!el)return;
+  let html='';
+  if(p.schema&&p.schema.tables&&p.schema.tables.length)
+    html+=`<button id="schemaBtn" class="${state.showSchema?'on':''}"><i class="ti ti-table"></i> Data model</button>`;
+  if(p.flows&&p.flows.length){
+    html+=`<span class="lab">Walk a flow:</span>`;
+    p.flows.forEach(f=>{ html+=`<button class="flowbtn" data-flow="${f.id}" ${state.playing?'disabled':''}><i class="ti ti-player-play"></i> ${f.name}</button>`; });
+  }
+  if(!html) html=`<span class="lab">Click a component below to drill in.</span>`;
+  el.innerHTML=html;
+  const sb=document.getElementById('schemaBtn'); if(sb) sb.onclick=toggleSchema;
+  el.querySelectorAll('.flowbtn').forEach(b=>b.onclick=()=>{ if(!state.playing) walkFlow(b.dataset.flow); });
+}
+function toggleSchema(){ state.showSchema=!state.showSchema; const box=document.getElementById('schemaBox');
+  if(state.showSchema){ renderSchema(); box.style.display='block'; } else box.style.display='none';
+  renderDifftools();
+}
+function renderSchema(){
+  const p=DATA[state.prob], box=document.getElementById('schemaBox');
+  let html='';
+  (p.schema.tables||[]).forEach(t=>{
+    html+=`<div class="tbl"><div class="tname">${t.name}${t.pk?`<span class="pk">PK: ${t.pk}</span>`:''}</div>`;
+    html+=`<table><tr><th style="width:32%">column</th><th style="width:26%">type</th><th>notes</th></tr>`;
+    t.columns.forEach(c=>{ html+=`<tr><td class="col">${c[0]}</td><td class="typ">${c[1]}</td><td class="note">${c[2]||''}</td></tr>`; });
+    html+=`</table>`;
+    if(t.rows&&t.rows.length){
+      html+=`<table class="rows"><caption>example rows</caption><tr>`+t.columns.map(c=>`<th>${c[0]}</th>`).join('')+`</tr>`;
+      t.rows.forEach(r=>{ html+=`<tr>`+r.map(v=>`<td>${v}</td>`).join('')+`</tr>`; });
+      html+=`</table>`;
+    }
+    html+=`</div>`;
+  });
+  box.innerHTML=html;
+}
+function walkFlow(flowId){
+  const p=DATA[state.prob], flow=(p.flows||[]).find(f=>f.id===flowId); if(!flow)return;
+  const steps=(flow.steps||[]).filter(s=>!s.requires||s.requires.every(id=>state.revealed.has(id)));
+  state.playing=true; renderStepper(); renderDifftools(); renderPanel();
+  addBubble('intv', `Walk me through the <strong>${flow.name}</strong> as the design stands right now.`);
+  const cand=document.createElement('div'); cand.className='bubble cand flow';
+  cand.innerHTML=`<div class="who"><span class="av">C</span>Candidate</div><div class="body"><p>Sure — tracing it through the current architecture:</p><ol id="flowol"></ol></div>`;
+  const t=document.getElementById('transcript'); t.appendChild(cand); t.scrollTop=t.scrollHeight;
+  const ol=cand.querySelector('#flowol');
+  let i=0;
+  const step=()=>{
+    if(i>=steps.length){ state.flowNode=null; renderDiagram(); state.playing=false; renderStepper(); renderDifftools(); renderPanel(); return; }
+    const s=steps[i];
+    state.flowNode=s.node||null; renderDiagram();
+    const compName = s.node ? (p.nodes.find(n=>n.id===s.node)||{}).name : '';
+    const li=document.createElement('li');
+    li.innerHTML=(compName?`<span class="comp">${compName}:</span> `:'')+s.text.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+    ol.appendChild(li); t.scrollTop=t.scrollHeight;
+    i++; setTimeout(step, 780);
+  };
+  step();
+}
+
 /* ---------------- diagram ---------------- */
 function renderDiagram(){
   const p=DATA[state.prob], cellW=132, cellH=54;
@@ -270,7 +359,7 @@ function renderDiagram(){
   p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return;
     const hasQ=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l));
     const isNew=state.justRevealed.has(n.id);
-    const cls=[(state.activeNode===n.id?'active':''),(state.answeredCount[n.id]>=1?'done':''),(isNew?'new':'')].join(' ');
+    const cls=[(state.activeNode===n.id?'active':''),(state.answeredCount[n.id]>=1?'done':''),(isNew?'new':''),(state.flowNode===n.id?'flowon':'')].join(' ');
     const cnt=state.answeredCount[n.id]||0;
     const badge=cnt>0?`<text class="sub" x="${n.x+cellW-12}" y="${n.y+18}" text-anchor="end" style="fill:var(--cand)">${cnt}</text>`:'';
     nodes+=`<g class="node ${cls}" data-node="${n.id}" style="${(state.phase===4&&!hasQ)?'opacity:.5':''}"><rect x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="9" fill="var(--panel2)" stroke="var(--line)" stroke-width="1.5"></rect><text x="${n.x+12}" y="${n.y+23}">${n.name}</text><text class="sub" x="${n.x+12}" y="${n.y+40}">${n.sub}</text>${badge}</g>`; });

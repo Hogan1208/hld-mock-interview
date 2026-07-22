@@ -17,6 +17,70 @@ window.DATA['proximity'] = {
   edges:[["client","gw"],["gw","match"],["match","db"],["gw","location"],["location","index"],["match","index"],["match","notify"]],
   core:["client","gw","match","db"],
   basic:["client","gw","match","db"],
+  schema:{tables:[
+    {name:"drivers",pk:"driver_id",columns:[
+      ["driver_id","bigint","driver, primary key"],
+      ["status","varchar(12)","available / busy / offline"],
+      ["last_lat","double","last reported latitude"],
+      ["last_lng","double","last reported longitude"],
+      ["updated_at","timestamptz","last report time (durable row)"],
+    ],rows:[
+      ["8821","available","37.7749","-122.4194","2026-07-22 10:05:03"],
+      ["8822","busy","37.7811","-122.4102","2026-07-22 10:05:01"],
+      ["8823","offline","37.3382","-121.8863","2026-07-22 09:58:40"],
+    ]},
+    {name:"driver_locations",pk:"driver_id",columns:[
+      ["driver_id","bigint","driver, primary key"],
+      ["h3_cell","varchar(16)","current H3 cell (geohash-scored)"],
+      ["lat","double","current latitude"],
+      ["lng","double","current longitude"],
+      ["ts","timestamptz","position time — in-memory Redis GEO, TTL ~15s, latest-wins"],
+    ],rows:[
+      ["8821","8a2830828047fff","37.7749","-122.4194","2026-07-22 10:05:03"],
+      ["8822","8a283082807ffff","37.7811","-122.4102","2026-07-22 10:05:01"],
+      ["8830","8a2830828047fff","37.7752","-122.4188","2026-07-22 10:05:02"],
+    ]},
+    {name:"geo_index",pk:"cell_id",columns:[
+      ["cell_id","varchar(16)","H3 cell id, primary key"],
+      ["driver_ids","set of bigint","drivers currently bucketed in this cell (Redis set, rebuildable)"],
+      ["driver_count","int","cached size for density-based subdivision"],
+      ["updated_at","timestamptz","last bucket change"],
+    ],rows:[
+      ["8a2830828047fff","{8821, 8830, 8845}","3","2026-07-22 10:05:03"],
+      ["8a283082807ffff","{8822}","1","2026-07-22 10:05:01"],
+    ]},
+    {name:"rides",pk:"ride_id",columns:[
+      ["ride_id","uuid","dispatch record, primary key"],
+      ["rider_id","bigint","requesting rider"],
+      ["driver_id","bigint NULL","assigned driver (null until claimed)"],
+      ["state","varchar(12)","offered / accepted / declined / completed"],
+      ["created_at","timestamptz","request time (durable)"],
+    ],rows:[
+      ["7f3a…","55012","8821","accepted","2026-07-22 10:05:04"],
+      ["b12c…","55019","(null)","offered","2026-07-22 10:05:06"],
+    ]},
+  ]},
+  flows:[
+    {id:"update",name:"Driver sends a location update",steps:[
+      {node:"client",text:"Driver app fires a tiny lat/lng frame over its persistent stream (fire-and-forget)."},
+      {node:"location",requires:["location"],text:"Ingest terminates the stream, batches over ~50-100ms, and keeps only the latest sample per driver."},
+      {node:"db",text:"Overwrites the driver's row in <code>driver_locations</code> (latest-wins, no history)."},
+      {node:"index",requires:["index"],text:"Computes the driver's H3 cell and moves them between buckets <strong>only if the cell changed</strong>."},
+    ]},
+    {id:"nearby",name:"Rider finds nearby drivers",steps:[
+      {node:"client",text:"Rider sends <code>GET /nearby {lat, lng, radius}</code>."},
+      {node:"gw",text:"Gateway authenticates and routes the read to the match service."},
+      {node:"match",text:"Computes the rider's cell plus the surrounding neighbor ring."},
+      {node:"index",requires:["index"],text:"Returns the driver ids bucketed in those cells — a small candidate set, not the whole fleet."},
+      {node:"db",text:"Reads the candidates' current positions from <code>driver_locations</code> for exact filtering."},
+      {node:"match",text:"Runs haversine on the candidates, drops those outside the radius, and ranks by distance / ETA."},
+    ]},
+    {id:"dispatch",name:"Dispatch a ride to a nearby driver",steps:[
+      {node:"match",text:"Picks the best-ranked available driver from the nearby set."},
+      {node:"notify",requires:["notify"],text:"Pushes a ride offer to that driver's phone and waits for accept / decline within a timeout."},
+      {node:"db",text:"On accept, atomically claims the trip on the <code>rides</code> row (compare-and-set on driver_id)."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Find all drivers (or places) within a radius of a rider's location, ranked by distance / ETA",

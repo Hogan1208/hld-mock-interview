@@ -17,6 +17,74 @@ window.DATA['filesync'] = {
   edges:[["client","gw"],["gw","meta"],["meta","db"],["gw","chunk"],["chunk","block"],["gw","notif"]],
   core:["client","gw","meta","db"],
   basic:["client","gw","meta","db"],
+  schema:{tables:[
+    {name:"files",pk:"file_id",columns:[
+      ["file_id","bigint","primary key"],
+      ["namespace_id","bigint","owning namespace (indexed)"],
+      ["path","text","path within the namespace"],
+      ["current_version","int","pointer to the live version"],
+      ["is_dir","boolean","true for a directory node"],
+    ],rows:[
+      ["9001","42","/plan.xlsx","6","false"],
+      ["9002","42","/photos","1","true"],
+      ["9003","77","/onboarding.pdf","1","false"],
+    ]},
+    {name:"file_versions",pk:"(file_id, version)",columns:[
+      ["file_id","bigint","which file"],
+      ["version","int","monotonic version number"],
+      ["chunk_hashes","text[]","ordered list of chunk hashes"],
+      ["size","bigint","file size in bytes"],
+      ["mtime","timestamptz","modification time"],
+      ["device_id","bigint","device that committed it"],
+    ],rows:[
+      ["9001","5","[c1a2, c9f3, cb44]","1048576","2026-07-19 08:12:00","5501"],
+      ["9001","6","[c1a2, c9f3, ce77]","1050112","2026-07-22 09:30:00","5502"],
+      ["9003","1","[d0aa, d0bb]","15728640","2026-07-20 14:00:00","5503"],
+    ]},
+    {name:"chunks",pk:"chunk_hash",columns:[
+      ["chunk_hash","varchar(64)","content hash, primary key"],
+      ["storage_url","text","location in block storage"],
+      ["ref_count","bigint","number of versions referencing it"],
+      ["size","int","chunk size in bytes"],
+    ],rows:[
+      ["c1a2","s3://blk/c1/c1a2","2","524288"],
+      ["ce77","s3://blk/ce/ce77","1","525824"],
+      ["d0aa","s3://blk/d0/d0aa","100000","4194304"],
+    ]},
+    {name:"namespaces",pk:"namespace_id",columns:[
+      ["namespace_id","bigint","primary key"],
+      ["owner_id","bigint","account that owns it"],
+      ["type","varchar(8)","user or shared"],
+    ],rows:[
+      ["42","7","user"],
+      ["77","7","shared"],
+    ]},
+    {name:"device_cursors",pk:"(device_id, namespace_id)",columns:[
+      ["device_id","bigint","a user device"],
+      ["namespace_id","bigint","namespace it subscribes to"],
+      ["last_synced_version","int","cursor of last applied change"],
+    ],rows:[
+      ["5501","42","6"],
+      ["5502","42","5"],
+      ["5503","77","1"],
+    ]},
+  ]},
+  flows:[
+    {id:"upload",name:"Upload a changed file",steps:[
+      {node:"client",text:"The sync agent detects <code>plan.xlsx</code> changed and content-defined-chunks it locally into hashed chunks."},
+      {node:"chunk",requires:["chunk"],text:"The chunker computes each chunk hash and asks the server which hashes are new, deduping any it already stores."},
+      {node:"block",requires:["block"],text:"The client uploads only the missing chunks directly to block storage."},
+      {node:"meta",text:"The metadata service commits a new file version referencing the ordered chunk-hash list and advances the namespace cursor."},
+      {node:"db",text:"The metadata DB persists the new version row and updates the file current_version."},
+    ]},
+    {id:"sync",name:"Sync a change to another device",steps:[
+      {node:"meta",text:"The commit advanced the namespace cursor, and the metadata service records the change against that namespace."},
+      {node:"notif",requires:["notif"],text:"The notification service pushes a tiny you-are-behind poke to the user's other subscribed devices."},
+      {node:"client",text:"A notified device requests changes-since its last_synced_version cursor."},
+      {node:"meta",text:"The metadata service returns the delta of which files and versions changed."},
+      {node:"block",requires:["block"],text:"The device pulls only the changed chunks from block storage and applies the new version locally."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Store files in a synced folder and back them up durably",

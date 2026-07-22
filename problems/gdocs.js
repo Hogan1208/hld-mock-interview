@@ -17,6 +17,70 @@ window.DATA['gdocs'] = {
   edges:[["client","gw"],["gw","collab"],["collab","doc"],["collab","engine"],["gw","presence"],["doc","persist"]],
   core:["client","gw","collab","doc"],
   basic:["client","gw","collab","doc"],
+  schema:{tables:[
+    {name:"documents",pk:"doc_id",columns:[
+      ["doc_id","uuid","document id, primary key"],
+      ["owner_id","bigint","user who created the doc"],
+      ["title","text","document title"],
+      ["current_version","bigint","latest committed op seq"],
+      ["created_at","timestamptz","creation time"],
+    ],rows:[
+      ["d-1a2b","42","Q3 Planning Notes","10432","2026-07-20 09:00:00"],
+      ["d-9f7c","7","Untitled document","0","2026-07-22 11:05:00"],
+      ["d-3c4d","42","Launch Checklist","288","2026-07-21 14:30:00"],
+    ]},
+    {name:"operations",pk:"doc_id + seq",columns:[
+      ["doc_id","uuid","which document (part of key)"],
+      ["seq","bigint","position in the doc total order"],
+      ["author_id","bigint","user who authored the op"],
+      ["op_json","jsonb","the operation, e.g. insert/delete"],
+      ["created_at","timestamptz","when the op was appended"],
+    ],rows:[
+      ["d-1a2b","10431","42","{op:insert, pos:120, char:h}","2026-07-22 10:15:03"],
+      ["d-1a2b","10432","7","{op:delete, pos:88}","2026-07-22 10:15:03"],
+      ["d-3c4d","288","42","{op:insert, pos:12, char:X}","2026-07-21 14:30:11"],
+    ]},
+    {name:"snapshots",pk:"doc_id + version",columns:[
+      ["doc_id","uuid","which document (part of key)"],
+      ["version","bigint","op seq this snapshot folds up to"],
+      ["content_blob_url","text","object-storage URL of folded content"],
+      ["created_at","timestamptz","when the snapshot was written"],
+    ],rows:[
+      ["d-1a2b","10000","s3://docs/d-1a2b/v10000.blob","2026-07-22 10:00:00"],
+      ["d-3c4d","250","s3://docs/d-3c4d/v250.blob","2026-07-21 14:00:00"],
+    ]},
+    {name:"acl",pk:"doc_id + user_id",columns:[
+      ["doc_id","uuid","which document (part of key)"],
+      ["user_id","bigint","the collaborator"],
+      ["role","varchar(6)","viewer or editor"],
+    ],rows:[
+      ["d-1a2b","42","editor"],
+      ["d-1a2b","7","editor"],
+      ["d-1a2b","55","viewer"],
+    ]},
+  ]},
+  flows:[
+    {id:"edit",name:"Apply a concurrent edit (OT/CRDT)",steps:[
+      {node:"client",text:"Client applies the keystroke to its local replica instantly and ships <code>insert(char, pos, baseVersion)</code> over the persistent socket."},
+      {node:"gw",text:"WS gateway routes the op up to the collab session that owns this doc."},
+      {node:"collab",text:"Collab session assigns the op the next position in the doc total order."},
+      {node:"engine",requires:["engine"],text:"Engine transforms (OT) or merges (CRDT) the op against the concurrent ops ordered before it so every client converges."},
+      {node:"doc",text:"Appends the transformed op to the append-only op-log (source of truth)."},
+      {node:"persist",requires:["persist"],text:"A background job periodically folds the log into a snapshot flushed to durable object storage."},
+      {node:"collab",text:"Acks the sender only after durable append, then broadcasts the ordered op to the other editors."},
+      {node:"presence",requires:["presence"],text:"Cursor and selection moves ride a separate throttled path, broadcast live to collaborators without touching the op-log."},
+    ]},
+    {id:"open",name:"Open / load a document",steps:[
+      {node:"client",text:"Client opens the doc and requests its current state over a new WebSocket."},
+      {node:"gw",text:"Gateway authenticates the connection and routes it to the doc owner collab session."},
+      {node:"collab",text:"Session verifies the user role against the ACL, then serves the load."},
+      {node:"doc",text:"Reads the latest snapshot plus the small tail of ops after it."},
+      {node:"persist",requires:["persist"],text:"Fetches the snapshot blob from durable object storage for a cold-open doc."},
+      {node:"engine",requires:["engine"],text:"Folds the op tail onto the snapshot to reconstruct the current document version."},
+      {node:"presence",requires:["presence"],text:"Sends the client the live cursors and the set of collaborators currently editing."},
+      {node:"client",text:"Renders the materialized document and starts streaming subsequent ops."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Multiple users edit one document concurrently, with changes propagating live to every editor",

@@ -17,6 +17,69 @@ window.DATA['chat'] = {
   edges:[["client","gw"],["gw","chat"],["chat","store"],["chat","queue"],["queue","push"],["gw","presence"],["chat","push"]],
   core:["client","gw","chat","store"],
   basic:["client","gw","chat","store"],
+  schema:{tables:[
+    {name:"messages",pk:"conversation_id, seq",columns:[
+      ["conversation_id","uuid","partition key — which conversation"],
+      ["seq","bigint","per-conversation monotonic order (clustering key)"],
+      ["message_id","uuid","server id"],
+      ["client_msg_id","uuid","sender-generated idempotency/dedupe key"],
+      ["sender_id","bigint","who sent it"],
+      ["ciphertext","blob","E2EE payload — server never sees plaintext"],
+      ["created_at","timestamptz","accept time"],
+    ],rows:[
+      ["c-9f2a","4470","m-01","b3f1-aa","42","0x9e2c…","2026-07-22 10:04:59"],
+      ["c-9f2a","4471","m-02","b3f1-bb","42","0x71a4…","2026-07-22 10:05:01"],
+      ["c-1b30","881","m-03","c7d2-01","88","0x0fce…","2026-07-22 10:05:03"],
+    ]},
+    {name:"conversations",pk:"conversation_id",columns:[
+      ["conversation_id","uuid","primary key"],
+      ["type","varchar(8)","1:1 or group"],
+      ["member_ids","list<bigint>","participant user ids"],
+      ["last_seq","bigint","highest assigned seq (seq allocator)"],
+      ["created_at","timestamptz","creation time"],
+    ],rows:[
+      ["c-9f2a","1:1","[42, 77]","4471","2026-07-01 08:00:00"],
+      ["c-1b30","group","[88, 42, 91, 12]","881","2026-07-10 14:20:00"],
+    ]},
+    {name:"user_inbox",pk:"user_id, conversation_id",columns:[
+      ["user_id","bigint","recipient (partition key)"],
+      ["conversation_id","uuid","which conversation (clustering key)"],
+      ["last_delivered_seq","bigint","delivery cursor — highest seq acked by device"],
+      ["last_read_seq","bigint","read-receipt cursor"],
+      ["updated_at","timestamptz","last cursor advance"],
+    ],rows:[
+      ["77","c-9f2a","4471","4470","2026-07-22 10:05:02"],
+      ["12","c-1b30","880","880","2026-07-22 09:40:00"],
+      ["91","c-1b30","(null)","(null)","(null)"],
+    ]},
+    {name:"connection_registry",pk:"user_id",columns:[
+      ["user_id","bigint","primary key"],
+      ["gateway_node","varchar(32)","node currently holding the socket"],
+      ["conn_id","varchar(32)","socket/connection id on that node"],
+      ["connected_at","timestamptz","when the socket was established"],
+    ],rows:[
+      ["42","gw-07","ab12","2026-07-22 09:58:10"],
+      ["77","gw-31","cd34","2026-07-22 10:01:44"],
+      ["91","(null)","(null)","(null)"],
+    ]},
+  ]},
+  flows:[
+    {id:"send",name:"Send a 1:1 message",steps:[
+      {node:"client",text:"A assigns a <code>client_msg_id</code>, renders optimistically, and sends over its open WebSocket."},
+      {node:"gw",text:"A's gateway receives the frame on the persistent socket and forwards it to a chat service instance."},
+      {node:"chat",text:"Dedupes on <code>client_msg_id</code>, assigns a per-conversation monotonic <code>seq</code>."},
+      {node:"store",text:"Persists the message row durably <strong>before</strong> acking — the store is the source of truth."},
+      {node:"client",text:"Chat acks A with the assigned <code>seq</code>; A's pending tick becomes a sent tick."},
+    ]},
+    {id:"deliver",name:"Deliver to recipient (online + offline)",steps:[
+      {node:"chat",text:"Looks up B in the connection registry to find B's gateway node."},
+      {node:"gw",text:"If B is online, B's gateway pushes the message down B's socket and B's device acks (delivered)."},
+      {node:"store",text:"If B is offline, the message stays undelivered against B's cursor for later pull."},
+      {node:"queue",requires:["queue"],text:"For group fan-out, a single task is enqueued and workers deliver per-recipient asynchronously."},
+      {node:"push",requires:["push"],text:"For an offline B, a notification service sends an APNs/FCM alert to wake the app."},
+      {node:"client",text:"B reconnects and pulls all messages with <code>seq &gt; last_delivered_seq</code>, then advances its cursor."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Send and receive 1:1 and group messages in real time, with delivery and read receipts",

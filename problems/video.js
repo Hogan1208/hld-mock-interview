@@ -17,6 +17,68 @@ window.DATA['video'] = {
   edges:[["client","upload"],["upload","storage"],["storage","cdn"],["upload","transcode"],["transcode","storage"],["upload","meta"],["cdn","player"]],
   core:["client","upload","storage","cdn"],
   basic:["client","upload","storage","cdn"],
+  schema:{tables:[
+    {name:"videos",pk:"video_id",columns:[
+      ["video_id","varchar(16)","short id, primary key"],
+      ["uploader_id","bigint","owning channel/user"],
+      ["title","text","display title"],
+      ["status","varchar(16)","uploaded / transcoding / ready"],
+      ["duration","int","length in seconds"],
+      ["created_at","timestamptz","upload time"],
+    ],rows:[
+      ["v_9kQ2aZ","42","Summer road trip 4K","ready","742","2026-07-20 09:12:00"],
+      ["v_15ftgG","7","Keynote livestream cut","transcoding","5400","2026-07-22 10:00:00"],
+      ["v_bX3mps","91","Cat compilation","uploaded","128","2026-07-22 11:30:00"],
+    ]},
+    {name:"renditions",pk:"video_id + resolution",columns:[
+      ["video_id","varchar(16)","which video (indexed)"],
+      ["resolution","varchar(8)","240p / 720p / 1080p / 2160p"],
+      ["bitrate","int","target bitrate in kbps"],
+      ["codec","varchar(12)","h264 / hevc / av1"],
+      ["storage_url","text","object-storage key for segments"],
+      ["segment_manifest_url","text","per-rendition playlist"],
+    ],rows:[
+      ["v_9kQ2aZ","720p","3000","h264","s3://renditions/v_9kQ2aZ/720p/","s3://renditions/v_9kQ2aZ/720p/index.m3u8"],
+      ["v_9kQ2aZ","2160p","16000","hevc","s3://renditions/v_9kQ2aZ/2160p/","s3://renditions/v_9kQ2aZ/2160p/index.m3u8"],
+      ["v_15ftgG","480p","1200","h264","s3://renditions/v_15ftgG/480p/","s3://renditions/v_15ftgG/480p/index.m3u8"],
+    ]},
+    {name:"view_counts",pk:"video_id",columns:[
+      ["video_id","varchar(16)","which video, primary key"],
+      ["count","bigint","approximate total views (sharded rollup)"],
+      ["updated_at","timestamptz","last aggregation flush"],
+    ],rows:[
+      ["v_9kQ2aZ","4820117","2026-07-22 11:59:30"],
+      ["v_15ftgG","933","2026-07-22 11:58:12"],
+    ]},
+    {name:"upload_sessions",pk:"session_id",columns:[
+      ["session_id","uuid","multipart upload id"],
+      ["video_id","varchar(16)","target video"],
+      ["chunks_received","int","parts committed so far"],
+      ["total_chunks","int","expected part count"],
+      ["created_at","timestamptz","session start"],
+    ],rows:[
+      ["7f3a-b12c…","v_15ftgG","4500","5000","2026-07-22 09:59:50"],
+      ["c3d4-a1b2…","v_bX3mps","32","32","2026-07-22 11:30:00"],
+    ]},
+  ]},
+  flows:[
+    {id:"upload",name:"Upload + process a video",steps:[
+      {node:"client",text:"Creator calls <code>POST /uploads</code> to start a resumable session for a new master."},
+      {node:"upload",text:"Upload service issues an upload-id plus <strong>pre-signed URLs</strong> and tracks the session."},
+      {node:"storage",text:"Client PUTs the file as independent chunks <strong>directly to object storage</strong>, re-sending only missing parts."},
+      {node:"meta",requires:["meta"],text:"On <code>complete</code>, metadata records the video row with <code>status = uploaded</code>."},
+      {node:"transcode",requires:["transcode"],text:"An enqueued job fans the master out into the bitrate-ladder <strong>renditions</strong> in parallel."},
+      {node:"storage",text:"Each finished rendition and its segment manifest is written back to object storage."},
+      {node:"meta",requires:["meta"],text:"Metadata flips <code>status</code> to <code>ready</code> once the first playable rendition lands."},
+    ]},
+    {id:"playback",name:"Watch a video (adaptive stream)",steps:[
+      {node:"client",text:"Viewer hits play and requests the video page."},
+      {node:"meta",requires:["meta"],text:"Metadata returns the rendition map used to build the manifest."},
+      {node:"cdn",text:"CDN serves the <strong>manifest</strong> and short immutable <strong>segments</strong> as cacheable GETs."},
+      {node:"player",requires:["player"],text:"The ABR <strong>player</strong> picks a rendition per segment from its measured buffer and bandwidth."},
+      {node:"meta",requires:["meta"],text:"A view event is counted asynchronously into the approximate <code>view_counts</code> rollup."},
+    ]},
+  ],
   requirements:{
     functional:[
       "Upload a video, then transcode it into multiple codec and resolution renditions",
