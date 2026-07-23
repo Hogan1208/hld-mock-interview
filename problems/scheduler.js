@@ -18,6 +18,228 @@ window.DATA['scheduler'] = {
   edges:[["client","api","submit"],["api","jobdb","persist"],["jobdb","worker","claim"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"],["coordinator","scheduler","elect"],["worker","deadletter","on fail"]],
   core:["client","api","jobdb","worker"],
   basic:["client","api","jobdb","worker"],
+  deepDive:{
+    client:{
+      role:"The submitter/monitor — it <code>POST</code>s job definitions and reads status. Thin, but it owns the lever that protects the durability promise on a flaky network: the <strong>client-generated idempotency key</strong> reused across retries, so a timed-out submit never creates a duplicate job.",
+      capacity:[
+        ["Status reads","~200K/s","~1M watched jobs polled every ~5s"],
+        ["Read:write skew","~20x","status reads dwarf ~10K exec/s and a trickle of submits"],
+        ["Submit burst","~50K in a burst","e.g. backfilling a year of reports"],
+      ],
+      data:"Stateless view of server truth — it stores only the returned <code>job_id</code> (or a batch id) and never assumes a job ran; the authoritative state is the job store, surfaced via the API. The one durable client contract is the idempotency key it attaches to each submit.",
+      scaling:[
+        "Use a <strong>batch submit</strong> endpoint so 50K jobs arrive as a handful of bulk requests, not 50K round trips.",
+        "Respect <code>429</code> rate-limit responses — back off with jitter rather than hammering.",
+        "Prefer <strong>completion webhooks</strong> for programmatic consumers and relaxed, rate-capped polling for human dashboards to collapse the 20x read amplification.",
+      ],
+      failures:[
+        {t:"Submit times out with no response",b:"User doesn't know if the job was created and hits submit again — a duplicate cron could double-charge.",m:"Attach a client-generated idempotency key and reuse it on retry; the server returns the same <code>job_id</code>, enforced by a unique constraint so racing retries can't both insert."},
+        {t:"An automated client floods 50K submits",b:"A spike far above steady-state melts the API.",m:"Async batch submit returns a batch id immediately after a durable intake write; the client polls the batch id — request stays fast and bounded regardless of size."},
+      ],
+      tradeoffs:[
+        {a:"Poll for status",b:"Push via webhooks",pick:"Polling is simple but burns read capacity proportional to watcher count; webhooks cost a delivery mechanism but a job changes state only a few times — webhooks for programmatic, relaxed polling for dashboards."},
+      ],
+      probes:[
+        "A submit times out and the user retries — how do you avoid creating the same job twice?",
+        "Status traffic is ~20x the write path — what does that imply for how clients learn of completion?",
+        "A client submits 50K jobs in a burst — how does the client side avoid melting the API?",
+      ],
+    },
+    api:{
+      role:"The synchronous, user-facing write path. It authenticates, <strong>validates</strong> (crucially, parses the cron expression and computes the first <code>next_run_at</code>), dedups on the idempotency key, rate-limits, and durably records intent. Its non-negotiable lever: <strong>never ack until the job is committed to durable, replicated storage</strong>.",
+      capacity:[
+        ["Per-instance throughput","~5K req/s","stateless: auth + validate + one store op"],
+        ["Peak load","~102K req/s","~100K status reads + ~2K submits"],
+        ["Fleet","~27 instances (raw)","low-tens once reads move to replicas + cache"],
+      ],
+      data:"Stateless — scales horizontally behind a load balancer. All durable state lives in the job store; the API's contract is simply that once it acks <code>201</code>, the job survives a node loss.",
+      scaling:[
+        "Split read/write paths: status reads served from <strong>read replicas + short-TTL cache</strong>, the write-primary reserved for submits and scheduler transitions.",
+        "Stateless horizontal scale behind an LB; size the fleet for submits + cache-miss traffic, not dashboard polling.",
+        "Validate the cron and reject garbage at submit — a malformed spec must not be discovered by the scheduler at 3am.",
+      ],
+      failures:[
+        {t:"API acks <code>201</code> but the store write wasn't durable",b:"Jobs silently evaporate while users think they're scheduled — a durability violation.",m:"Wait for a <strong>quorum-acknowledged write</strong> (majority of replicas on durable media) before acking; a few ms of latency buys the whole durability promise."},
+        {t:"Store briefly unavailable, can't confirm the durable write",b:"Risk of acking a job that doesn't exist.",m:"Fail closed — return <code>503</code>, don't ack, let the client retry safely with its idempotency key; never trade durability for availability on the write path."},
+      ],
+      tradeoffs:[
+        {a:"Serve status from the primary",b:"Serve from replicas + cache",pick:"Status tolerates a second of staleness, so replicas + cache absorb the 100x read load and keep the primary for submits and the scheduler's due-scan/transitions — reads never starve writes."},
+        {a:"Sync validate + persist",b:"Async intake for huge batches",pick:"Small submits persist synchronously; very large batches write to a durable intake and return a batch id, keeping request latency bounded while preserving durability."},
+      ],
+      probes:[
+        "Beyond writing rows, what does the API own — especially for a cron submission?",
+        "Under load the API acked 5K submits but some writes never flushed before a crash — close the durability hole.",
+        "How many API instances at peak, and what cuts the number down?",
+      ],
+    },
+    jobdb:{
+      role:"The durable source of truth for every job's definition and state — the box that guarantees a submitted job is never lost. Its correctness-gating lever: the <strong>atomic single-row conditional claim</strong> (flip <code>pending &rarr; queued</code> only if still <code>pending</code>), which is what stops two schedulers double-firing.",
+      capacity:[
+        ["Write rate","~40-50K writes/s","10K exec/s &times; 3-4 transitions + a run insert; higher at midnight"],
+        ["Due-scan","every ~1s","range read on <code>next_run_at &le; now</code>, not a 100M-row scan"],
+        ["Storage","~few hundred GB hot","100M jobs &times; a few KB; run history tiered separately"],
+        ["Shards","~3-4 replica groups","shard by <code>job_id</code>, aligned to scheduler partitions"],
+      ],
+      data:"Strongly-consistent relational/NewSQL. Hot <code>jobs</code> table (current state + <code>next_run_at</code>, the part the scheduler scans) with a <strong>range index on <code>next_run_at</code></strong>; append-only <code>job_runs</code> for immutable history kept out of the hot index. Every shard is a replica group with <strong>quorum-acknowledged writes</strong>.",
+      scaling:[
+        "<strong>Index on <code>next_run_at</code></strong> (partial/time-bucketed over live jobs) turns the due-scan into a bounded range read; a Redis sorted set fronts the tight polling loop.",
+        "Shard by <code>job_id</code> aligned with the scheduler's partitions so scanning is embarrassingly parallel.",
+        "Tier cold run history to object storage; keep only live jobs in the hot cluster.",
+      ],
+      failures:[
+        {t:"A shard node's disk fails",b:"Millions of jobs (incl. a billing run) could silently stop firing forever.",m:"Every shard is a ≥3-replica group across AZs with synchronous quorum writes — a single loss loses nothing and a fresh replica rebuilds from survivors."},
+        {t:"Write-primary crashes mid-claim, old primary rejoins",b:"Split-brain: two primaries each claim job 42 — a double-fire.",m:"Consensus-based promotion grants a monotonic <strong>epoch</strong>; the stale primary's writes are fenced and it demotes + re-syncs. Pause-elect-fence-resume: late-but-correct over fast-but-double-fired."},
+        {t:"Naive <code>SELECT WHERE next_run_at &le; now</code> at 100M rows",b:"A full scan every tick pins the DB and starves transition writes.",m:"Range index on <code>next_run_at</code> (touch ~10K rows/tick) plus a Redis sorted set for the hot tier so the DB isn't scanned every second."},
+      ],
+      tradeoffs:[
+        {a:"Relational / NewSQL",b:"Cassandra / DynamoDB",pick:"Relational does the atomic conditional claim and the <code>next_run_at</code> range scan natively; Cassandra's LWT claim is ~4 round trips, and a DynamoDB <code>next_run_at</code> GSI creates a midnight hot partition. Correctness + due-scan beat raw write-scale."},
+        {a:"Consistency (pause writes) on partition",b:"Availability",pick:"Choose consistency — a few seconds of paused claiming means jobs fire slightly late (recovered by the overdue scan), whereas double-firing a billing job is unacceptable."},
+      ],
+      probes:[
+        "Model the schema and the state machine — why is run history a separate table?",
+        "100M jobs and a hot due-scan — how do you make finding due jobs cheap, and how do you shard?",
+        "The primary fails mid-scan and the old one rejoins thinking it's primary — what breaks and how do you prevent it?",
+      ],
+    },
+    worker:{
+      role:"The stateless executor. It leases a task under a <strong>visibility timeout</strong>, transitions the job to <code>running</code>, executes the handler with the <strong>execution id</strong>, then acks on success or reschedules on failure. Its defining lever: <strong>lease-then-ack (at-least-once) over delete-on-dequeue (at-most-once)</strong>, so a crash re-runs rather than loses a job.",
+      capacity:[
+        ["Concurrency (Little's law)","~20K in-flight","10K/s &times; ~2s avg duration"],
+        ["Workers","~400 floor, ~600 provisioned","~50 concurrent IO-bound tasks each, ~1.5x for peaks"],
+        ["Lease","~60s visibility timeout","heartbeat-extended while healthy"],
+      ],
+      data:"Stateless queue consumer — no durable state of its own; the job store and queue hold the truth. Per-run it holds a lease and passes the <strong>execution id</strong> (<code>jobId + scheduledFireTime</code>) to side-effecting downstreams for idempotency.",
+      scaling:[
+        "<strong>Autoscale on queue depth / consumer lag</strong> with the Little's-law number as a warm floor.",
+        "Separate pools by <strong>duration class</strong> so multi-minute jobs don't head-of-line-block 10ms tasks.",
+        "Partition queues by priority/tenant with per-tenant concurrency limits so one flood can't monopolize the pool.",
+      ],
+      failures:[
+        {t:"Worker OOM-killed 90s into a job, never acked",b:"Execution incomplete; risk of loss or a double-run on re-delivery.",m:"Visibility-timeout lease lapses and the queue re-delivers; idempotency on the execution id (plus per-step checkpoints) makes the re-run apply each effect at most once."},
+        {t:"A legit 5-min job outlives its 60s timeout",b:"Premature re-delivery — two workers run it concurrently.",m:"Heartbeat to extend the lease while healthy; a crashed worker stops renewing and the lease lapses promptly — long jobs hold their lease only as long as they're alive."},
+        {t:"A wedged worker heartbeats but makes no progress",b:"Holds a slot / lease forever.",m:"Independent hard <strong>execution timeout</strong>: exceed max runtime and the job is killed and failed for retry, regardless of heartbeats."},
+      ],
+      tradeoffs:[
+        {a:"Lease-then-ack (at-least-once)",b:"Delete-on-dequeue (at-most-once)",pick:"Lease-then-ack re-runs on crash (harmless with idempotency); delete-on-dequeue loses the execution — losing a scheduled job is the one thing this system must never do."},
+        {a:"Fixed worker pool",b:"Autoscale on depth",pick:"A fixed pool either idles or falls behind given wildly varying durations; autoscale tracks load (with a warm floor) at the cost of some lag on a sudden spike."},
+      ],
+      probes:[
+        "Walk me through lease, run, ack — and why not just delete the task on dequeue?",
+        "A worker dies 90s into a job — lost, and how do you avoid the first 90s' side effects happening twice?",
+        "Visibility timeout is 60s but the job takes 5 minutes — fix the premature re-delivery without a giant timeout.",
+      ],
+    },
+    scheduler:{
+      role:"The asynchronous engine that finds due jobs and hands them off. It scans its owned partition for <code>next_run_at &le; now</code>, atomically claims each, and enqueues it. Its highest-leverage move: keep due-discovery <strong>bounded and parallel</strong> — a range index / sorted set per partition, never a full scan.",
+      capacity:[
+        ["Poll tick","~1s","work per tick proportional to what's due, not the catalog"],
+        ["Steady due rate","~10K/s","one instance sustains ~10K claims/s"],
+        ["Midnight burst","~50K/s","1M jobs smeared by jitter over ~20s"],
+        ["Partitions","~6","50K/s &divide; ~10K/s + headroom to finish within the tick"],
+      ],
+      data:"Owns a disjoint <strong>partition</strong> of the job space (by hash of <code>job_id</code>), assigned by the coordinator with a fencing epoch. Hot tier is a per-partition <strong>Redis sorted set scored by fire time</strong>; the durable store holds authoritative state and is written only on transitions.",
+      scaling:[
+        "Partition by <code>job_id</code> so scanning is parallel and aligned with the store's shards; add a scheduler, coordinator rebalances.",
+        "Front the tight loop with a sorted set — <code>ZRANGEBYSCORE</code> pops due jobs in O(log n); future jobs aren't in the hot set.",
+        "Flatten temporal spikes with <strong>jitter</strong> on popular cron times and absorb the remainder in the queue.",
+      ],
+      failures:[
+        {t:"Scheduler crashes ~10 min before standby takes over",b:"Thousands of jobs became due during the gap.",m:"Due-ness lives in the durable store — the new owner's <strong>overdue scan</strong> enqueues any <code>next_run_at &lt; now</code> still <code>pending</code>; degrades timeliness, not durability."},
+        {t:"Clock skew across hosts",b:"A fast clock fires early, or two skewed hosts both think a job is due.",m:"The atomic conditional claim makes worst-case skew a small timing error, never a double-fire; NTP-discipline hosts and treat the store's committed state/clock as the arbiter."},
+        {t:"Single scanner can't keep up at 100M jobs",b:"A tick takes longer than 1s and jobs fire late.",m:"Partition ownership so all schedulers scan in parallel; size N so the worst-case (midnight) tick finishes within its interval."},
+      ],
+      tradeoffs:[
+        {a:"Partition by <code>job_id</code>",b:"Partition by fire time",pick:"Id-partitioning spreads scan work evenly and aligns with shards; time-partitioning concentrates the whole midnight tick into one partition — a self-inflicted hotspot. Flatten time separately with jitter."},
+        {a:"Single leader scanner",b:"Partitioned ownership",pick:"A single leader is a scaling ceiling at 100M jobs; partitioned ownership scales linearly, and disjoint partitions mean two schedulers never scan the same job."},
+      ],
+      probes:[
+        "With millions of jobs, how do you find the due ones without scanning everything every tick?",
+        "A scheduler is down 10 minutes and a cron should have fired 5 times — run it 5 times or once?",
+        "Clocks disagree by a few seconds across the fleet — how do you keep timing correct without double-fires?",
+      ],
+    },
+    queue:{
+      role:"The task buffer that <strong>decouples dispatch from execution</strong> and gives durability across the handoff. The scheduler enqueues and moves on; workers consume at their own rate. Its lever: <strong>at-least-once delivery with a visibility timeout</strong>, making it the shock absorber for bursts and the backpressure boundary.",
+      capacity:[
+        ["Steady throughput","~10K msgs/s in and out","dispatch path"],
+        ["Midnight burst","~50K/s","jittered from the 1M herd"],
+        ["Partitions","~12-16","peak drain &divide; ~5K/s per partition + headroom"],
+        ["Delivery","at-least-once","visibility timeout + per-message ack"],
+      ],
+      data:"Durable, replicated messages — a task is persisted and quorum-acked before the enqueue is done, so a broker loss keeps the backlog. A dequeued message is leased (invisible) until the worker acks; no ack means re-delivery. The durable job store remains the ultimate source of truth for due-ness.",
+      scaling:[
+        "Autoscale workers on queue depth to drain a burst; a deep queue is the system working as designed.",
+        "Partition the queue for throughput and into <strong>priority classes</strong> so a low-priority flood can't starve time-critical jobs.",
+        "Apply <strong>backpressure upstream</strong> past a depth threshold — the scheduler defers low-priority enqueues (jobs stay <code>pending</code> in the store).",
+      ],
+      failures:[
+        {t:"A broker holding 200K enqueued tasks fails",b:"In-memory-only messages would silently vanish — 200K lost executions.",m:"Persist + replicate each message with quorum ack; and because the durable job store is the real source of truth, vanished tasks resurface in the overdue scan — late, not lost."},
+        {t:"Arrival outpaces drain, depth grows unbounded",b:"Memory/storage exhaustion.",m:"Backpressure — the scheduler slows low-priority enqueues into the durable store; priority partitions keep urgent jobs flowing; the working set stays bounded."},
+      ],
+      tradeoffs:[
+        {a:"Message queue (SQS/RabbitMQ-style)",b:"Kafka-style log",pick:"Task dispatch needs independent per-task lease/ack/redelivery and easy dead-lettering — message-queue semantics fit; a log's per-partition offset model makes per-message redelivery awkward. Use a log for the ordered monitoring stream."},
+      ],
+      probes:[
+        "Why a queue between scheduler and workers, and what delivery semantics do you configure?",
+        "A midnight herd enqueues 1M tasks but workers drain 10K/s — keep the queue healthy without losing tasks.",
+        "A broker with 200K in-flight tasks fails — how do you make the queue itself durable?",
+      ],
+    },
+    coordinator:{
+      role:"The arbiter of <strong>who is allowed to act</strong>. Using ZooKeeper/etcd it manages membership (which schedulers are alive) and partition assignment (who owns which slice), giving no-SPOF failover and disjoint ownership. Its safety lever: issuing a monotonic <strong>fencing epoch</strong> per assignment so a stale owner's writes are rejected.",
+      capacity:[
+        ["Hot-path load","~none","off the per-job path; membership + assignment only"],
+        ["Op rate","hundreds/s at most","e.g. 40 schedulers renewing a lease every ~5s"],
+        ["Ensemble","3 nodes (default)","tolerates 1 failure; 5 for double-fault tolerance"],
+      ],
+      data:"Small, linearizable metadata — the assignment map and membership (ephemeral nodes / leases). It exposes a monotonic revision (etcd <code>mod_revision</code> / ZK <code>zxid</code>) used directly as the fencing epoch. It is <em>not</em> on the per-job path.",
+      scaling:[
+        "<strong>Consistent hashing</strong> for partition-to-scheduler assignment so churn moves only a small fraction of partitions.",
+        "Keep it off the hot path — consulted on membership changes, not per job.",
+        "Delegate consensus to a proven system rather than hand-rolling agreement in app code.",
+      ],
+      failures:[
+        {t:"Network partition isolates a scheduler; coordinator reassigns its partitions",b:"Split-brain — the isolated old owner still thinks it owns them and both scan/enqueue.",m:"Fencing tokens: the new owner gets a higher epoch and the store/queue reject the stale token's writes; the atomic per-job claim + idempotent execution are the second and third layers."},
+        {t:"Rapid scheduler churn (4&rarr;40, crashes, adds)",b:"Constant reassignment could overload the coordinator or leave a partition uncovered.",m:"Consistent hashing makes rebalances incremental and the assignment map tiny; a briefly-unowned partition is tolerated (overdue scan recovers), a briefly-double-owned one is fenced."},
+      ],
+      tradeoffs:[
+        {a:"Delegate to ZooKeeper/etcd",b:"Peer-to-peer consensus in app code",pick:"Reinventing distributed agreement is a classic split-brain source; a battle-tested consensus system gives linearizable membership + assignment with fencing built in, keeping schedulers simple."},
+        {a:"3-node ensemble",b:"5-node ensemble",pick:"3 tolerates 1 failure with a fast 2-node quorum — the default since the coordinator is rarely written and off the hot path; move to 5 only if losing it is judged catastrophic."},
+      ],
+      probes:[
+        "What does the coordinator manage, and why not have schedulers coordinate peer-to-peer?",
+        "A partition isolates a scheduler and its partitions get reassigned — prevent the double-execution.",
+        "Where does the fencing token come from, ZooKeeper vs etcd?",
+      ],
+    },
+    deadletter:{
+      role:"The safety net and operational surface for jobs that <strong>exhaust their retry budget</strong>. It captures the poison job, payload, execution id, attempts, and last error for triage and replay, keeping permanently-failing work out of the hot retry path. Its lever: turning failures into a <strong>monitorable, replayable</strong> queue rather than silent loss or infinite retries.",
+      capacity:[
+        ["Steady inflow","~10/s","~0.1% of 10K exec/s finally fail → ~860K/day"],
+        ["Volume","~a few GB/day","def + payload + last error, a few KB each"],
+        ["Retention","~30 days","covers realistic triage-and-fix-and-replay cycles"],
+      ],
+      data:"A durable, queryable <code>dead_letter</code> table (indexed by <code>failed_at</code> / <code>last_error</code>) with a <strong>replay-state</strong> column so replay is resumable. Replicated + quorum-acked so an entry never disappears whether or not it's been replayed.",
+      scaling:[
+        "Append-friendly and partitioned by <code>failed_at</code> so bad-deploy bursts spread and old entries age out.",
+        "<strong>Alert on depth</strong> — a sharp spike signals a systemic downstream failure, not 50K independent bad jobs.",
+        "Replay as a <strong>rate-limited re-enqueue</strong> through the normal dispatch path so a fixed downstream isn't re-overwhelmed.",
+      ],
+      failures:[
+        {t:"A bad deploy dead-letters 50K jobs in an hour",b:"A flood must be absorbed and later replayed.",m:"Durable append-store absorbs it; the depth spike pages someone; replay is a throttled re-enqueue (filter by error/time, dry-run first), each job keeping its execution id."},
+        {t:"Replay worker crashes halfway through 10K entries",b:"Unsure which were re-enqueued — risk of loss or double-replay.",m:"Atomic per-entry replay-state (pending&rarr;replayed) makes it resumable — un-replayed entries stay durable, and a duplicate re-enqueue is neutralized by execution-id idempotency downstream."},
+      ],
+      tradeoffs:[
+        {a:"Database table",b:"Broker DLQ / Kafka topic",pick:"A table is queryable by error/owner/time and supports resumable, selective, rate-limited replay — the dead-letter is an operational surface; a log wins on throughput but is clumsy to triage. Optionally fed by a broker DLQ as transport."},
+        {a:"Fail-fast to dead-letter on 4xx",b:"Retry everything",pick:"Retry transient 5xx/timeouts (usually succeed in budget); fail-fast poison 4xx/validation so depth is a meaningful signal, not transient noise."},
+      ],
+      probes:[
+        "What lands in the dead-letter, and how do you distinguish a poison job from a transient failure?",
+        "A bad deploy dead-letters 50K jobs — absorb the flood and replay safely after the fix.",
+        "A replay worker crashes halfway — make replay neither lose nor double-run entries.",
+      ],
+    },
+  },
   dbDoc:{
     component:"Job store",
     load:"Writes dominate and are multi-step: each execution walks <code>pending &rarr; queued &rarr; running &rarr; succeeded/failed</code> (3-4 state transitions) plus one append to <code>job_runs</code>, so ~10K executions/s steady &rarr; ~40-50K writes/s, spiking far higher at midnight. On top of that the scheduler does a <strong>due-scan read every second</strong> (find rows where <code>next_run_at &le; now</code>). ~100M jobs at a few KB each &approx; only a few hundred GB &mdash; the pressure is transactional write throughput and cheap due-discovery, not raw bytes. Every claim must be an <strong>atomic single-row compare-and-set</strong> (flip only if still <code>pending</code>) or two schedulers double-fire.",

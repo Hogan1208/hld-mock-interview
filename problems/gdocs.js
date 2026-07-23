@@ -17,6 +17,218 @@ window.DATA['gdocs'] = {
   edges:[["client","gw","WS"],["gw","collab","edits"],["collab","doc","apply"],["collab","engine","transform"],["gw","presence","cursors"],["doc","persist","snapshot"]],
   core:["client","gw","collab","doc"],
   basic:["client","gw","collab","doc"],
+  deepDive:{
+    client:{
+      role:"The in-browser editor that holds a <strong>local replica</strong> and applies keystrokes instantly, then ships them as small ops. The consequential lever it owns: <strong>local-first (optimistic) apply</strong> — typing must feel instant with zero round-trip, which is the whole reason a conflict engine exists downstream.",
+      capacity:[
+        ["Own typing","~2-5 ops/s","tiny insert/delete + baseVersion"],
+        ["Inbound edit stream","~1-2.5K ops/s worst case","a 500-editor doc, &lt; ~100 KB/s — nothing for a socket"],
+        ["Local replica","a few hundred KB","the current doc, not full op history"],
+        ["Cursor churn","~5-10/s per user, coalesced","taken as one batched snapshot per ~100-200ms tick"],
+      ],
+      data:"Holds the current document replica, a queue of <strong>unacknowledged local ops</strong> (each tagged with the base version it was made against), and the last server version seen. Offline, all of that is durable-enough locally to replay on reconnect. It does <em>not</em> hold full op history — it fetches snapshot + tail on open and keeps a recent window.",
+      scaling:[
+        "Apply locally first, reconcile later through the engine — never gate a keystroke on a round-trip.",
+        "Apply ops <strong>incrementally to the changed range</strong> and <strong>virtualize</strong> rendering to the viewport so a 500-page doc stays on ~1 core.",
+        "Fetch <strong>snapshot + tail</strong> on open (O(recent), not O(full history)).",
+        "Throttle/coalesce cursor emission and take presence as a batched per-tick snapshot to stay off the edit budget.",
+      ],
+      failures:[
+        {t:"User edits offline for 60 min (~4,000 ops) while 10,000 remote ops land",b:"Divergent local state on reconnect.",m:"Queued unacked ops replay through the engine, each transformed against concurrent remote ops; fall back to rebasing onto a recent snapshot if divergence is huge; unmergeable regions preserved as suggestions, never dropped."},
+        {t:"Opening a 500-page, 2M-op doc",b:"Full replay freezes the tab for 30s+.",m:"Fetch the latest snapshot + only the op tail; virtualize rendering to the visible viewport."},
+        {t:"Ctrl-Z while a colleague is editing elsewhere",b:"Naive global undo wipes their change too.",m:"Per-user undo stack; undo generates the inverse of <em>my</em> op transformed against everything after it."},
+      ],
+      tradeoffs:[
+        {a:"Wait for server confirm per keystroke",b:"Local-first optimistic apply",pick:"Waiting shows every character ~100-200ms late — unusable; local-first is non-negotiable, at the cost of a replica momentarily ahead of the server that the engine reconciles."},
+        {a:"Hold full op history client-side",b:"Snapshot + recent window",pick:"Full history bloats the tab and slows open; keep only snapshot + tail and fetch more on demand."},
+      ],
+      probes:[
+        "When I press a key, what does the client do before/during/after the server hears about it — and why apply locally first?",
+        "A user edits offline for an hour, then reconnects into 10,000 remote ops. What happens, and isn't transforming 4,000 ops fragile?",
+        "Implement Ctrl-Z correctly when others are editing — give a case where the naive answer is wrong.",
+      ],
+    },
+    gw:{
+      role:"The <strong>WebSocket gateway</strong>: it owns the persistent socket lifecycle and maps <code>connection → user → doc session</code>, but is deliberately thin on logic. Its defining lever: separating <strong>connection-holding</strong> (huge, mostly idle) from the CPU-real work in collab, so a million cheap sockets scale independently of doc sessions.",
+      capacity:[
+        ["Concurrent sockets","~2M at Monday-9am peak","persistent, bidirectional, push-heavy"],
+        ["Per-node connections","~50K before FD/memory bite","idle-socket RAM + descriptors set the ceiling"],
+        ["Fleet","~40 nodes → ~60 with headroom / 3 AZs","losing an AZ drops ~1/3, not the tier"],
+        ["Broadcast per hot doc","~1-2.5K small ops/s fanned out","via pub/sub, not the gateway holding 500 sockets"],
+      ],
+      data:"Stateless-ish routing — no durable state; the collab service is the durable session owner. It tracks socket &harr; session mappings and handles TLS, auth-on-connect, heartbeats, and backpressure.",
+      scaling:[
+        "Scale horizontally on <strong>connection count</strong> behind an L4 connection-aware LB; autoscale on connections with a warm floor.",
+        "Fan out via a <strong>pub/sub layer keyed by doc</strong> — publish once, each gateway pushes to its local subset of that doc's sockets.",
+        "Shard pub/sub by doc id and co-locate the collab session with its partition to cut hops.",
+        "Branch presence to the presence service rather than through the op log/engine.",
+      ],
+      failures:[
+        {t:"A gateway node crashes with 50K live sockets",b:"50K connections drop mid-edit.",m:"Clients detect the dead heartbeat and auto-reconnect through the LB; no edits lost because the client re-sends its unacked tail and the collab service dedupes by (clientId, seq)."},
+        {t:"A re-sent op after reconnect",b:"Risk of double-inserting a character.",m:"Every op carries (clientId, client-seq); the collab service ignores an already-applied seq idempotently and re-acks."},
+        {t:"2M sockets at Monday-9am ramp",b:"A single node caps at ~50K.",m:"40+ nodes behind an L4 LB; autoscale on connection count with a warm floor so the ramp doesn't outrun provisioning."},
+      ],
+      tradeoffs:[
+        {a:"Terminate the socket on the collab process",b:"Separate gateway + collab tiers",pick:"They scale on different axes — connections (huge, idle) vs active sessions/op throughput; splitting lets a client's socket survive a collab restart (just re-route) and holds cheap sockets separately from CPU work."},
+        {a:"Size on op throughput",b:"Size on connection count",pick:"CPU-wise the gateway is thin (~1-2.5K ops/s even on a hot doc), but it can't <em>hold</em> more than ~50K live sockets in memory — connections are the real constraint."},
+      ],
+      probes:[
+        "Why WebSockets and not HTTPS request/response, and what exactly lives in this box?",
+        "2M live sockets at peak — how does this tier hold, and what's the broadcast cost on a busy 500-editor doc?",
+        "A gateway node dies with 50K sockets — what do users experience, and how do you avoid double-applying a re-sent op?",
+      ],
+    },
+    collab:{
+      role:"The <strong>single authoritative session</strong> that owns a doc: it orders each op into the doc's total order, hands it to the engine, appends it durably, acks, then broadcasts. Its defining lever: <strong>one sequencer per doc</strong> imposes a single global order so every client provably converges — and it must be exactly one (fencing) to avoid split-brain.",
+      capacity:[
+        ["Sessions per node","~10K live sessions","per-doc work is tiny: transform + append + publish"],
+        ["Concurrent sessions","~2M at peak → ~200 nodes","sized on concurrency, not the 50M-doc corpus"],
+        ["Hot-doc op rate","~1-2.5K tiny ops/s","fits one core; fan-out offloaded to gateways/pub-sub"],
+        ["Ack budget","&lt; 200ms for others to see an edit","local apply means the author feels nothing"],
+      ],
+      data:"Owns the live, in-memory session state for actively-edited docs — the materialized doc + a recent op window + per-client accepted-seq high-water marks — all a <strong>derived cache</strong> rehydratable from snapshot + op-log tail. Ownership is granted via a <strong>lease/consensus with a fencing epoch</strong> (consistent hashing on doc id).",
+      scaling:[
+        "<strong>Shard docs across the fleet</strong> by consistent hashing on doc id; ordering stays per-doc so hot docs never contend.",
+        "Size by <strong>concurrent sessions</strong> — an idle doc owns no process; provision with ~30% headroom.",
+        "<strong>Batch/pipeline appends</strong> so one quorum round-trip commits dozens of concurrent ops.",
+        "Split a pathologically hot doc into per-section owners only when measurement demands it.",
+      ],
+      failures:[
+        {t:"The owner of a 500-editor doc is OOM-killed after broadcasting ~3,000 ops",b:"Could those edits be lost?",m:"Ack + broadcast only <em>after</em> durable append, so nothing committed is lost; mid-flight (unacked) ops are re-sent by clients; a new owner is elected, rehydrates from snapshot + tail, resumes — ~1-3s stall."},
+        {t:"A network partition splits 500 editors 300/200 for 90s",b:"Risk of two divergent op logs (split-brain).",m:"Lease + fencing epoch — only the majority side keeps a valid lease and stays writable; the minority goes read-only/buffered and replays on heal (the offline path). Consistency over write-availability for the minority."},
+        {t:"An old owner returns thinking it still owns the doc",b:"Two writers.",m:"New owner writes under a higher epoch; the stale owner's writes are rejected and it steps down."},
+      ],
+      tradeoffs:[
+        {a:"Central per-doc sequencer",b:"Peer-to-peer / no server",pick:"A central order means each op transforms only against a known, finite prefix — far simpler correct OT (Google Docs' choice); P2P forces CRDTs with extra metadata to converge without coordination."},
+        {a:"Broadcast then persist",b:"Persist (quorum) then ack/broadcast",pick:"Broadcast-first can show users edits that vanish on recovery; durable-first costs a few ms (batched away) and is the only correct ordering for a document."},
+      ],
+      probes:[
+        "Walk me through what collab does per op, and why a single central owner makes convergence easier.",
+        "One process per doc with 50M docs — how do you place and scale owners without a global bottleneck?",
+        "A partition splits your editors in two for 90s — what's the right behavior, and what must you never do?",
+      ],
+    },
+    doc:{
+      role:"The source-of-truth <strong>append-only op log</strong> per document (the doc at any version is the fold of its ops), plus periodic snapshots. Its defining lever: keying the log <code>(doc_id, seq)</code> so replaying a doc is a single-partition ordered range-scan — the cheap primitive the whole design leans on.",
+      capacity:[
+        ["Append rate","~120K ops/s avg, ~400-600K/s peak","each op ~50 bytes, sequential"],
+        ["Raw log growth","~500 GB/day","~10B ops/day &times; ~50 bytes"],
+        ["Fleet","~50 nodes","500K ÷ ~30K writes/node &times;3 replication; auto-shards by doc id"],
+        ["Read shape","point read + short ordered range","snapshot pointer + op tail after seq S — no scans"],
+      ],
+      data:"Op log keyed <code>(doc_id, seq)</code> — doc_id partition key, seq clustering key — so a doc's ops sit contiguous and sorted on one partition. Snapshots in a separate small table <code>(doc_id, version)</code> holding a <strong>pointer</strong> to the folded blob in object storage + the fold-seq. Metadata + ACLs in a small relational/KV table where transactions matter.",
+      scaling:[
+        "Wide-column LSM store — appends fit the write shape, auto-shards by doc id with no global hotspot.",
+        "<strong>Snapshots</strong> (every ~1,000 ops or 60s) bound open + recovery to O(recent), not full history.",
+        "<strong>Compaction</strong>: once a snapshot at seq S is durable, archive + truncate log segments before S so the hot tier stays small.",
+        "Push fat cold snapshot blobs to object storage; keep only tiny ordered rows hot.",
+      ],
+      failures:[
+        {t:"A store node holding a 2M-op doc restarts",b:"Full replay = tens of seconds unavailable.",m:"Recover from latest snapshot + op tail (sub-second); the log is replicated with quorum, so a dead disk loses nothing."},
+        {t:"A replication gap drops the last 40 acked ops",b:"The doc reverts 40 ops — users watch text disappear.",m:"Ack only after a write quorum — acked implies on a majority implies recoverable; recovery reconciles to the highest committed seq, never below what was acked."},
+        {t:"A live 50M-op doc; replay takes minutes; storage balloons",b:"Growth + replay cost.",m:"Snapshots bound replay; compaction archives old segments to cold storage (archives, not deletes) so history stays available and the hot log tracks active docs."},
+      ],
+      tradeoffs:[
+        {a:"Wide-column op log",b:"Postgres / Kafka-as-store",pick:"Wide-column matches append + single-partition range-scan at ~500K/s on ~50 nodes and auto-shards; Postgres' ~10-20K/node ceiling forces 30+ hand-managed shards + vacuum pain; Kafka is transport not random-access (partitions multiplex docs), so it earns the pub/sub role instead."},
+        {a:"Snapshot blob as a wide-column cell",b:"Blob in object storage + pointer",pick:"Big blobs bloat SSTables and drag the range-scans the log depends on; object storage is purpose-built for write-once immutable blobs (11-nines, lifecycle tiering) — keep only a pointer + fold-seq in the log."},
+      ],
+      probes:[
+        "Give me the data model — source of truth, SQL or NoSQL — and why keep the whole op log instead of overwriting current state?",
+        "Pick the datastore for the op log against Postgres and Kafka, pinning the load first; where do snapshots live?",
+        "A node loses the last 40 acked ops before a snapshot — users watch text disappear. Prevent it by construction.",
+      ],
+    },
+    engine:{
+      role:"The correctness heart: it <strong>transforms (OT)</strong> or <strong>merges (CRDT)</strong> each op against the concurrent ops ordered before it so every client converges to the identical document. Its defining lever: leaning on the central total order to keep OT transforms bounded and cheap.",
+      capacity:[
+        ["Per-op work","O(ops-behind), kept tiny","healthy clients are a few ops behind → O(handful)"],
+        ["Hot-doc load","a few thousand cheap transforms/s","~1-2.5K ops/s, well within one core"],
+        ["Live memory","current doc (~hundreds of KB) + recent op window","not full history"],
+        ["Laggard case","client 2,000 ops behind","batch catch-up / fresh snapshot, not 2,000 live transforms"],
+      ],
+      data:"Holds derived, non-authoritative state co-located with the doc's collab owner — the materialized doc + pending-transform context + per-client accepted-seq marks. Fully reconstructible from snapshot + op-log tail, so it never needs to persist its own state to be correct after a crash.",
+      scaling:[
+        "Keep clients caught-up (continuous ordered push) so each transform is O(small).",
+        "Catch a laggard up in a <strong>batch</strong> (compose missed ops) or hand it a fresh snapshot + short tail — never dribble 2,000 transforms through the hot path.",
+        "Co-locate with the owner and hold state only for <strong>actively edited</strong> docs; memory scales with concurrent sessions.",
+        "Rebase onto the current snapshot when a client's base predates compaction.",
+      ],
+      failures:[
+        {t:"Two users insert at the same position on the same version",b:"Divergence — the classic corruption.",m:"OT transforms B's op against A's already-applied op (shift insert 3 → 4); CRDT gives each char a unique dense id — either way convergence is guaranteed."},
+        {t:"The owner (holding engine state) restarts with 500 clients holding unacked ops",b:"Rebuild correct state without double-applying.",m:"Deterministic rebuild from snapshot + tail; clients re-send unacked ops; (clientId, seq) makes already-committed ops idempotent skips."},
+        {t:"A client's base version was compacted away",b:"Can't transform against long-gone ops.",m:"Rebase the client onto the current snapshot + tail, then re-apply its unacked ops on top — the same large-divergence path."},
+      ],
+      tradeoffs:[
+        {a:"OT (transform)",b:"CRDT (merge)",pick:"With a central server (already present for storage/auth) OT keeps ops tiny (just a position) and is Google-Docs-proven; CRDTs are conflict-free without coordination but pay in per-element ids + tombstones — reach for them for decentralized/long-offline P2P."},
+        {a:"Transform a laggard op-by-op",b:"Batch catch-up / snapshot",pick:"O(ops-behind) per op melts the hot path for a 2,000-behind client; compose-and-catch-up or hand a fresh snapshot keeps steady state O(small)."},
+      ],
+      probes:[
+        "Give me the mechanics of an OT transform and the TP1 property — why does the central order make it tractable?",
+        "Explain CRDTs concretely — where they shine, and why not just use them everywhere?",
+        "A reconnecting client is 2,000 ops behind while 500 clients fire ops — does the engine become the bottleneck?",
+      ],
+    },
+    presence:{
+      role:"The <strong>ephemeral live-state</strong> tier — cursors, selections, name/color, typing status. Its defining lever: playing by looser rules than the op log (no order, no durability, droppable) so cursor churn never touches or slows the correctness path for edits.",
+      capacity:[
+        ["Per-user emission","~5-10/s (throttled)","only on meaningful movement"],
+        ["Naive fan-out","~2.5M msg/s on one 500-editor doc","500 &times; ~10 &times; 499 — dwarfs edits"],
+        ["Coalesced fan-out","a few thousand batched msg/s","one snapshot per ~100-200ms tick"],
+        ["Storage","a few hundred bytes per (doc,user), in-memory","2M editors &lt; 1 GB across the tier"],
+      ],
+      data:"A <strong>LWW value keyed (docId, userId)</strong> — last write wins, no merge — held only as the current value in memory with a short TTL. No durable state by design; the source of truth for 'where is my cursor' is the client, which re-announces on reconnect.",
+      scaling:[
+        "<strong>Throttle</strong> client emission + <strong>coalesce</strong> to the latest per user, flushed one batched snapshot per tick.",
+        "Past a threshold, <strong>degrade to aggregate presence</strong> ('+N others editing') and viewport-scope updates — cosmetic, so shedding detail is free.",
+        "Run stateless + horizontally scaled; shard freely and drop under load with zero consistency risk.",
+        "TTL + heartbeat so a dead client's cursor auto-expires.",
+      ],
+      failures:[
+        {t:"500 editors each move cursors ~10/s",b:"~2.5M msg/s N-squared fan-out.",m:"Throttle + coalesce to per-tick batched snapshots; degrade to aggregate presence + viewport scoping past a threshold."},
+        {t:"The presence tier is down for 2 minutes",b:"No cursors/selections flow.",m:"Not a correctness incident — edits keep flowing untouched; client fails soft (freeze/fade cursors, never block typing); rebuilds trivially on recovery as clients re-announce."},
+        {t:"A user closes the laptop lid without a clean disconnect",b:"A ghost cursor sits frozen forever.",m:"TTL refreshed by heartbeats (~10-15s); no heartbeat → entry expires and a 'user left' is broadcast; clean disconnect removes immediately."},
+      ],
+      tradeoffs:[
+        {a:"Push cursors through the op stream",b:"Separate presence path",pick:"Mixing pollutes the durable ordered log with throwaway updates, bloats snapshots/replay, and wastes the engine on conflict-free data; a separate pipe lets you throttle/drop aggressively without risking edits."},
+        {a:"Per-user cursor messages",b:"Batched per-tick snapshot",pick:"Per-user is N-squared; one batched snapshot per ~100-200ms tick turns 2.5M/s into a few thousand/s at the cost of ~100-200ms cursor latency (imperceptible)."},
+      ],
+      probes:[
+        "Why can presence play by looser rules than the op log, and how is a cursor update represented/delivered differently?",
+        "500 editors, ~10 cursor updates/s each — tame the ~2.5M msg/s fan-out.",
+        "The presence tier dies for 2 minutes — is it a P1, and what do editors experience?",
+      ],
+    },
+    persist:{
+      role:"The durability layer: it makes 'acked implies never lost' true across a node <em>and</em> a whole-AZ loss, and folds the log into snapshots. Its defining lever: <strong>two tiers</strong> — a fast quorum-replicated hot log for live acks and cheap object storage for cold history — so durability never gates typing.",
+      capacity:[
+        ["Hot-log replication","3 nodes / 3 AZs, quorum writes","ack only after a majority persists"],
+        ["Ack overhead","a few ms, batched","one quorum round-trip commits dozens of ops"],
+        ["Snapshot cadence","every ~1,000 ops or 60s","+ on idle so cold-open is cheap"],
+        ["Archive durability","~11 nines, cross-AZ","object storage, background writes"],
+      ],
+      data:"Owns the replicated hot log (recent ops) and the offsite tier (snapshots + sealed segments in object storage, referenced by versioned immutable keys). Truncates a hot-log segment only <em>after</em> its covering snapshot is confirmed durable — so data never exists only in a not-yet-consistent place.",
+      scaling:[
+        "<strong>Batch</strong> quorum appends so per-op durability overhead is small.",
+        "Keep snapshotting + archival as <strong>background jobs</strong> off the hot path.",
+        "Control growth: retain few snapshots, <strong>incremental/delta</strong> snapshots, compaction, and <strong>coarsening retention</strong> (fine recent ops → hourly → daily).",
+        "Lifecycle-tier old segments into cheaper cold/glacier classes.",
+      ],
+      failures:[
+        {t:"A single node — or a whole AZ — is lost",b:"Acked edits at risk.",m:"3-node/3-AZ quorum means any one node/AZ can die with zero loss of acked edits; snapshots + segments offsite in object storage cover the rest."},
+        {t:"Object storage has a 30-min regional hiccup",b:"Snapshot/archive writes fail while editing continues.",m:"Editing never stalls — live durability is the quorum hot log; background jobs queue + retry with backoff; don't truncate any segment until its snapshot is confirmed durable (hold space for safety)."},
+        {t:"Naive full-copy snapshot per 1,000 ops",b:"A busy 200KB doc generates GBs/day.",m:"Retain few snapshots, incremental/delta snapshots, compaction, coarsening retention, lifecycle tiering → O(current size + recent history)."},
+      ],
+      tradeoffs:[
+        {a:"Object storage for snapshots/archives",b:"Database / block volumes",pick:"Big write-once blobs read rarely fit object storage (11-nines, cross-AZ, cheap per GB, lifecycle tiering); a DB wastes transactional machinery and bloats, block volumes are costly and capacity-capped."},
+        {a:"Restore by deleting newer ops",b:"Restore as new appended ops",pick:"Rewriting history is a correctness hazard and breaks concurrent editing; compute the diff to seq S and append it as new ops so restore flows through the engine like any edit and stays auditable."},
+      ],
+      probes:[
+        "Guarantee an acked edit survives any single node <em>and</em> a whole-AZ outage without killing latency — lay out the design.",
+        "Object storage is slow and eventually consistent — does that hurt the write or recovery path?",
+        "'Restore to 3pm yesterday' with op log + snapshots — how do you serve it precisely, and do you delete the newer ops?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Document / op-log store",
     load:"~120K op-appends/s average, ~400-600K/s at peak, each op tiny (~50 bytes). Reads are not scans: a read is a point lookup of the latest snapshot pointer plus a short ordered range-scan of the op tail after seq S for one doc, driven by opens and reconnect catch-ups. The raw log grows ~500GB/day and snapshots add a folded blob per doc periodically, so ~500K tiny ordered appends/s, cheap per-doc range reads, and unbounded growth are the real pressures.",

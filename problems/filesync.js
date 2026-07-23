@@ -17,6 +17,218 @@ window.DATA['filesync'] = {
   edges:[["client","gw","sync"],["gw","meta","file ops"],["meta","db","index"],["gw","chunk","upload"],["chunk","block","store chunks"],["gw","notif","notify"]],
   core:["client","gw","meta","db"],
   basic:["client","gw","meta","db"],
+  deepDive:{
+    client:{
+      role:"The sync agent on each device: watches the folder via OS filesystem events, chunks and hashes changes <strong>locally</strong>, and reconciles against the server. Owns the most consequential lever — pushing chunking/hashing to the edge keeps ~460 cores of ingest CPU off your fleet — plus the causality tracking that decides <em>conflict</em> vs <em>fast-forward</em>.",
+      capacity:[
+        ["Local index","~100 B/file","50K files ≈ ~5MB SQLite; 2M files ≈ ~200MB"],
+        ["Initial hash","~500 MB/s","50GB ≈ ~100s one-time; 500GB ≈ ~17 min"],
+        ["Steady edit","~2 ms","re-hash a 1MB changed file"],
+        ["Watches","per-directory","500K files ≈ a few thousand dir watches, not 500K handles"],
+      ],
+      data:"Holds a <strong>local index</strong> (path &rarr; size, mtime, content hash) treated as a <em>cache, not source of truth</em> — the server's namespace version is authoritative. Per-file causality is a <strong>version vector</strong> (a counter per device); the index uses a WAL so a power-loss leaves it consistent, and a corrupt index is rebuilt from a rescan + server diff.",
+      scaling:[
+        "Watch <strong>directories</strong> recursively, not files — thousands of watches instead of hundreds of thousands.",
+        "<strong>Debounce and batch</strong> event storms — a 50K-file <code>git checkout</code> coalesces into one batched tree-delta commit.",
+        "Throttle initial hashing to a fraction of cores at low IO priority so first-sync never hijacks the machine.",
+        "Chunk + hash on-device so ingest CPU spreads free across 100M machines and bytes go direct-to-storage.",
+      ],
+      failures:[
+        {t:"Corrupt local index after a hard power-off",b:"Device can't trust local state; a naive design re-uploads 50GB.",m:"Treat the index as a cache: rescan + hash, diff against the server's file list; dedup means only blocks the server lacks are pushed — a CPU cost, not re-transfer."},
+        {t:"OS filesystem-event buffer overflows under churn",b:"Some changes are silently missed.",m:"A periodic full reconcile scan compares (size, mtime) against the index as a backstop; the common path stays event-driven."},
+        {t:"Two devices edit the same file offline",b:"Last-write-wins would destroy one person's work.",m:"Version vectors flag concurrent (neither-dominates) edits; the loser is materialized as a conflicted copy — both survive."},
+      ],
+      tradeoffs:[
+        {a:"Client-side chunking/hashing",b:"Central chunking",pick:"Client-side spreads ~460 cores across user machines and enables direct-to-storage; cost is you can't trust client hashes, so the block layer re-verifies on commit."},
+        {a:"Event-driven watches",b:"Periodic scan",pick:"Events give near-instant sync but are best-effort; the scan is a rare, cheap safety net so you never permanently miss a change."},
+      ],
+      probes:[
+        "The local SQLite index is corrupt on reboot — do they re-upload 50GB? Walk the recovery.",
+        "A <code>git checkout</code> rewrites 50K files in 2s — what stops 50K round-trips?",
+        "Two devices edit <code>plan.xlsx</code> offline then both push within 10s — who wins, and how is nothing lost?",
+      ],
+    },
+    gw:{
+      role:"The edge / API + sync service. Splits into a <strong>metadata control plane</strong> (tiny commits, changes-since reads) and a <strong>data plane</strong> that never touches bytes — clients upload chunks direct-to-storage via <strong>pre-signed URLs</strong>. The lever it owns: keep the expensive byte path out of the fleet so a small stateless tier serves millions of tiny polls.",
+      capacity:[
+        ["Commit rate","~460K/s peak","115K/s baseline × 4"],
+        ["Per-instance","~5K req/s","stateless 4-core node"],
+        ["Metadata fleet","~130 instances","~500K rps ÷ 5K, +30%; warm floor ~40"],
+        ["Data-plane instances","0","bytes bypass the fleet via pre-signed URLs"],
+      ],
+      data:"Stateless — no per-request state, so instances add/remove freely. It authenticates, mints scoped short-lived upload URLs (keyed to the claimed content hash), and forwards tree deltas to the metadata service; correctness lives downstream in the metadata store and block layer.",
+      scaling:[
+        "Split control and data planes so a few big uploads can't starve millions of tiny metadata polls.",
+        "Direct-to-storage via pre-signed URLs → the byte tier needs zero instances.",
+        "Notification pokes + per-(namespace,cursor) caching collapse sync reads from constant polling to ~one read per change.",
+        "Warm floor + autoscale on request rate above it.",
+      ],
+      failures:[
+        {t:"Slow data path backs up connections",b:"Big uploads tie up memory/connections needed for metadata.",m:"Physically separate planes; bytes never transit the metadata fleet."},
+        {t:"Client lies about a chunk hash / uploads garbage",b:"Corrupt or spoofed content could become referenceable.",m:"The pre-signed URL is scoped to the hash-derived key and expires fast; the block layer re-hashes on commit and rejects mismatches."},
+        {t:"Instance crashes mid-request",b:"That single request fails.",m:"Stateless → client retries idempotently against another instance; nothing durable was owned here."},
+      ],
+      tradeoffs:[
+        {a:"Direct-to-storage (pre-signed)",b:"Proxy bytes through the service",pick:"Direct-to-storage removes an entire CPU/bandwidth tier; cost is you must verify client-claimed hashes server-side."},
+        {a:"Provision for cold-cache worst case",b:"Trust autoscale",pick:"Keep a warm floor (~40) so a cache flush can't stampede before autoscale catches up; cost is idle capacity."},
+      ],
+      probes:[
+        "A 1KB tree-delta and a 2GB upload both arrive here — trace each precisely.",
+        "If clients write straight to storage, how do you stop them uploading garbage or spoofing a hash?",
+        "Why ~130 instances just to forward tiny commits — what actually cuts it?",
+      ],
+    },
+    meta:{
+      role:"The metadata service: file tree, versions, cursors, and sharing. Every change is an <strong>atomic per-namespace commit</strong> that advances one version cursor via <strong>compare-and-set</strong>. The lever it owns: the per-namespace commit boundary is the strong-consistency unit — keep it small and everything else scales.",
+      capacity:[
+        ["Commits","~460K/s peak","3–5 row writes + a CAS each"],
+        ["Sync reads","~1.6M/s cold","100M devices ~once/min"],
+        ["Instances","~50–80 post-cache","changes-since cache collapses the herd"],
+        ["Shared folder","1 commit / 5,000 members","one cursor advance, not 5,000 writes"],
+      ],
+      data:"Source of truth for structure. A commit is one transaction: advance the namespace version, write a <code>file_versions</code> row, update the <code>files</code> pointer. The <strong>changes-since-cursor</strong> response is immutable and identical per (namespace, cursor), so it caches almost perfectly. Concurrent commits serialize on the version CAS — the loser rebases.",
+      scaling:[
+        "Shard by <strong>namespace</strong> so a folder's whole tree + cursor stay co-located and each sync is single-shard.",
+        "Cache the changes-since response per (namespace, cursor) to collapse shared-folder herds.",
+        "Jittered notification delivery spreads the herd over seconds.",
+        "Sub-partition a giant namespace by path range without breaking the commit boundary.",
+      ],
+      failures:[
+        {t:"Instance crashes mid-commit",b:"A 3,200-file batch could land half-applied.",m:"The commit is one atomic transaction — all-or-nothing; the cursor only advances on commit, so devices never see a half-state. Stateless retry."},
+        {t:"Two devices commit against the same version",b:"One edit could clobber the other.",m:"Compare-and-set on the version: first wins 41&rarr;42, the second rebases onto 42 and commits 42&rarr;43."},
+        {t:"Hot shard (hyper-active shared folder)",b:"One shard pins while others idle.",m:"Read replicas absorb sync reads; consistent-hash rebalancing sheds the hot namespace."},
+      ],
+      tradeoffs:[
+        {a:"Strong per-namespace",b:"Eventual everywhere",pick:"Strong only on the tiny metadata core (tree, CAS); the huge block plane stays eventual — keeps the strong core cheap to keep correct."},
+        {a:"Mount/reference a shared folder",b:"Copy across namespaces",pick:"Mount keeps one commit per edit; copying multiplies writes and breaks atomic per-namespace commits."},
+      ],
+      probes:[
+        "A batch moves 3,000 files and the instance dies after half — is the tree corrupt?",
+        "5,000 members issue the identical changes-since read at once — how is that not a DB stampede?",
+        "Where exactly is the strong-consistency boundary, and why keep it small?",
+      ],
+    },
+    db:{
+      role:"The metadata store: NewSQL (Spanner/CockroachDB-class) sharded by namespace, giving <strong>distributed ACID</strong> for the per-namespace commit + version CAS. The lever it owns: holding only <em>metadata</em> (pointers to bytes) keeps the strongly-consistent store tiny relative to the exabytes it indexes.",
+      capacity:[
+        ["Version rows","~5 trillion","~1T files × ~5 versions"],
+        ["Raw / replicated","~1PB / ~3PB","~200 B/row, ×3"],
+        ["Nodes","~1,500 storage-bound","~2TB usable/node"],
+        ["Commit ceiling","~10K TPS/primary","NewSQL ~5–10K ACID writes/node"],
+      ],
+      data:"Composite key <code>(namespace_id, path)</code> serves point lookups and folder <strong>prefix range scans</strong>; an index on <code>(namespace_id, version)</code> turns changes-since into a range scan of <code>version &gt; cursor</code>. Strong consistency + linearizable CAS is the non-negotiable property; blocks live elsewhere, eventually consistent.",
+      scaling:[
+        "Shard by namespace hash; each commit stays single-shard.",
+        "Read replicas absorb the sync-read fan-out; the primary sees writes + cold misses.",
+        "Tier old version rows to cheap storage; keep live tree + recent versions hot.",
+        "Keep the index set minimal — each commit touches ~2 indexes on the 460K/s path.",
+      ],
+      failures:[
+        {t:"A shard's disk dies",b:"Trees + history for ~30M namespaces at risk.",m:"Each shard is a replica group (&ge;3 across AZs) with quorum writes; a lost replica rebuilds, zero data loss."},
+        {t:"Write-primary crashes mid-sale",b:"Commits on that shard stall.",m:"Consensus leader election with an epoch/fencing token; the stale old primary's writes are fenced off. Reads stay up on replicas."},
+        {t:"A single namespace outgrows a shard",b:"One 10M-file folder can't fit.",m:"Sub-partition its tree by path range while keeping rows small and the commit boundary intact."},
+      ],
+      tradeoffs:[
+        {a:"NewSQL (Spanner/Cockroach)",b:"Sharded Postgres/MySQL",pick:"NewSQL brings built-in quorum replication + failover so you don't hand-roll it for 140+ shards; cost is money, lock-in, cross-region commit latency. Sharded Postgres is the cheaper fallback because commits are single-shard."},
+        {a:"Relational / NewSQL",b:"Cassandra / Dynamo",pick:"Rejected: a Paxos-CAS store needs more nodes and still can't do atomic multi-row tree commits — the one property metadata can't surrender."},
+      ],
+      probes:[
+        "Why not Cassandra for 460K writes/s — be specific about where it breaks.",
+        "How is changes-since a range scan and not a full-tree walk?",
+        "Old version rows are most of the data and rarely read — how do you avoid keeping them all hot?",
+      ],
+    },
+    chunk:{
+      role:"Content-defined chunking + global dedup, run <strong>on the client</strong>. A rolling hash (Rabin) sets boundaries by content so an insert disturbs only one chunk. The lever it owns: CDC boundaries are what make dedup and delta-sync work — and pushing byte-crunching to clients removes a whole central CPU tier.",
+      capacity:[
+        ["Chunk target","~4MB","bounded min/max"],
+        ["Rolling hash","O(1)/byte, ~1 GB/s/core","single linear pass"],
+        ["Central cost if server-side","~460 cores at peak","~460 GB/s ÷ ~1 GB/s/core"],
+        ["Server-side work","~few hundred K lookups/s","hash-existence checks, not bytes"],
+      ],
+      data:"Stateless compute. Chunks are content-addressed (hash = key) with a <strong>ref count</strong> per chunk in metadata. The client computes hashes; the server must not trust them, so the block layer re-hashes on commit. Dedup is chunk-level, so partially-similar files share common chunks.",
+      scaling:[
+        "Push chunking/hashing to clients → ~460 cores spread free across 100M machines; bytes go direct-to-storage.",
+        "Server does only cheap hash-existence lookups on the 115K changes/s path.",
+        "Content-defined boundaries survive inserts, so a 1-byte insert re-uploads 1 chunk, not the whole file.",
+        "Bound chunk min/max so pathological inputs can't produce millions of tiny chunks.",
+      ],
+      failures:[
+        {t:"Fixed-size chunking on an insert",b:"Every boundary shifts, every hash changes, whole file re-uploads.",m:"Content-defined chunking with a rolling hash re-aligns boundaries right after the edit."},
+        {t:"Ref-count double-decrement drives a live chunk to 0",b:"GC deletes a still-referenced chunk — thousands of files point at missing bytes.",m:"Mark-and-sweep GC recomputes reachability from live metadata; long grace period; re-verify before delete; content is re-uploadable from a holder."},
+        {t:"Cross-user dedup existence side-channel",b:"An attacker probes whether specific content exists in anyone's storage.",m:"Dedup silently server-side (always accept the offer) or scope dedup per-namespace, trading storage for privacy."},
+      ],
+      tradeoffs:[
+        {a:"Content-defined chunking",b:"Fixed 4MB blocks",pick:"CDC survives inserts (1 chunk changes vs all of them); cost is a rolling-hash pass, cheap since it's dominated by disk read."},
+        {a:"Global dedup",b:"Per-namespace dedup",pick:"Global maximizes storage savings but leaks a cross-user existence oracle; per-namespace is private but stores duplicates."},
+      ],
+      probes:[
+        "Insert one byte at the front of a 100MB file — how many chunks change under fixed vs content-defined?",
+        "A ref-count bug drives a live chunk to zero and GC deletes it — prevent and recover.",
+        "Global cross-user dedup has a privacy side-channel — what is it, and how do you close it?",
+      ],
+    },
+    block:{
+      role:"The content-addressed, immutable block store (Magic-Pocket-style): a giant hash&rarr;bytes map at exabyte scale, protected by <strong>erasure coding</strong>. The lever it owns: immutability — chunks never change, so replication is free, there's no invalidation, and integrity is verifiable by re-hashing.",
+      capacity:[
+        ["Raw &rarr; unique &rarr; physical","25 EB &rarr; ~12 EB &rarr; ~18 EB","dedup ~2×, EC 6+3 ~1.5×"],
+        ["Drives","~900K","~20 TB/node"],
+        ["Write rate","~2M chunks/s peak","hash-partitioned, embarrassingly parallel"],
+        ["EC 6+3","tolerate 3 fragment losses","vs 3× for replication"],
+      ],
+      data:"The key <em>is</em> the content hash. A hash&rarr;location index maps chunks to the container/volume holding them (chunks packed into larger objects for locality). Immutable + content-addressed → replicate freely, verify by re-hash, safe background compaction. Tiered by access age.",
+      scaling:[
+        "Hash-partition writes across many cells — no coordination, no hotspot for distinct chunks.",
+        "Dedup collapses a viral identical chunk to one write + cheap refs.",
+        "A read cache/CDN absorbs hot-chunk read fan-out.",
+        "Tier cold chunks to dense cheap media; EC is the durable cold backbone.",
+      ],
+      failures:[
+        {t:"A storage node holding unique chunks dies",b:"Sole copies of thousands of users' file content at risk.",m:"Erasure coding (RS 6+3) across failure domains: any 6 of 9 fragments reconstruct; rebuild lost fragments from survivors."},
+        {t:"A whole zone goes offline",b:"Reads needing that zone's fragments could fail.",m:"Place fragments across zones so a zone loss stays within m=3; a grace period before triggering rebuild avoids storms."},
+        {t:"Silent bit-rot",b:"A fragment corrupts undetected.",m:"Continuous scrubbing re-hashes fragments and rebuilds proactively."},
+      ],
+      tradeoffs:[
+        {a:"Erasure coding (~1.5×)",b:"3× replication",pick:"EC gives 11-nines-class durability at half the overhead; cost is reconstruction CPU on a degraded read, mitigated by a hot cache tier."},
+        {a:"Start on S3",b:"Self-hosted Magic-Pocket",pick:"S3's managed durability wins early; migrate to self-hosted only at exabyte scale when the bill dwarfs ops cost — immutability makes the migration verifiable."},
+      ],
+      probes:[
+        "A node holding the only copies of some chunks dies — how is that not permanent loss?",
+        "10M users upload the identical viral chunk — does that hot-spot one cell?",
+        "S3 or self-hosted for the bytes, and at what scale does the answer flip?",
+      ],
+    },
+    notif:{
+      role:"Fans out tiny 'namespace X advanced to cursor N' pokes to subscribed devices. It's a <strong>best-effort hint, not the source of truth</strong> — the lever it owns is staying deliberately dumb so correctness lives entirely in cursor-based polling, and a lost or duplicate poke is harmless.",
+      capacity:[
+        ["Connections","100M concurrent","~10 KB state each ≈ ~1TB aggregate"],
+        ["Per node","~250K idle conns","async/epoll → ~400 nodes (or ~100 if only 20–30M live)"],
+        ["Poke rate","~350K/s baseline","peak ×4 ≈ ~1.4M/s"],
+        ["Payload","namespace + cursor only","never content"],
+      ],
+      data:"Holds ephemeral per-device subscriptions keyed by namespace; carries only the namespace and its new cursor. No durable state worth recovering — durability lives in the metadata log. Pokes are idempotent: a duplicate just re-pulls from the same cursor and finds nothing new.",
+      scaling:[
+        "Async/epoll connection fleet holding hundreds of thousands of mostly-idle connections per node.",
+        "Keep live push only for foreground/recently-active devices; sleeping devices fall back to slow polling.",
+        "Jitter fan-out so a 50K-subscriber edit doesn't spike syncs.",
+        "A Redis-Pub/Sub-style lightweight bus keyed by namespace links metadata and connection nodes.",
+      ],
+      failures:[
+        {t:"Notification tier down for 20 min",b:"Devices get no pokes.",m:"Not the source of truth: devices fall back to periodic cursor-based polling and catch up in order on reconnect — graceful degradation, no loss."},
+        {t:"A poke is lost in flight",b:"A device sits at a stale cursor thinking it's current.",m:"Its background poll presents the cursor and gets the delta next cycle — correctness never depends on any single poke."},
+        {t:"Reconnect storm when the tier recovers",b:"100M devices reconnect at once.",m:"Randomized backoff/jitter on reconnect."},
+      ],
+      tradeoffs:[
+        {a:"Redis Pub/Sub",b:"Kafka",pick:"A poke is a tiny best-effort hint and correctness lives in the cursor log, so you don't need Kafka's durability/ordering — Redis-style is faster and cheaper; keep Kafka for the analytics side."},
+        {a:"Hold all 100M connections",b:"Foreground-only",pick:"Foreground-only cuts ~400 nodes to ~100; cost is slightly staler sync for a sleeping device, which the user isn't watching anyway."},
+      ],
+      probes:[
+        "The whole notification tier is down 20 min while edits continue — are devices permanently out of sync?",
+        "A poke is lost exactly as a device's connection drops — how does it ever learn about v42?",
+        "Why not Kafka for the notification backbone — what does a poke actually need?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Metadata DB",
     load:"~115K commits/s baseline, peak ×4 ≈ ~460K commits/s, and a commit is a small transaction (3-5 row writes + a CAS): advance the namespace version, write a file_versions row, update the files pointer. Sync-since-cursor reads dominate — ~1.6M reads/s cold, though the per-namespace+cursor cache collapses shared-folder herds to near one read per change. Volume: ~1 trillion files × ~5 versions ≈ 5 trillion version rows at ~200B/row ≈ 1PB, ×3 replication ≈ 3PB. So: read-heavy, write-hot, PB-scale, every write a small ACID transaction.",

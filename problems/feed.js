@@ -17,6 +17,203 @@ window.DATA['feed'] = {
   edges:[["client","lb","HTTP"],["lb","feed","route"],["feed","db","write post"],["feed","cache","read feed"],["cache","db","on miss"],["feed","fanout","on post"],["fanout","cache","push"],["feed","media","media"]],
   core:["client","lb","feed","db"],
   basic:["client","lb","feed","db"],
+  deepDive:{
+    client:{
+      role:"The mobile or web app that <strong>posts</strong> (<code>POST /post</code>) and, ~20x more often, <strong>reads</strong> the home timeline (<code>GET /timeline</code>). It's thin, but it owns two consequential levers: the <strong>idempotency key</strong> that makes a flaky-network retry safe, and the <strong>poll-vs-push</strong> decision that governs how much 'anything new?' traffic ever reaches your edge.",
+      capacity:[
+        ["Read:write mix","~20:1","~70K reads/s vs ~3,500 posts/s"],
+        ["Feed opens","~20/user/day","6B reads/day across 300M DAU"],
+        ["New-post-count poll","1 tiny call / few s","the highest-frequency call in the system"],
+        ["Push socket","~10KB resident","idle connection replaces N polls/s"],
+      ],
+      data:"Mostly stateless. The durable client-side artifacts are an <strong>idempotency key</strong> minted per compose action (so a retry can't dupe a post) and an <strong>optimistic-UI copy</strong> of a just-sent post held locally until ack — that copy is what guarantees read-your-own-writes feels instant before async fan-out lands.",
+      scaling:[
+        "Page the feed by <strong>opaque cursor</strong>, never <code>OFFSET</code> — cursor seeks are O(1) and immune to head churn as new posts arrive.",
+        "Poll the <code>/timeline/count?since=cursor</code> endpoint with <strong>adaptive backoff + jitter</strong> so millions of idle apps don't synchronize on the same tick.",
+        "Flip highly-active sessions to a <strong>push channel</strong> (WebSocket/SSE) during live events, turning request-rate load into cheap idle-connection load.",
+      ],
+      failures:[
+        {t:"Post commits but the response is lost mid-request",b:"Auto-retry mints a second post — a visible duplicate on the user's own feed.",m:"Client-generated idempotency key on every retry; the server records it on first commit and returns the same <code>post_id</code> for any replay."},
+        {t:"Poll flood during a live event",b:"50M foregrounded clients polling every 5s = ~10M req/s of pure 'anything new?' traffic slamming the edge.",m:"Adaptive backoff + jitter, serve the count from the edge/feed cache, and flip hot users to push so idle sockets replace the polls."},
+      ],
+      tradeoffs:[
+        {a:"Adaptive polling",b:"Persistent push connections",pick:"Polling holds zero server state but wastes round-trips on 'nothing changed'; push kills the waste but turns load into connection-count (memory + fds). Use push only for the engaged working set and leave the idle long tail on polling."},
+      ],
+      probes:[
+        "A user on a subway taps Post, loses signal, and the app retries — how do you guarantee exactly one post?",
+        "Twitter shows an 'N new posts' pill without re-downloading the feed — how does the client learn N cheaply?",
+        "Offset or cursor pagination for infinite scroll, and what exactly breaks when new posts arrive between pages?",
+      ],
+    },
+    lb:{
+      role:"The edge tier. The <strong>load balancer</strong> spreads connections across healthy feed-service instances with health-check ejection; the <strong>gateway</strong> owns TLS, auth, validation, and <strong>rate limiting</strong>. Its single most consequential lever is treating <code>POST /post</code> and <code>GET /timeline</code> asymmetrically — writes are rate-limited hard because one post can trigger tens of millions of downstream fan-out writes, reads are made as cheap as possible and leaned on the feed cache.",
+      capacity:[
+        ["Timeline reads","~300K/s peak","the latency-critical hot path"],
+        ["Post writes","~4K/s peak","heavier, abuse-prone, throttled hard"],
+        ["Per-node budget","~50K req/s","L7 doing TLS + auth + rate-limit"],
+        ["Nodes (real traffic)","~10-15 across 3 AZs","poll flood absorbed at edge, not provisioned for"],
+      ],
+      data:"Stateless by design — no per-request state lives here, which is what lets you add or drain LB nodes freely and avoid session affinity. Region affinity is a routing hint, not stored state: a user is pinned to a home region so their feed cache and graph reads stay local.",
+      scaling:[
+        "Horizontally redundant behind <strong>GeoDNS / anycast</strong> with health checks that withdraw a dead region within the ~10-30s check interval.",
+        "Serve the tiny new-post <strong>count</strong> from the edge/feed cache with a short TTL so it never reaches an app-serving gateway.",
+        "Prioritized <strong>load-shedding</strong> under overload: protect timeline reads and post writes, shed exact counts and recommendations first, return slightly-stale cached feeds instead of erroring.",
+      ],
+      failures:[
+        {t:"Live event spikes reads 70K→350K/s in a minute",b:"The feed fleet, sized for normal load, saturates before autoscaling warms (pods take a minute or two).",m:"Baseline over-provisioning + pre-scale ahead of known events; gateway sheds optional work and serves cached-but-stale feeds while capacity catches up."},
+        {t:"An entire region goes dark",b:"~40% of home-region users get a dead app — no feed, no posting — for the health-check window.",m:"GeoDNS steers to the next-nearest healthy region; cross-region-replicated graph + feeds serve reads, and globally-unique snowflake ids let any region accept writes with no coordination."},
+      ],
+      tradeoffs:[
+        {a:"Rate-limit writes hard",b:"Rate-limit reads lightly",pick:"A write amplifies — one post can become tens of millions of fan-out writes — so an abusive write loop is far more dangerous than an abusive read loop, which is self-limiting and cache-absorbed."},
+        {a:"Size for real requests (~305K/s)",b:"Size for the raw poll flood (~10M/s)",pick:"Sizing for the flood would need ~200 nodes; instead absorb the count at the edge and push hot users, collapsing the tier to ~10-15 nodes."},
+      ],
+      probes:[
+        "A <code>GET /timeline</code> and a <code>POST /post</code> both land here — trace exactly what the gateway does to each.",
+        "Why rate-limit writes far more aggressively than reads on a read-heavy system?",
+        "The poll flood, not real reads, would set your node count — how do you refuse to provision for it?",
+      ],
+    },
+    feed:{
+      role:"The stateless read-path service that <strong>builds the home timeline</strong>: range-read the user's pre-computed feed list of <em>post ids</em> from the cache, merge in the handful of followed celebrities at read time, hydrate the page with a parallel scatter-gather multi-get, assemble and return. Its most consequential lever is storing <strong>ids not bodies</strong> and hydrating in parallel — that keeps a read to one cache list-read plus a bounded fan-out.",
+      capacity:[
+        ["Peak reads","~300K/s","read p99 target < 200ms"],
+        ["Per-instance throughput","~5K req/s","I/O-bound on cache + post store"],
+        ["Instances","~80 (warm floor ~40)","300K/s ÷ 5K + ~30% headroom, across 3 AZs"],
+        ["Follows per read","~300","hydration fan-out width per page"],
+      ],
+      data:"Effectively stateless — no durable per-request state, so any instance serves any user and it autoscales on request rate. It reads from the feed cache and post/graph store but owns none of it; correctness lives downstream. Read-your-own-writes is enforced by a synchronous self-insert into the author's own list plus pinning the author's post-write reads to the freshest source briefly.",
+      scaling:[
+        "Stateless → scale out horizontally, autoscale on request rate and connection count, no cross-instance coordination.",
+        "Keep hydration <strong>cached and paged</strong> — bound fan-out width per page and hedge slow shards so per-request cost stays flat regardless of how prolific the followees are.",
+        "Materialize the ranked candidate set once per scroll session (pin it in cache) so paging is a cheap cursor walk, not a re-rank.",
+      ],
+      failures:[
+        {t:"Author posts but doesn't see it in their own feed",b:"Async fan-out hasn't delivered yet, so the author's read returns a list missing their fresh post — a read-your-writes violation.",m:"Synchronously insert the post id into the author's own feed list before returning 200; the client also prepends its optimistic copy."},
+        {t:"Hydration scatter-gathers to many cold shards",b:"Per-request cost spikes and the fleet needs far more instances to hold p99.",m:"Warm caches for post bodies and authors, bound fan-out width per page, hedge slow shards, and page rather than fetch the whole timeline."},
+      ],
+      tradeoffs:[
+        {a:"Store post ids in the feed list",b:"Store post bodies inline",pick:"Ids keep one canonical copy (an 8-byte ref) so millions of lists fit in memory and an edit/delete is a single write; inlining ~1KB bodies would duplicate a viral post millions of times and rewrite them all on every change."},
+        {a:"Parallel multi-get hydration",b:"N serial reads",pick:"Scatter-gather holds the read within the 200ms budget; serial reads would multiply latency by the page size."},
+      ],
+      probes:[
+        "Walk me through <code>GET /timeline</code> for a user who follows 300 people, step by step, being precise about what you fetch.",
+        "Where's the canonical post body, and what happens when a feed-list id points at a since-deleted post?",
+        "You quote ~80 instances for mostly a cache read and a fan-out — what actually moves that number?",
+      ],
+    },
+    db:{
+      role:"The durable source of truth, <strong>split by workload</strong>: a hash-partitioned wide-column post store (point-lookup by <code>post_id</code>) and a TAO-style association store for the follow graph (bidirectional adjacency). The consequential lever is that the scary ~1M/s fan-out writes live in the <em>cache</em>, not here — so this tier is sized by <strong>storage</strong> (~1.7PB), not write QPS.",
+      capacity:[
+        ["Posts","~1.7PB replicated","~1KB × 300M/day × 5y × RF3"],
+        ["Post nodes","~850","1.7PB ÷ ~2TB usable/node"],
+        ["Follow graph","~180B edges, ~27TB","300M × ~300 × 2 directions × RF3"],
+        ["Durable writes","~3,500 posts/s","fan-out's ~1M/s does NOT land here"],
+      ],
+      data:"Posts are point-lookup by <code>post_id</code> (hash-partitioned) with a secondary index on <code>(author_id, created_at)</code> for per-author range scans. The follow graph is stored <strong>bidirectionally</strong> — a <code>following</code> index by follower_id and a <code>followers</code> index by followee_id — so every follow is a <strong>double write</strong>, the deliberate write-cost trade for O(1) adjacency reads both directions. Consistency is eventual except read-your-writes, which the feed service handles.",
+      scaling:[
+        "Add nodes → the hash ring rebalances posts linearly; capacity, not throughput, sets the node count.",
+        "<strong>Sub-partition</strong> a hot user's 50M-follower list across many partitions (hash of follower_id) so reads/writes parallelize N-ways instead of pinning one shard.",
+        "Tier old posts to cheaper cold storage (read overwhelmingly in the days after creation), shrinking the hot cluster several-fold.",
+      ],
+      failures:[
+        {t:"A shard node loses its disk",b:"Billions of edges and millions of posts on that node — catastrophic if it were a single copy.",m:"Every shard is a ≥3-node replica group across AZs with quorum writes; a lost replica rebuilds from the survivors, zero data loss."},
+        {t:"Write-primary crashes, old primary rejoins believing it's still primary",b:"Split-brain: two primaries take divergent writes to the same post/edge keys, corrupting the social graph.",m:"Consensus leader-election issues a monotonic epoch; the stale primary's writes are rejected via fencing token. Writes to that shard pause a few seconds (consistency over availability), reads stay up from replicas."},
+      ],
+      tradeoffs:[
+        {a:"Wide-column + TAO split",b:"Single relational cluster",pick:"Posts are storage-bound point-lookups that scale linearly to ~850 nodes; a relational engine can't hold billions of rows or 180B edges without hand-rolled sharding and never uses the joins you paid for."},
+        {a:"TAO-style association store for graph",b:"Native graph DB (Neo4j)",pick:"The feed needs only one-hop adjacency at billions of reads/day, not multi-hop traversal; a native graph DB nails traversals but won't horizontally shard the hot-skewed 180B-edge graph at this write+read rate."},
+      ],
+      probes:[
+        "Characterize the read and write load first, then defend your engine choice against relational and native-graph alternatives with per-node numbers.",
+        "A single hot user has 50M followers — how does that follower index survive on one shard?",
+        "Quorum writes add latency to every post and follow — worth it, and do you read from replicas too?",
+      ],
+    },
+    fanout:{
+      role:"The async write-path service that <strong>delivers a post to followers' feeds</strong>: on a committed post it reads the author's follower list and inserts the <code>post_id</code> into each follower's feed-cache list. Its single most consequential lever is the <strong>hybrid threshold</strong> — normal accounts fan out on write, celebrities above the follower threshold are skipped and merged in at read time, so neither worst case (a 50M-write celebrity storm, or a heavy every-read merge) can occur.",
+      capacity:[
+        ["Average fan-out","~1M feed-list writes/s","avg ~300 followers × 3,500 posts/s"],
+        ["Celebrity post","50M writes → 0","skipped via read-time merge"],
+        ["Per-worker inserts","~10K/s","batched, pipelined, network-bound"],
+        ["Workers","~150-200 steady, ~600 peak","1M/s ÷ 10K; autoscale on backlog"],
+      ],
+      data:"Stateless queue consumers holding no durable state of their own — the durable hand-off is a Kafka queue paired with a <strong>transactional outbox</strong>, so the fan-out intent is committed atomically with the post. Delivery is <strong>at-least-once</strong>; correctness comes from idempotent inserts downstream, not from the queue guaranteeing exactly-once.",
+      scaling:[
+        "Scale horizontally by adding consumers and partitions; the queue absorbs bursts so you size for sustained rate, not the instantaneous spike.",
+        "<strong>Chunk</strong> a large fan-out into bounded per-partition sub-jobs so a crash re-processes a few thousand followers, not millions, and delivery parallelizes.",
+        "Under backlog, lower the celebrity threshold and deliver only to <strong>active users</strong> — that strips the largest and deadest work off the top, cutting write volume by an order of magnitude.",
+      ],
+      failures:[
+        {t:"Workers fall hours behind during a posting storm",b:"Posts take an hour to reach feeds — a product failure even though the queue is absorbing correctly.",m:"Add consumers + partitions, prioritize a fresh-posts lane over inactive-user backfill, lower the celebrity threshold, and deliver only to active users."},
+        {t:"Worker crashes after delivering to 3M of 50M followers",b:"Job redelivers and restarts from the top, risking duplicate inserts and wasted re-work.",m:"Feed inserts are <strong>idempotent</strong> (sorted-set add by post id is a no-op on replay), so the first 3M aren't duplicated; chunking bounds the re-processed slice to a few thousand."},
+      ],
+      tradeoffs:[
+        {a:"Fan-out on write",b:"Fan-out on read",pick:"Write pre-builds feeds so reads are a cheap list fetch (great for 20:1 read:write) but explodes on a celebrity; the hybrid fans out normal accounts on write and merges celebrities at read time so neither worst case occurs."},
+        {a:"Queue in the middle",b:"Feed service writes follower feeds inline",pick:"The queue decouples post latency from follower count, absorbs spikes, and gives retry/redelivery; inline writes would couple a 200ms post to tens of thousands of inserts."},
+      ],
+      probes:[
+        "A celebrity with 50M followers posts — what breaks under naive fan-out, and how do you handle both the write and the follower-list read?",
+        "Your Kafka partitions are briefly unavailable — are those posts lost from feeds, and does posting stall?",
+        "Fan-out is ~1M writes/s average — show the worker math and what keeps it from exploding on a celebrity storm.",
+      ],
+    },
+    cache:{
+      role:"The feed cache: a Redis <strong>sorted set per active user</strong> (<code>timeline:userId → {postId: score}</code>) that fan-out appends to and reads range-scan by cursor. Its most consequential lever is being explicitly <strong>not the source of truth</strong> — every list is a recomputable view of posts + graph — which is what lets it live in volatile memory and absorb the ~1M/s fan-out write flood the durable store must never see.",
+      capacity:[
+        ["Per timeline","~20KB","~800 ids × 8B × ~3x sorted-set overhead"],
+        ["Total RAM","~6TB","300M active users × 20KB"],
+        ["Nodes","~120, ~240 with replicas","6TB ÷ ~50GB usable/node + headroom"],
+        ["List trim","top ~800 by score","engagement drops off a cliff with depth"],
+      ],
+      data:"Volatile and <strong>derived</strong>, never authoritative — the durable truth is the canonical posts + follow graph in the DB, so a lost list is a rebuild, not data loss. Ranking runs over a <strong>bounded candidate set</strong> (~500-1,000 recent ids), and the sorted set keeps them score-ordered; a read is 'return top-N of an already-scored list.'",
+      scaling:[
+        "Only maintain feeds for <strong>active users</strong> (last-seen window); fan-out skips inactive followers, shrinking the cache to the working set and cutting fan-out writes by the inactive fraction.",
+        "Shard widely so each single-threaded Redis node owns a slice of users — aggregate throughput scales horizontally and blast radius stays small.",
+        "Tune trim length and active window to fit the working set in memory rather than provisioning for every registered user at full depth.",
+      ],
+      failures:[
+        {t:"A cache node restarts empty",b:"Every timeline on it cold-misses at once — blank feeds for millions, worse than a slow feed.",m:"Run as a replicated cluster so a restart fails over to a replica; on a genuine miss rebuild on demand from graph + posts, with request coalescing to collapse the herd."},
+        {t:"Mass rebuild threatens to melt the DB",b:"Millions of feeds rebuilding from the durable store at once just moves the meltdown downstream.",m:"Rebuild <strong>lazily</strong> only when a user loads (spreading work over real traffic), throttle with per-shard rate limits + coalescing, and serve slightly-stale results — a latency event, never data loss."},
+      ],
+      tradeoffs:[
+        {a:"Redis sorted sets",b:"Memcached blobs / more DB replicas",pick:"Redis gives score-ordered inserts and cursor range-reads natively at ~1M inserts/s; Memcached would rewrite an opaque blob on every insert, and DB replicas keep list-building on the disk-backed hot path you're escaping."},
+        {a:"Volatile in-memory",b:"Durable feed lists",pick:"Volatile is right because lists are recomputable from posts + graph; add AOF/RDB or replicas only as a warm-start optimization, not a correctness requirement."},
+      ],
+      probes:[
+        "You have 500M registered but ~300M active users — how do you avoid pre-computing a feed for the dormant tail?",
+        "A dormant user returns after two months to an evicted feed — what do they see?",
+        "Defend Redis over Memcached or just more DB replicas for the feed lists.",
+      ],
+    },
+    media:{
+      role:"The media path: <strong>pre-signed direct upload</strong> to object storage (bytes never touch app servers), an async transcode pipeline producing multiple bitrate renditions, and CDN delivery. Its most consequential lever is keeping the byte path fully independent of the feed path — a 200MB video is a tiny JSON <em>reference</em> on the post, so posting stays cheap and a media outage degrades a slice gracefully instead of breaking the feed.",
+      capacity:[
+        ["Originals ingested","~120TB/day","~20% of 300M posts × ~2MB"],
+        ["Total storage","~440PB over 5y","originals + renditions"],
+        ["Viewer demand","~900TB/day","~30% of 6B reads fetch ~500KB"],
+        ["Origin egress","~45TB/day","~95% CDN hit ratio absorbs the rest"],
+      ],
+      data:"The post carries only a <strong>media reference</strong> (object key + metadata); the canonical bytes live write-once in replicated object storage. Media state is explicit — <code>processing / ready / failed</code> — driven by the pipeline, so the read path always knows whether a rendition exists before serving one. Ready is set only when all required renditions exist.",
+      scaling:[
+        "Serve from a <strong>CDN</strong> so 10M viewers pull from nearby edges and origin serves each segment roughly once per PoP — collapsing ~900TB/day to ~45TB/day of fills.",
+        "<strong>Adaptive bitrate</strong> (HLS/DASH) so a low-end phone streams 240p smoothly instead of buffering on 1080p.",
+        "Lifecycle-tier storage: hot renditions on standard, cold originals of old posts to archival, pulling the effective hot footprint well below 440PB.",
+      ],
+      failures:[
+        {t:"Transcode crashes half-done",b:"Some renditions exist, others don't — viewers get broken playback on a post that looks live.",m:"Idempotent retryable jobs on a durable queue; mark media <strong>ready only when all renditions exist</strong>, show 'processing' + thumbnail otherwise; a poison file dead-letters after bounded retries."},
+        {t:"A CDN region has an outage",b:"Media 404s/times out for millions mid-scroll while the feed text still loads.",m:"Multi-region (or multi-CDN) health-based routing steers to the next healthy PoP filling from a shared origin shield; the independent text path renders text + thumbnails while full media retries."},
+      ],
+      tradeoffs:[
+        {a:"Pre-signed direct upload",b:"Proxy uploads through app servers",pick:"Direct upload keeps 200MB off the latency-critical fleet and lands bytes in durable storage before the post commits; proxying burns app bandwidth/memory for something object storage does better."},
+        {a:"Object storage + CDN",b:"Bytes in the DB / self-managed filesystem",pick:"Object storage is purpose-built for write-once blobs read by key with cross-AZ durability and native CDN origin; DB bytes wreck the buffer cache, and a self-managed FS means owning rebalancing and durability yourself."},
+      ],
+      probes:[
+        "A user attaches a 200MB video — walk the upload and be specific about what your servers do and don't handle.",
+        "A video goes viral to 10M viewers in an hour on poor connections — fix delivery, including the cold-start before the CDN is warm.",
+        "The transcode fleet goes down during a posting spike — what breaks and what keeps serving?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Post + graph DB (posts, follow edges, feed lists)",
     load:"Writes: ~3,500 posts/s steady; the scary number is <strong>fan-out</strong> — avg ~300 followers means ~90B feed-list writes/day &approx; ~1M/s, and one 50M-follower celebrity post is 50M writes on its own. Reads: ~70K timeline reads/s, peak ~300K/s, but the feed cache absorbs almost all of them so the durable store mostly serves post hydration + graph lookups. Storage: post metadata ~1KB &times; 300M/day &approx; ~300GB/day into the hundreds of TB over years; media lives separately in object storage. Access = point-lookup posts by <code>post_id</code>, range-scan a post-by-author list, and adjacency reads on the follow graph — no joins on the hot path.",

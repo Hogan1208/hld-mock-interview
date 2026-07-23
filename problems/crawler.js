@@ -18,6 +18,243 @@ window.DATA['crawler'] = {
   edges:[["seed","frontier","seed URLs"],["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","frontier","new links"],["parser","store","save page"],["fetcher","dns","resolve"],["fetcher","politeness","rate check"],["parser","dedup","seen?"]],
   core:["seed","frontier","fetcher","parser"],
   basic:["seed","frontier","fetcher","parser"],
+  deepDive:{
+    seed:{
+      role:"The scheduler/bootstrap: it injects the initial ~10K seed URLs and, more consequentially, owns <strong>recrawl scheduling</strong> — deciding <em>when</em> each of 30B known pages is due again so the fixed ~12K pages/s budget goes to the pages most likely to have changed.",
+      capacity:[
+        ["Seeds","~10K URLs","one-time bootstrap"],
+        ["Recrawl decisions","~12K/s","one per page-slot spent"],
+        ["Per-page state","~40 B","last-crawled, change-rate, priority"],
+        ["State total","~1.2 TB","40B × 30B pages"],
+      ],
+      data:"A schedule/priority store over 30B pages: last-fetch time, observed change frequency, and next-due. Tiered into hourly/daily/monthly buckets so news re-enters fast and static archives rarely — you scan a small live bucket, not 30B rows each cycle.",
+      scaling:[
+        "Bucket pages by cadence (hourly/daily/monthly) and only sweep due buckets.",
+        "Adapt cadence to observed change rate — pages that never change decay to monthly.",
+        "The budget is fixed at ~12K/s; scheduling is a prioritization problem, not a throughput one.",
+        "Partition state by domain hash to match the frontier's sharding.",
+      ],
+      failures:[
+        {t:"Change-rate signal is wrong",b:"Waste slots re-fetching static pages while news goes stale.",m:"Feed the parser's content-hash (did it actually change?) back into the cadence estimate; back off on no-change."},
+        {t:"A bad seed list floods one TLD",b:"Frontier + politeness skew to one domain.",m:"Cap per-domain injection and let politeness throttle regardless of seed weighting."},
+        {t:"Schedule store lost",b:"Lose knowledge of what's due.",m:"Rebuildable from the crawl-metadata index (last-fetch per URL); worst case, re-derive cadence over time."},
+      ],
+      tradeoffs:[
+        {a:"Adaptive per-page cadence",b:"Uniform monthly sweep",pick:"Adaptive spends the fixed budget where change happens (freshness on news); uniform is simpler but wastes slots re-fetching archives and lags breaking pages."},
+      ],
+      probes:[
+        "30B pages, ~12K/s budget — full recrawl takes ~a month. How do you pick what to fetch next?",
+        "How do you learn a page's change rate without wasting fetches to measure it?",
+        "A news homepage and a 2009 blog post are both 'due' — who wins and why?",
+      ],
+    },
+    frontier:{
+      role:"The prioritized URL queue and the crawler's brain. It owns the two levers that decide crawl quality: <strong>priority</strong> (crawl good pages first) and <strong>politeness sequencing</strong> (never hammer one host). A Mercator-style two-stage queue where <code>worker = hash(domain) % N</code> co-locates a domain's ordering on one shard.",
+      capacity:[
+        ["In-flight URLs","~3B","× ~200B ≈ ~600GB fleet"],
+        ["Per worker","~3 GB","600GB / 200 workers"],
+        ["Enqueue","~120K/s","~10 new links/page × 12K pages/s"],
+        ["Dequeue","~12K/s","= fetch budget; enqueue ≫ dequeue"],
+      ],
+      data:"Two-stage queues: <strong>front</strong> queues by priority, <strong>back</strong> queues one-per-domain enforce politeness order. Each URL is dedup-checked (seen-set) before it ever enters — enqueue vastly exceeds dequeue, so the seen filter is what keeps 3B from becoming ∞.",
+      scaling:[
+        "Shard by <code>hash(domain)%N</code> so one domain's queue + rate state live on one worker.",
+        "Front/back split decouples 'what's important' from 'what's polite to fetch now'.",
+        "Enforce per-domain caps + max crawl depth to starve traps and link farms.",
+        "Spill cold low-priority URLs to disk/object store; keep hot ready-set in memory.",
+      ],
+      failures:[
+        {t:"A spider trap emits infinite URLs",b:"One domain's back-queue explodes; budget wasted on junk.",m:"Per-domain URL caps + max depth + trap detection (deep repetitive path patterns) drop them before enqueue."},
+        {t:"A frontier shard dies",b:"~3GB of queued URLs for those domains lost.",m:"Durable/replicated queue state; on loss, those URLs are re-discovered from future page links (frontier is regenerable, not source-of-truth)."},
+        {t:"Enqueue (120K/s) outruns dequeue (12K/s) unbounded",b:"Frontier grows without limit.",m:"Seen-set rejects already-known URLs at ingress; priority + caps bound what's admitted."},
+      ],
+      tradeoffs:[
+        {a:"Two-stage priority+politeness frontier",b:"Single FIFO queue",pick:"Two-stage crawls high-value pages first while respecting per-host limits; a FIFO ignores importance and would need external throttling to stay polite."},
+        {a:"In-memory ready set",b:"All-disk queue",pick:"Memory keeps dequeue hot at 12K/s; spill only cold URLs to disk — balances 600GB footprint against latency."},
+      ],
+      probes:[
+        "Enqueue is ~120K/s but you can only fetch ~12K/s — what stops the frontier from exploding?",
+        "Why put a whole domain on one shard instead of load-balancing its URLs?",
+        "A site links a calendar 'next month' forever — how does the frontier not chase it to infinity?",
+      ],
+    },
+    fetcher:{
+      role:"The async HTTP downloader — the throughput engine. Its lever is <strong>concurrency via non-blocking I/O</strong>: pages spend most of their life waiting on the network, so one box juggles thousands of open sockets instead of blocking a thread each. It obeys politeness/DNS before every fetch.",
+      capacity:[
+        ["Target","~12K pages/s fleet","1B/day"],
+        ["Per box","~12.5K/s ceiling","~5K sockets × ~400ms avg"],
+        ["Size cap","~10 MB/response","stop-reading guard"],
+        ["Workers","~200","also shard the frontier"],
+      ],
+      data:"Stateless per request; correctness comes from checking politeness (per-domain rate) and DNS (resolved IP) first. It streams the body with a hard size cap and timeouts, then hands raw bytes to the parser — it holds no durable state.",
+      scaling:[
+        "Event-driven epoll/async so a handful of boxes cover thousands of concurrent slow fetches.",
+        "Hard per-request timeouts + a ~10MB read cap so one slow/huge response can't pin a slot.",
+        "Scale horizontally; each box is independent and shard-aligned to the frontier.",
+        "Respect <code>Retry-After</code>/backoff to avoid getting a crawler IP blocked.",
+      ],
+      failures:[
+        {t:"A host black-holes connections (no response)",b:"Sockets pile up, effective concurrency collapses.",m:"Aggressive connect/read timeouts free the slot; circuit-break a repeatedly-failing host."},
+        {t:"A server streams a multi-GB 'file'",b:"One response eats memory/bandwidth.",m:"Hard ~10MB cap: stop reading and truncate/discard."},
+        {t:"A worker box dies",b:"Its in-flight fetches drop.",m:"Stateless — those URLs remain in the frontier and get re-leased; no data loss, just a retry."},
+      ],
+      tradeoffs:[
+        {a:"Async non-blocking I/O",b:"Thread-per-request",pick:"Async fits the I/O-bound profile — ~5K sockets/box vs a thread (≈1MB stack) each; threads would cap a box at hundreds of fetches and burn RAM on idle waits."},
+      ],
+      probes:[
+        "Each fetch waits ~400ms on the network — how does one box still do thousands per second?",
+        "A domain stops responding mid-download — how do you keep from leaking sockets?",
+        "What stops a malicious server from making you download a 5GB response?",
+      ],
+    },
+    parser:{
+      role:"Extracts links + content from raw HTML and feeds both frontier (new URLs) and store (page body). Its lever is the <strong>render-or-not decision</strong>: cheap static HTML parse (~20ms CPU) versus expensive headless-browser JS rendering (100ms–1s) that costs 10–50× the compute.",
+      capacity:[
+        ["Static parse","~20 ms CPU/page","→ ~240 cores for 12K/s"],
+        ["JS render","100ms–1s/page","→ thousands of cores"],
+        ["Fan-out","~10 links/page","drives frontier enqueue"],
+        ["Extracted text","~16 KB/page","after boilerplate strip"],
+      ],
+      data:"Stateless CPU worker. It normalizes/canonicalizes extracted URLs (so <code>/a</code> and <code>/a/</code> don't both enqueue), strips boilerplate, and computes a content hash used by dedup + recrawl cadence. Holds nothing durable.",
+      scaling:[
+        "Keep the default path a plain HTML parse; reserve rendering for domains that demonstrably need JS.",
+        "Canonicalize URLs before enqueue to cut duplicate discovery at the source.",
+        "It's CPU-bound (unlike the I/O-bound fetcher), so scale it as a separate, differently-sized pool.",
+        "Batch/pipeline parse → content-hash → dedup to avoid re-walking the DOM.",
+      ],
+      failures:[
+        {t:"Everything routed through the JS renderer",b:"Compute blows from ~240 cores to thousands; throughput craters.",m:"Render only when a static parse yields no content/links; maintain a per-domain 'needs render' flag."},
+        {t:"Malformed/adversarial HTML",b:"Parser crashes or hangs on one page.",m:"Sandbox + per-page CPU/time budget; skip and log, never block the pipeline."},
+        {t:"Poor URL canonicalization",b:"Same page enters the frontier many ways, wasting budget.",m:"Strict normalization (scheme/host case, trailing slash, param ordering, fragment strip) before enqueue."},
+      ],
+      tradeoffs:[
+        {a:"Headless-browser render",b:"Static HTML parse",pick:"Render captures JS-built content but costs 10–50× CPU (thousands of cores); make it opt-in per domain so the common static case stays at ~240 cores."},
+      ],
+      probes:[
+        "Rendering every page needs thousands of cores; parsing needs ~240 — how do you decide per page?",
+        "The parser feeds the frontier — how do you keep it from enqueuing the same page five ways?",
+        "Why size the parser pool separately from the fetcher pool?",
+      ],
+    },
+    store:{
+      role:"Durable, write-once archive of raw pages plus a queryable crawl-metadata index. Its lever is the <strong>bytes-vs-index split</strong>: giant immutable blobs go to object storage (S3/WARC), while small per-URL metadata lives in a separate wide-column index — using each store for what it's good at.",
+      capacity:[
+        ["Blob volume","~500 TB","3PB raw, ~16KB/page compressed"],
+        ["Write rate","~190 MB/s","~12K pages/s, ~1.6TB/day"],
+        ["Metadata","~3 TB","30B URLs × ~100B"],
+        ["Blob nodes","~50–60","object-storage capacity, +3× replication"],
+      ],
+      data:"Content-addressed or URL-keyed blobs packed into <strong>WARC</strong> files (many pages per object) to dodge small-file overhead; a wide-column metadata index (URL → offset, fetch time, status, content-hash). Write-once, read by key or batch-scan; no updates/joins/transactions.",
+      scaling:[
+        "Pack many pages per WARC object so 30B tiny files don't crush the store.",
+        "Keep bytes (object storage) and metadata (index) in separate systems tuned differently.",
+        "3× replication (or erasure coding) for ~11 nines durability on data you can't cheaply recrawl.",
+        "Batch-scan for indexing jobs; point-get by key for reprocessing.",
+      ],
+      failures:[
+        {t:"A storage node/disk fails",b:"A slice of archived pages at risk.",m:"3× replication / erasure coding across nodes — a single loss is invisible; ~11 nines durability."},
+        {t:"Writing 30B individual objects",b:"Metadata/NameNode-style overhead explodes.",m:"WARC packing amortizes per-object cost; the metadata index (~3TB) stays separate and small."},
+        {t:"Metadata index corrupts",b:"Can't locate blobs by URL.",m:"Rebuild the index by scanning WARC headers — bytes remain the source of truth."},
+      ],
+      tradeoffs:[
+        {a:"Object storage + WARC + separate index",b:"HDFS",pick:"Object storage wins: 30B objects would need a ~4.5TB NameNode heap on HDFS; WARC packing + object store sidesteps small-file death and is cheaper/more durable."},
+        {a:"Object storage for bytes",b:"Cassandra for bytes",pick:"Store bytes in object storage, not Cassandra — 500TB of blobs would drown Cassandra in compaction and cost; keep Cassandra-style stores for the small metadata index only."},
+      ],
+      probes:[
+        "Why not just dump 30B pages into HDFS as files?",
+        "Where do the raw bytes live vs the 'have I stored this URL' lookup, and why split them?",
+        "How do you store 30B ~16KB blobs without dying from small-file overhead?",
+      ],
+    },
+    dedup:{
+      role:"Two dedups in one: <strong>URL-seen</strong> (has this link been queued?) at billions-of-URLs scale, and <strong>content-seen</strong> (is this page a near-duplicate?). The lever it owns: a probabilistic seen-set that keeps the frontier finite at 30B without a 3TB exact index in RAM.",
+      capacity:[
+        ["Seen URLs","~30B","the exact set is huge"],
+        ["Bloom fleet","~37 GB","~10 bits/URL, <1% FP"],
+        ["Per worker","~190 MB","37GB / 200 workers"],
+        ["Exact hashset","3 TB+","the alternative you avoid"],
+      ],
+      data:"A per-worker Bloom filter over URL hashes (partitioned by the same <code>hash(domain)%N</code> as the frontier). Bloom is <em>mergeable</em>: on worker migration/rebalance, OR the bit-arrays. Content dedup uses <strong>SimHash + LSH banding</strong> to catch near-duplicates, not just byte-identical pages.",
+      scaling:[
+        "Bloom instead of a hashset: ~37GB fleet vs 3TB+ exact — the enabling trade.",
+        "Partition by domain hash so a worker only holds its shard's set (~190MB).",
+        "Merge shards by bitwise-OR when rebalancing — no rehash of 30B URLs.",
+        "SimHash+LSH buckets similar content so near-dup detection is sub-linear.",
+      ],
+      failures:[
+        {t:"Bloom false positive (<1%)",b:"A never-seen URL is wrongly skipped — that page never crawled.",m:"Accept the tiny miss rate (tune bits/URL); it only drops coverage slightly, never corrupts data. Use exact check only for high-value URLs."},
+        {t:"Worker migrates its domain shard",b:"Seen-set must move without a full rebuild.",m:"Bloom's OR-merge property: combine bit-arrays on the target — cheap, no rehash."},
+        {t:"Content changes trivially each fetch (timestamps/ads)",b:"Byte-hash sees everything as new.",m:"SimHash on extracted content ignores boilerplate churn so near-dups collapse."},
+      ],
+      tradeoffs:[
+        {a:"Bloom filter (probabilistic)",b:"Exact hashset",pick:"Bloom fits 30B URLs in ~37GB with <1% false positives (a few missed pages); an exact set needs 3TB+ RAM — you trade perfect recall for feasibility."},
+        {a:"SimHash near-dup",b:"Exact content hash",pick:"SimHash catches templated/near-identical pages exact hashing misses, at the cost of a tunable similarity threshold and LSH bucketing complexity."},
+      ],
+      probes:[
+        "30B seen URLs — why not just a hashset, and what does Bloom cost you?",
+        "A Bloom false positive means you never crawl a real page — why is that acceptable?",
+        "Two pages differ only by a timestamp and rotating ad — how do you call them duplicates?",
+      ],
+    },
+    dns:{
+      role:"Resolves hostnames to IPs before every fetch. Left unmanaged it's a hidden bottleneck — a blocking lookup per page would throttle the crawler. The lever it owns: an <strong>aggressive resolver cache</strong> that turns ~12K lookups/s into ~100 real DNS queries/s.",
+      capacity:[
+        ["Lookups implied","~12K/s","one per fetch"],
+        ["New hosts","~50/s","→ >99% cache hit"],
+        ["Real misses","~100/s","cold/expired entries only"],
+        ["Cache size","~10 GB full","~100M hosts × ~100B (partitioned to tens of MB/worker)"],
+      ],
+      data:"A shared/tiered resolver cache: host → IP with TTL. Most fetches hit an already-resolved domain (the crawl revisits hosts constantly), so the working set is small and hit-rate is >99%. Partitioned by domain hash alongside frontier/politeness state.",
+      scaling:[
+        "Cache resolutions with TTLs — the crawl's domain locality gives >99% hits.",
+        "Async/prefetch resolution so a lookup never blocks a fetch slot.",
+        "Partition the host→IP table by domain hash to keep per-worker footprint at tens of MB.",
+        "Run/back with a dedicated recursive resolver to avoid hammering public DNS.",
+      ],
+      failures:[
+        {t:"DNS provider slow/rate-limits the crawler",b:"Resolution latency stalls fetches fleet-wide.",m:"High cache hit-rate shrinks real queries to ~100/s; own recursive resolver + backoff insulate from a flaky upstream."},
+        {t:"Stale cache entry (IP changed)",b:"Fetching a dead/old IP for a host.",m:"Honor record TTLs; on connect failure, force a re-resolve and evict."},
+        {t:"Thundering herd on a popular expired entry",b:"Many workers resolve the same host at once.",m:"Single-flight per host: one lookup fills the cache, others wait on it."},
+      ],
+      tradeoffs:[
+        {a:"Aggressive resolver cache",b:"Resolve per fetch",pick:"Caching turns 12K lookups/s into ~100 real queries/s (>99% hit) — essential, at the cost of occasional staleness bounded by TTL and connect-failure re-resolve."},
+      ],
+      probes:[
+        "A DNS lookup per page at 12K/s — why is that a problem and how do you make it ~100/s?",
+        "A cached IP goes stale and the host moved — how do you notice and recover?",
+        "A hot domain's DNS entry expires and 50 workers need it at once — avoid the stampede.",
+      ],
+    },
+    politeness:{
+      role:"The rate-limit + robots.txt authority per domain — the crawler's social contract. Its lever: enforce a <strong>per-host request interval</strong> (and <code>Crawl-delay</code>/robots rules) so one target site is never overwhelmed, keeping the crawler's IPs from being blocked.",
+      capacity:[
+        ["Timing state","~50 B/host","last-hit, min-interval"],
+        ["Timing fleet","~5 GB","for ~100M hosts"],
+        ["robots cache","~1 KB/host","→ ~100GB fleet, ~500MB/worker"],
+        ["robots TTL","~24 h","re-fetch daily"],
+      ],
+      data:"Per-domain: last-request timestamp + min interval, and a cached parsed <code>robots.txt</code> (allow/deny paths, crawl-delay). Co-located with the frontier's back-queue for that domain (same <code>hash(domain)%N</code> shard) so the rate decision and the queue live together.",
+      scaling:[
+        "Shard by domain so all rate state for a host is on one worker — no cross-node coordination to be polite.",
+        "Cache robots.txt with a ~24h TTL; ~1KB × domains ≈ ~100GB fleet.",
+        "Pair with the frontier back-queues: a domain becomes fetch-eligible only when its interval elapses.",
+        "Default-deny unknown/unfetched robots until fetched, to stay conservative.",
+      ],
+      failures:[
+        {t:"robots.txt fetch fails",b:"Unknown crawl rules for a domain.",m:"Fail conservative — apply a safe default interval and defer, retry robots later rather than crawl blind."},
+        {t:"A domain's shard is overloaded",b:"Politeness decisions lag; risk hammering or starving that host.",m:"Since state is domain-local, rebalance whole domains to another shard — decision stays single-owner."},
+        {t:"Site tightens crawl-delay after you cached the old one",b:"You crawl too fast for up to a day.",m:"24h robots TTL bounds staleness; honor <code>429</code>/<code>Retry-After</code> immediately regardless of cache."},
+      ],
+      tradeoffs:[
+        {a:"Per-domain rate state co-located with frontier",b:"Central rate-limit service",pick:"Co-location means being polite needs zero cross-node coordination and no hot central service; the cost is domain-affinity in sharding (which the frontier already requires)."},
+      ],
+      probes:[
+        "How do you guarantee you never send two requests to one host within its crawl-delay across 200 workers?",
+        "You cached robots.txt 12 hours ago and the site just disallowed you — what happens?",
+        "Why does politeness state live on the same shard as that domain's frontier queue?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Content store",
     load:"~12K pages/s of write-once blobs; each raw page ~100KB, ~16KB after ~6x gzip &rarr; <strong>~190MB/s sustained write</strong>, ~1.6TB/day ingested. Total ~30B pages &times; ~16KB &approx; <strong>~500TB compressed (3PB raw)</strong>, growing ~100TB/month. Access = write once, read by key for reprocessing or batch-scan for indexing; no updates, no joins, no transactions.",

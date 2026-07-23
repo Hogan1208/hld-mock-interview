@@ -17,6 +17,203 @@ window.DATA['chat'] = {
   edges:[["client","gw","WS"],["gw","chat","send"],["chat","store","persist"],["chat","queue","enqueue"],["queue","push","deliver"],["gw","presence","heartbeat"],["chat","push","notify"]],
   core:["client","gw","chat","store"],
   basic:["client","gw","chat","store"],
+  deepDive:{
+    client:{
+      role:"The phone app that <strong>owns identity and durability of its own outbound messages</strong>: it mints a <code>client-msg-id</code> (the idempotency key), renders optimistically, and persists to a local outbox before a byte hits the network. Its most consequential lever is that durability starts <em>on the device</em> — an unacked message lives in on-disk SQLite, not memory, so a phone dying mid-send never loses it.",
+      capacity:[
+        ["Per-user volume","~50 sent/day","2B users vs 100B msgs/day"],
+        ["Heavy-user history","~110K msgs/yr ≈ 100MB","~300/day × ~1KB stored"],
+        ["Outbox size","normally 0","only unacked sends, a handful in a tunnel"],
+        ["Reconnect delta","single digits per active chat","messages with seq > cursor"],
+      ],
+      data:"The phone is a <strong>cache, not the source of truth</strong>. It holds a durable outbox of unacked sends (each with its <code>client-msg-id</code>), a rolling recent window of decrypted history, and per-conversation <strong>last-delivered cursors</strong>. E2EE keys live here too — only the client can decrypt content.",
+      scaling:[
+        "Reconnect <strong>politely</strong>: exponential backoff with jitter so 20M devices don't retry on the same tick, plus a resume token for a delta sync not a full reload.",
+        "Sync by <strong>last-delivered cursor</strong> per conversation — pull only <code>seq &gt; cursor</code>, so reconnect bandwidth is proportional to what changed.",
+        "Cap local cache to a rolling recent window and page older scroll-back from the store on demand, keeping low-end devices lean.",
+      ],
+      failures:[
+        {t:"Phone dies mid-send, reboots 20 min later",b:"In-flight messages would vanish if they lived only in memory.",m:"Write to the on-device outbox before attempting send; on reconnect flush in order, each carrying its original <code>client-msg-id</code> so the server dedupes."},
+        {t:"Server ack never arrives",b:"The client can't tell if the message landed — a blind resend risks a duplicate.",m:"Keep the entry 'pending' and retry with the same id; the server maps a retry to the existing seq, so a resend is a no-op if the original landed."},
+      ],
+      tradeoffs:[
+        {a:"Keep everything local forever",b:"Rolling recent window + server paging",pick:"Unbounded local history gives instant scroll-back but breaks multi-device sync, reinstall recovery, and low-end storage; a capped window keeps the phone lean while the store stays authoritative."},
+      ],
+      probes:[
+        "You render optimistically before the server acks — what if that ack never comes?",
+        "A user sends 5 messages in a tunnel, then others message the same chat before those 5 flush — how is ordering not scrambled?",
+        "20M clients drop and reconnect in seconds — what in the client design keeps that from becoming an outage?",
+      ],
+    },
+    gw:{
+      role:"The WebSocket gateway tier that <strong>holds hundreds of millions of persistent connections</strong> and pushes messages the instant they arrive. Its single most consequential property is being connection-bound, not compute-bound — you scale it by how many sockets a node can hold, and routing to a specific user is an explicit <strong>connection-registry lookup</strong> (<code>userId → nodeId</code>), never a hash computation.",
+      capacity:[
+        ["Concurrent connections","~500M","held across the tier"],
+        ["Sockets per node","~500K-1M","WhatsApp pushed millions/box"],
+        ["Nodes","~500-1000","500M ÷ 500K-1M"],
+        ["Per-socket cost","~10KB, ~0 CPU idle","fd + buffers + a little state"],
+      ],
+      data:"Holds volatile per-connection state (socket, buffers, a little session data) but no durable truth. The <strong>connection registry</strong> (<code>userId → {nodeId, connId}</code>) lives in sharded Redis with a TTL — soft state, a routing hint, self-healing on reconnect, never a source of truth.",
+      scaling:[
+        "Scale by adding nodes behind an L4 LB; placement is <strong>recorded, not computed</strong>, so there's no hash ring to rebalance on add/drain.",
+        "Tune the kernel (fd limits, socket buffer sizes) and size by socket count, since memory and fd density bind before CPU.",
+        "Drain a node by refusing new sockets and letting clients reconnect elsewhere (backoff + jitter, resume token), updating their registry entries.",
+      ],
+      failures:[
+        {t:"A node holding 500K live sockets crashes hard",b:"Half a million users instantly disconnected; a synchronized reconnect could stampede a surviving node.",m:"Jittered backoff spreads reconnects over tens of seconds; the LB scatters them; per-node accept rate-limits guard the rest. No message lost — in-flight ones are durable in the store or the sender's outbox."},
+        {t:"Registry says B is on node 42, but node 42 just crashed",b:"A stale route — the forward to node 42 fails or times out.",m:"Treat B as offline, fall through to the durable store + cursor-pull + push path; the TTL + heartbeat self-heals the entry, and 'delivered' only fires on a real device ack."},
+      ],
+      tradeoffs:[
+        {a:"~500K-1M sockets/node",b:"2-3M sockets/node",pick:"Denser nodes cut count and cost but a crash drops far more users (a 2M reconnect storm vs 500K) and huge socket counts strain GC/epoll and hurt p99 — balance cost against blast radius."},
+        {a:"Redis connection registry",b:"etcd/ZooKeeper or the message DB",pick:"The registry is high-churn and read-hot; Redis gives sub-ms reads, native TTL, and churn tolerance, while coordination stores can't take millions of connect/disconnect writes/s and the DB is too slow on the delivery path."},
+      ],
+      probes:[
+        "A message for B arrives at the chat service — how does it find the one gateway node out of a thousand holding B's socket?",
+        "Why persistent WebSockets over the phone polling <code>GET /messages</code> every couple seconds?",
+        "You add and drain nodes for deploys — doesn't every reshuffle break routing?",
+      ],
+    },
+    chat:{
+      role:"The stateless routing-and-logic tier: validate, <strong>dedupe on client-msg-id</strong>, assign a per-conversation <strong>monotonic seq</strong>, persist, ack the sender, then forward to the recipient's gateway. Its most consequential lever is <strong>persist-then-deliver</strong> — durability is the promise the moment it acks, so history and other devices can never lose a message the sender saw acked.",
+      capacity:[
+        ["Peak throughput","~5M msg/s","~1.16M/s average"],
+        ["Per-instance","~10K msg/s","mostly I/O wait"],
+        ["Instances","~500 peak, ~120 avg","5M ÷ 10K; warm floor kept"],
+        ["Accept-path work","1 persist + 1 enqueue","independent of group size"],
+      ],
+      data:"<strong>Stateless</strong> — every bit of durable state lives in the store, registry, and queue, so any instance handles any message. Ordering state is the per-conversation seq, allocated where the conversation is anchored (partition-by-conversation-id), so different conversations advance fully in parallel with no global counter.",
+      scaling:[
+        "Stateless → scale linearly by adding instances behind an LB; keep a warm floor because reconnect storms arrive faster than cold instances boot.",
+        "Decouple accept from delivery: one persist + one enqueue regardless of group size, so group fan-out drains on queue workers sized separately.",
+        "Above a group-size threshold, flip huge groups to <strong>fan-out-on-read</strong> (write once, members pull by cursor) so a 100K-member group doesn't become 100K deliveries per message.",
+      ],
+      failures:[
+        {t:"Crash after push but before persist (deliver-first)",b:"A message B saw once is lost from history and from B's other devices — an un-reproducible loss.",m:"Persist-then-deliver: the store is the source of truth, delivery is a fast path on top; worst case is a delivered+stored message redelivered and deduped on the client."},
+        {t:"Retried duplicate + out-of-order arrival (A2 before A1)",b:"Recipients could see a duplicate and scrambled order.",m:"Server-assigned monotonic seq decides display order (clients render by seq); client-msg-id dedupes so a retry maps to the same seq, never a second row."},
+      ],
+      tradeoffs:[
+        {a:"Persist then deliver",b:"Deliver then persist",pick:"Persist-first guarantees no acked message is ever lost, at the cost of a few ms before the push; deliver-first shaves latency but risks losing a message from history after a mid-flight crash."},
+        {a:"Fan-out-on-write for groups",b:"Fan-out-on-read for groups",pick:"Write-fanout gives instant delivery for small active groups; read-fanout (write once, pull by cursor) is the only thing that survives a 100K-member group — a hybrid keyed on size and activity."},
+      ],
+      probes:[
+        "You persist before delivering — why not deliver first for lower latency, then persist?",
+        "That per-conversation monotonic seq — where does the counter live without becoming a bottleneck or SPOF?",
+        "Can your chat service read message content, and if not, how do you do spam detection?",
+      ],
+    },
+    store:{
+      role:"The durable message history: a <strong>masterless wide-column store</strong> (ScyllaDB/Cassandra) with <strong>partition key = conversation_id, clustering key = seq</strong>. Its most consequential lever is that key design — every conversation's messages are co-located and pre-sorted, so 'open a chat, load latest N' is a single-partition ordered scan, one seek, no scatter.",
+      capacity:[
+        ["Write rate","~5M msg/s peak → ~15M replica-writes/s","×3 replication"],
+        ["Storage","~20TB/day → ~7PB/yr logical, ~21PB/yr replicated","~200 bytes/msg"],
+        ["Hot write nodes","~300 (Scylla) vs ~500 (Cassandra)","15M/s ÷ per-node ceiling"],
+        ["Dominant read","last N by seq + seq > cursor","single-conversation range"],
+      ],
+      data:"Rows are <code>(conversation_id) / (seq desc) → {senderId, client_msg_id, ciphertext, ts}</code> — server sees ciphertext + metadata only. Consistency is <strong>tunable quorum</strong> (RF=3, W=2): acked after a quorum + WAL append, needing no consistency beyond a single partition. Dedupe is partition-scoped on <code>client_msg_id</code>; <em>no</em> global secondary index on the hot path.",
+      scaling:[
+        "Shard by <strong>hash of conversation_id</strong> so writes and bytes spread uniformly; add capacity by adding nodes.",
+        "<strong>Time-bucket the partition key</strong> (conversation_id + bucket) for giant broadcast conversations so no single partition grows unbounded or hotspots.",
+        "Tiered retention: recent weeks-to-months hot in the cluster, cold history aged to cheap object storage for rare deep scroll-back.",
+      ],
+      failures:[
+        {t:"A shard node dies with un-flushed memtable writes",b:"Recently-acked messages appear to be gone.",m:"RF=3 across AZs with quorum (W=2) + commit-log/WAL — a lost node loses nothing; survivors serve reads and the memtable replays from the WAL; a replacement streams from peers."},
+        {t:"Write-primary crashes, old primary rejoins as primary",b:"Split-brain: two nodes mint seqs → a forked, conflicting conversation (corruption).",m:"Consensus leader-election with a monotonic epoch; the stale primary's writes are rejected via fencing token. seq is bound to the epoch so ordering can't fork; that shard's writes pause a few seconds (consistency over availability), reads stay up."},
+      ],
+      tradeoffs:[
+        {a:"ScyllaDB / Cassandra (masterless)",b:"HBase or DynamoDB",pick:"Masterless LSM fits write-heavy, per-conversation-ordered reads with no write-primary SPOF; HBase adds unneeded global consistency + HDFS ops and region hotspots, and DynamoDB's ~1K WCU/partition cap throttles hot conversations at ~15M writes/s."},
+        {a:"No global secondary index",b:"Global index by sender_id",pick:"A global index is a second table every write updates (write amplification) whose reads scatter across partitions — exactly the pattern the conversation_id key removes; keep dedupe partition-scoped instead."},
+      ],
+      probes:[
+        "Why partition by conversation rather than by user or by message-id?",
+        "A single broadcast conversation takes 50K msg/s — that's a hotspot even after hashing. Fix it.",
+        "Give me the node math: candidates with per-node write ceilings, and why ~300 Scylla vs ~500 Cassandra.",
+      ],
+    },
+    queue:{
+      role:"The durable, partitioned log (Kafka) that <strong>decouples accept from deliver</strong>: the send path acks fast, and fan-out, delivery, and push drain asynchronously with retry and burst absorption. Its most consequential lever is <strong>partition-by-conversation-id</strong>, which preserves per-conversation order cheaply while different conversations parallelize across partitions.",
+      capacity:[
+        ["Effective throughput","~10-20M events/s peak","accept ~5M/s × fan-out multiplier"],
+        ["Per-partition budget","~50K events/s","one consumer's safe sustain"],
+        ["Partitions","~400 floor, ~2000 provisioned","20M ÷ 50K + headroom + hot-key buckets"],
+        ["Config","RF=3, acks=all, min.insync=2","durability on enqueue"],
+      ],
+      data:"A replicated retained log — holds fan-out/delivery/push tasks, not the source of truth (that's the store). Ordering is per-partition by conversation_id; consumers track committed <strong>offsets</strong>. Delivery is <strong>at-least-once</strong>; correctness comes from idempotent consumers keyed on message-id / client-msg-id, not exactly-once semantics.",
+      scaling:[
+        "Size partition count to target-throughput ÷ per-partition budget with modest headroom — thousands, not 100K, since partitions cost open files, rebalances, and leader elections.",
+        "Sub-key genuinely hot conversations (conversation_id + bucket); cross-bucket order is fine because the <strong>server-assigned seq</strong>, not queue arrival order, is the real ordering guarantee.",
+        "Scale delivery by adding consumer instances up to the partition count; workers are stateless.",
+      ],
+      failures:[
+        {t:"A broker holding partitions for millions of pending tasks dies",b:"Queued deliveries appear at risk.",m:"RF=3, acks=all, min.insync.replicas=2 — leader re-elects to an in-sync replica with no loss; producers only got acked after replication, consumers resume from committed offsets."},
+        {t:"Consumer crashes after delivering but before committing offset",b:"The task redelivers — a potential duplicate message/receipt.",m:"At-least-once + idempotent consumers: dedupe on message-id / client-msg-id so a redelivery is a no-op, chosen over fragile exactly-once."},
+      ],
+      tradeoffs:[
+        {a:"Kafka (retained log)",b:"RabbitMQ / SQS",pick:"Kafka gives partition-ordering by conversation_id, durable replay from committed offset, and tens-of-millions-of-events/s headroom; RabbitMQ is a broker not a log (replay is awkward) and SQS standard loses order while FIFO caps throughput."},
+        {a:"~2000 partitions",b:"100K partitions",pick:"More partitions buy parallelism but cost open files, longer rebalances, more leader elections, and fragment ordering — size to throughput ÷ budget with headroom, not maximum."},
+      ],
+      probes:[
+        "Why a queue at all instead of the chat service calling delivery directly — and how do you keep per-conversation order?",
+        "A 100K-member group has 500 members post in seconds — naive fan-out is 50M deliveries. Contain it.",
+        "Fan-out-on-read just moves the storm to reads — 100K clients pulling one active group. Why is that better?",
+      ],
+    },
+    presence:{
+      role:"The online/last-seen/typing service — a <strong>shared cross-gateway view</strong> no single gateway can answer. Its most consequential property is being <strong>soft state</strong>, off the delivery path: online is a Redis key that exists, offline is that key silently expiring, so a total presence outage is cosmetic and never stops messaging.",
+      capacity:[
+        ["Raw heartbeats","~17M/s naive","500M ÷ 30s"],
+        ["Redis ops after rollup","~100K-1M/s","gateway batches liveness it already knows"],
+        ["Keyspace memory","~50GB","500M keys × ~100 bytes"],
+        ["Redis nodes","~10-20","sharded by userId"],
+      ],
+      data:"Ephemeral TTL-driven state in a sharded, replicated Redis cluster: <code>presence:userId</code> refreshed by heartbeat with a ~45-60s TTL. Online = key exists; offline = expired; last-seen = last write time. Deliberately approximate — soft state that rebuilds itself within one TTL window, which is what licenses aggressive batching.",
+      scaling:[
+        "Terminate heartbeats <strong>at the gateway</strong> (it already knows socket liveness) and bulk-write rollups, so Redis sees far fewer ops than 17M/s of raw heartbeats.",
+        "<strong>Subscribe-on-view</strong>: a user only receives B's presence when a chat with B is open, so the live watcher set is tiny — not a broadcast to 5,000 contacts.",
+        "Scope typing/presence to active viewers of a conversation, sampled and debounced; shed these signals first under load.",
+      ],
+      failures:[
+        {t:"The Redis presence cluster has a full outage",b:"Online dots and last-seen vanish for everyone.",m:"Messaging survives completely (nothing on the delivery path reads presence); UI falls back to 'presence unknown', and heartbeats repopulate the whole keyspace within one TTL window (~1 min) on recovery."},
+        {t:"A user with 5,000 contacts comes online",b:"Naive eager fan-out notifies all 5,000 watchers — presence traffic dwarfs messaging.",m:"Subscribe-on-view keeps the watcher set to open chats (~3, not 5,000); rapid on/off flaps are coalesced and debounced."},
+      ],
+      tradeoffs:[
+        {a:"~30s heartbeat / 45-60s TTL",b:"10s heartbeat for accuracy",pick:"A shorter interval triples write rate and drains phone battery/radio for pinpoint freshness nobody needs; presence is soft state, so bias to lower load and better battery over accuracy."},
+        {a:"Redis (TTL + pub/sub)",b:"Memcached or the message DB",pick:"TTL-as-liveness plus pub/sub for targeted subscriptions is exactly the model; Memcached's LRU can evict live keys and lacks pub/sub, and a durable DB is overkill and a churn magnet for throwaway state."},
+      ],
+      probes:[
+        "Even at 30s, 500M clients is ~17M heartbeat writes/s into Redis — how do you not drown?",
+        "A 1,000-member group with everyone watching — presence and typing for all of them?",
+        "The presence store goes fully down — what do users experience, and does messaging survive?",
+      ],
+    },
+    push:{
+      role:"The notification service that owns the <strong>APNs/FCM integration</strong> and the <code>userId/device → push token</code> map, waking offline devices so they pull the real message. Its most consequential framing is that push is a <strong>best-effort alert to come pull</strong>, never the delivery channel — the store + cursor is the real delivery, so a push outage costs alert timeliness, not messages.",
+      capacity:[
+        ["Morning burst","~2M push events/s","overnight offline backlog"],
+        ["After coalescing","~200K sends/s","~10:1 one-per-conversation-burst"],
+        ["Per worker","~5K/s","multiplexed HTTP/2 to APNs/FCM"],
+        ["Workers","~40 floor + retry headroom","200K ÷ 5K"],
+      ],
+      data:"Holds the device-token mapping and a <strong>durable retry queue</strong> of push tasks. For E2EE the payload carries no content — a generic 'new message' + conversation id; rich previews come from a silent data-push that wakes the app to render a <strong>local</strong> notification on-device, so plaintext is never composed server-side.",
+      scaling:[
+        "<strong>Coalesce</strong> — one push per conversation-burst per device, not per message — cutting a 50-message thread to one 'N new messages' push (~10:1).",
+        "Drain the durable queue at the <strong>provider-accepted rate</strong> using batch APIs and multiplexed connections; the provider, not your fleet, is the ceiling.",
+        "On flush after an outage, coalesce and <strong>drop superseded/stale</strong> pushes (already-read, or past a max-age) to avoid a spam storm.",
+      ],
+      failures:[
+        {t:"APNs/FCM is down or crawling for 20 minutes",b:"Notifications stall; risk of touching message delivery.",m:"Delivery runs off store + cursor and never waits on push; tasks sit in the durable retry queue with backoff and flush on recovery — zero messages lost, only alert timeliness."},
+        {t:"Recovery fires 20 minutes of backlog at once",b:"Notification spam — every buffered buzz replays.",m:"Coalesce on flush to one summary per conversation and drop superseded/stale pushes; the message is already deliverable in-app, so pruning the backlog is safe."},
+      ],
+      tradeoffs:[
+        {a:"Coalesce + metered drain",b:"Add workers and blast 2M/s raw",pick:"The ceiling is the provider (APNs/FCM rate-limit and will throttle a blaster), so more workers can't beat the limit and just spam users and drain battery; coalesce ~10:1 and drain at the accepted rate."},
+        {a:"Generic 'new message' payload",b:"Content in the push",pick:"E2EE means content never leaves the client, so the payload is a bare alert; a silent data-push lets the app compose a rich local notification on-device without exposing plaintext server-side."},
+      ],
+      probes:[
+        "The payload can't contain the message under E2EE — what does the user see on the lock screen?",
+        "A morning backlog fires ~2M pushes/s at APNs/FCM — how do you not melt yourself or the providers?",
+        "APNs throttles you — how do you not lose notifications, and does it touch message delivery?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Message store",
     load:"Write-dominated: ~1.16M msg/s average, ~5M/s at peak, each quorum-replicated 3x ≈ ~15M replica-writes/s at peak against ~20 TB/day of new history (~7 PB/yr logical, ~21 PB/yr replicated). Reads are lighter and narrow: <strong>open a chat, latest N by seq</strong> plus cursor catch-up (<code>seq &gt; cursor</code>) — a single-conversation range, never a cross-conversation scatter.",

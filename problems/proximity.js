@@ -17,6 +17,216 @@ window.DATA['proximity'] = {
   edges:[["client","gw","request"],["gw","match","nearby?"],["match","db","lookup"],["gw","location","update loc"],["location","index","index"],["match","index","query"],["match","notify","dispatch"]],
   core:["client","gw","match","db"],
   basic:["client","gw","match","db"],
+  deepDive:{
+    client:{
+      role:"Two very different apps behind one box: the <strong>driver</strong> app streaming its position, and the <strong>rider</strong> app asking who's nearby and receiving ride offers. The consequential lever it owns: <strong>how often a driver reports</strong> — adaptive reporting at the source is what shrinks the 250K writes/s firehose before it ever hits the edge.",
+      capacity:[
+        ["Driver report interval","~every 4s (adaptive)","1M drivers → ~250K updates/s; parked drivers slow to 20-30s"],
+        ["Update frame size","&lt; ~100 bytes","driverId, lat, lng, ts, status — fire-and-forget"],
+        ["Rider query rate","~20K/s, peak 3-5&times;","GET /nearby {lat, lng, radius}"],
+        ["Connection","1 persistent stream per driver","gRPC/WebSocket, no per-update handshake"],
+      ],
+      data:"Mostly stateless. The driver app holds a live GPS position and a persistent socket; the rider app holds a transient query and, if matched, an <strong>offer card</strong> keyed by offer-id (idempotent so a re-delivered offer shows once). No durable client state — a lost update is superseded ~4s later.",
+      scaling:[
+        "<strong>Adaptive reporting</strong> driven from the server: report frequency tracks speed and match-likelihood, cutting the firehose at the source.",
+        "Persistent connection + tiny binary frames so 250K/s is ~25 MB/s of trivial bandwidth, not 250K TLS handshakes/s.",
+        "Fire-and-forget updates (no per-message ack) since loss is tolerable and latest-wins.",
+      ],
+      failures:[
+        {t:"A buggy build sends location 50&times;/s",b:"Self-inflicted DDoS on ingest/store/index.",m:"Per-driver token-bucket rate limit at the edge (cap ~1/s), keeping the <em>latest</em> frame — throttles frequency, never recency."},
+        {t:"The driver loses signal / closes the app",b:"Their position would linger stale in queries.",m:"TTL ~15s on every position ages them out automatically — presence is a lease renewed by the next report."},
+        {t:"An offer is delivered twice or an accept is lost",b:"Phantom trips / double-tap confusion.",m:"Offer-id idempotency on the client + the authoritative atomic claim server-side resolve it to one outcome."},
+      ],
+      tradeoffs:[
+        {a:"Fixed 4s reporting",b:"Adaptive reporting",pick:"Fixed is simple but wastes writes on parked cars; adaptive slows stationary drivers and speeds up moving/matched ones, cutting aggregate write rate while keeping the drivers that matter fresh."},
+      ],
+      probes:[
+        "A buggy driver build spams updates 50&times;/s across a rollout — what saves you, and could dropping updates hide a fast-moving driver?",
+        "Why a persistent stream with fire-and-forget frames instead of an HTTPS POST per update?",
+        "How does adaptive reporting shrink 250K writes/s without hurting match freshness?",
+      ],
+    },
+    gw:{
+      role:"The shared edge that terminates ~1M persistent driver streams and fronts rider queries. Its defining lever: <strong>split the write firehose from the query path</strong> so 250K/s of loss-tolerant updates can never starve the reads riders actually wait on.",
+      capacity:[
+        ["Driver connections","~1M persistent streams","connection-bound, not CPU-bound"],
+        ["Per-node connections","~250K sockets/node","~4 nodes for connections alone"],
+        ["Query load","~80K req/s peak","~10K/node → ~8 nodes; take the max"],
+        ["Fleet","~12 nodes across 3 AZs","losing an AZ sheds ~1/3 of streams, not the service"],
+      ],
+      data:"Stateless — no per-request state, which is what lets nodes be added/removed freely. It owns TLS, auth (both sides authenticated), per-driver rate limiting, and routing; the authoritative state lives downstream.",
+      scaling:[
+        "Size on <strong>connection count</strong> first (memory + file descriptors), then check request rate — connections dominate.",
+        "Route updates down a dedicated <strong>ingest</strong> path, queries to the match service, so the firehose never touches the query stack.",
+        "Per-driver token-bucket rate limiting to absorb a client bug becoming a DDoS.",
+        "Connection headroom + 3-AZ spread + jittered reconnect to make reconnect storms a non-event.",
+      ],
+      failures:[
+        {t:"An edge zone with 300K live streams crashes",b:"300K connections drop at once; that area's positions go briefly stale.",m:"Degraded coverage, not outage — location self-heals on reconnect; clients reconnect with exponential backoff + jitter, LB/anycast steers to a healthy zone."},
+        {t:"Mass simultaneous reconnect (thundering herd)",b:"The healthy zone could be knocked over.",m:"Jittered backoff spreads reconnects; healthy zones carry connection headroom and autoscale on connection count; a fresh connection is cheap."},
+        {t:"A misbehaving client floods the edge",b:"Op/connection amplification.",m:"Per-driver rate limit + drop excess frames silently (latest-wins makes intermediate drops harmless)."},
+      ],
+      tradeoffs:[
+        {a:"One shared path for updates and queries",b:"Separate write/query paths",pick:"Sharing is simpler but the constant 250K/s write firehose can starve latency-sensitive reads; splitting isolates them — updates get a cheap fire-and-forget channel, queries get the full request lifecycle."},
+        {a:"Size on update rate (250K/s)",b:"Size on connection count",pick:"A persistent socket costs memory+FD whether or not a frame is in flight, and frames are trivial bandwidth — connections set the ceiling, so provision against them."},
+      ],
+      probes:[
+        "How many edge nodes to terminate 1M streams + 80K queries/s — and why size on connections, not the 250K/s update rate?",
+        "A rider query and a driver update both hit this gateway — what does each need, and what splits here?",
+        "An edge zone holding 300K streams crashes — what do drivers and riders experience, and isn't the reconnect a thundering herd?",
+      ],
+    },
+    match:{
+      role:"The stateless read tier that answers 'who's nearby': compute the rider's cell-ring, one index lookup, then exact <strong>haversine</strong> on a small candidate set, ranked by distance/ETA. It owns the lever that keeps queries fast under surge: <strong>cap candidates + cache hot cells</strong>, trading a beat of freshness for flat query cost.",
+      capacity:[
+        ["Query rate","~20K/s, peak ~80K/s","3-5&times; during surge"],
+        ["Per-instance budget","~5K queries/s","a modern 4-core node at low latency"],
+        ["Fleet","~16 + headroom &asymp; ~20 instances","across 3 AZs; writes never touch this tier"],
+        ["p99 latency","&lt; 200ms","dominated by candidate-set size, not fleet"],
+      ],
+      data:"Stateless per query. It may hold short-TTL (sub-second) <strong>cached candidate sets</strong> for hot cells and, when driving dispatch, in-flight <strong>offer state in an external short-TTL store</strong> keyed by request id — never in pod memory.",
+      scaling:[
+        "Autoscale horizontally on request rate; keep a warm floor sized for normal spread load.",
+        "<strong>Cap candidates</strong> (nearest N, gathered nearest-first) so per-query work stays bounded even in a 100K-in-one-cell surge.",
+        "<strong>Cache/coalesce</strong> hot-cell candidate sets for a sub-second TTL — dozens of near-identical queries share one index read.",
+        "<strong>Expand the search ring</strong> outward only when a radius comes back empty (cost scales with sparsity, which is low-volume).",
+      ],
+      failures:[
+        {t:"The geo index for a region is briefly unreachable (~5s failover)",b:"Queries there can't get a candidate set.",m:"Degrade, don't error — serve last-known cached candidate sets or read approximate positions from a store replica; availability beats consistency here."},
+        {t:"A match instance dies holding 500 in-flight offers",b:"500 riders stuck on a spinner.",m:"Offer state in an external short-TTL store keyed by request id; another instance resumes or the offer times out and re-enters matching (idempotent on request id)."},
+        {t:"Surge floods 3 downtown cells at 100K/s",b:"Per-query candidate sets balloon; effective capacity drops where load spikes.",m:"Candidate cap + hot-cell caching flatten per-query cost; stateless tier autoscales on rate."},
+      ],
+      tradeoffs:[
+        {a:"Scan all candidates for the true optimum",b:"Cap at nearest N",pick:"Capping trades a theoretical global optimum for a bounded fast query; gathered nearest-first, the 51st candidate is already farther than #1-50, so the best offer is unchanged."},
+        {a:"Fresh index read per query",b:"Sub-second cached candidate set",pick:"A driver moves ~10-15m/s — well inside a 2km radius — so a ~1s-old candidate set is materially identical; exact haversine still runs against the live query point so ranking stays precise."},
+      ],
+      probes:[
+        "Size the match fleet for 80K queries/s — and does your number hold when a downtown cell drags back thousands of candidates?",
+        "A concert lets out and 3 cells jump to 100K/s — what falls over and what do you do?",
+        "The index is unreachable for 5s — do you fail the query or fake it, and where's the staleness floor?",
+      ],
+    },
+    db:{
+      role:"The hot store of <strong>current driver positions</strong> — one tiny latest-wins record per driver, point-write by driverId and point-radius read. Its defining lever: choosing <strong>in-memory + ephemeral</strong> over durable, because a lost position self-heals in ~4s so durability buys nothing on the hot path.",
+      capacity:[
+        ["Writes","~250K/s sustained","blind latest-wins overwrites, one record each"],
+        ["Reads","~20K/s, peak ~80K/s","point-radius search"],
+        ["Working set","~150 MB","1M drivers &times; ~150 bytes — fits in RAM on one box"],
+        ["Fleet","~6 nodes","3 write shards (~100K ops/s each) &times;2 for primary+AZ replica"],
+      ],
+      data:"<code>driverId → {lat, lng, ts, status}</code>, geohash/H3 cell as the sort/index key, latest-wins overwrite, <strong>TTL ~15s</strong> so a dark driver ages out. No joins, no history, no range scans. The only durable fork leaves the hot path: ingest also publishes each update to <strong>Kafka</strong> for the async history/analytics/billing pipeline.",
+      scaling:[
+        "Shard by <strong>density, not land area</strong> — split hot metros into many shards, merge sparse regions.",
+        "Run each shard as a replica group (primary + AZ replica) so failover needs no rebuild.",
+        "Keep it ephemeral in-memory (Redis GEO) — no WAL/fsync slowing the 250K/s path.",
+        "<strong>Overlap band</strong> at shard borders (drivers within ~2km of a line exist in both) so most border queries stay single-shard.",
+      ],
+      failures:[
+        {t:"The in-memory SF node OOMs and restarts empty",b:"Every SF position vanishes.",m:"Self-heals in ~4s as drivers re-report; replica group fails over first so there's no empty window in the common case — no backup/WAL needed."},
+        {t:"250K writes/s hit one node",b:"A single Redis node tops out well before that.",m:"Geo-shard by density and route each driver's writes to the shard owning its area; workload is inherently local so most queries stay single-shard."},
+        {t:"A query at a shard border misses drivers across the line",b:"The 3 nearest cars are in the neighbor shard — silent wrong answer.",m:"Fan out to neighboring shards when the radius crosses a boundary (scatter-gather), or replicate a thin overlap band into both."},
+      ],
+      tradeoffs:[
+        {a:"In-memory KV with native geo (Redis GEO)",b:"PostGIS / Cassandra",pick:"Redis wins on the three axes that matter — native point-radius, ~100K ops/s/node (~6-node fleet), and zero effort spent on durability the self-healing stream already provides. PostGIS caps at ~5-10K fsync writes/node (~30+ nodes fighting vacuum); Cassandra has no native radius query and compacts ~15s-lived overwrites."},
+        {a:"Durable hot store",b:"Ephemeral + Kafka fork",pick:"Durability is worthless for a latest-wins sample overwritten in ~4s; keep the hot store ephemeral and persist only the Kafka fork that feeds history/billing off the critical path."},
+      ],
+      probes:[
+        "If the whole working set fits in a few hundred MB on one node, why shard at all?",
+        "Why does in-memory actually beat a durable DB here — isn't losing positions dangerous?",
+        "A rider one block from a shard boundary — the 3 closest drivers are across the line. Bug? Fix it.",
+      ],
+    },
+    location:{
+      role:"The dedicated write tier that swallows the 250K/s firehose — terminate driver streams, batch, keep only the latest per driver, then write store + index. Its defining lever: <strong>conditional index writes</strong> (only on cell change) to kill the write amplification that would otherwise double the op rate.",
+      capacity:[
+        ["Ingest rate","~250K updates/s","~25 MB/s — trivial bandwidth, the cost is op + connection count"],
+        ["Batch window","~50-100ms","negligible vs a few-seconds freshness budget"],
+        ["Index moves","~17K/s","only ~1 in 15 updates crosses a cell boundary"],
+        ["Fleet","~8 nodes","connection-bound + write-op-bound; partition by driverId"],
+      ],
+      data:"Holds transient per-driver latest-wins state within a batch window (sticky per-driver routing lets it dedupe before writing). The store write is disposable/at-most-once; the durable copy is the <strong>Kafka</strong> publish for history — the same update treated two ways.",
+      scaling:[
+        "<strong>Batch</strong> over ~50-100ms and collapse to latest-per-driver so intermediate samples are dropped.",
+        "<strong>Conditional index write</strong>: only touch the index when the driver's cell changed → ~17K/s not 250K/s.",
+        "Partition by driverId; autoscale on <strong>queue lag and connection count</strong>, not CPU.",
+        "<strong>Load-shed stale updates</strong> and apply backpressure so ingest stays near real-time instead of buffering stale work.",
+      ],
+      failures:[
+        {t:"A deploy doubles per-update work; queue backs up, positions 30s stale",b:"Riders matched to drivers who already left.",m:"A 30s-old latest-wins update is worthless — drop stale/old, keep only the newest per driver, apply backpressure, autoscale on lag; alert on end-to-end freshness > 5s."},
+        {t:"An ingest node crashes holding a 100ms batch (~25K buffered updates)",b:"Those updates are lost.",m:"Invisible — each is superseded within ~4s; at-most-once is fine, a durable WAL would only slow the hot path. Durability lives on the Kafka fork."},
+        {t:"Naive index write per update",b:"500K+ ops/s of write amplification.",m:"Conditional index moves only on cell change cut it to ~17K/s."},
+      ],
+      tradeoffs:[
+        {a:"Buffer and catch up when overloaded",b:"Load-shed stale updates",pick:"For latest-wins data, catching up processes data nobody wants; shedding stale samples keeps ingest real-time — freshness is the SLO, not completeness."},
+        {a:"Durable ingest (WAL/durable queue)",b:"At-most-once + Kafka fork",pick:"A durable log protecting disposable position samples is pure overhead on the 250K/s path; make only the analytics fork durable, where trip trails and billing genuinely need it."},
+      ],
+      probes:[
+        "Index 250K moving-object writes/s without write amplification — design the write path.",
+        "Ingest falls behind and positions go 30s stale — what do you do, and how do you know before riders complain?",
+        "An ingest node crashes with 25K buffered updates — do you need a durable queue to prevent the loss?",
+      ],
+    },
+    index:{
+      role:"The spatial index that turns 'search 1M drivers' into 'search a few dozen in a handful of cells' — a <code>cell → set of driverIds</code> mapping. Its defining lever: <strong>adaptive cell resolution</strong>, so one scheme serves both a dense metro and an empty prairie without a hotspot.",
+      capacity:[
+        ["Footprint","~50-100 MB","derived, compact — id + cell reference per driver + cell metadata"],
+        ["Index writes","~17K moves/s","only cell-boundary crossings, not the 250K/s firehose"],
+        ["Lookups","~80K/s peak","cell-ring lookups, not scans"],
+        ["Cell sizing","H3 res ~10 (~65m) dense, res ~7 (~1km) sparse","2km radius over ~1km cells → ~9 cell lookups"],
+      ],
+      data:"Derived, rebuildable state — a bucketed view of the location store, keyed by cell with per-cell counts for density-driven subdivision. Not a source of truth; rebuilds in seconds from the store (or the next round of driver updates). TTL ages out stale entries with no sweep.",
+      scaling:[
+        "<strong>Adaptive resolution</strong> (H3 levels / quadtree subdivision): promote a cell to finer resolution when its density crosses a threshold.",
+        "Query the rider's cell <strong>plus its neighbor ring</strong> so a driver just across a boundary isn't missed.",
+        "<strong>Cap candidates</strong> + <strong>spread a hot cell across shards</strong> for the pathological 100K-in-one-spot case.",
+        "Run replica groups per AZ so a failover needs no rebuild; cheap rebuild is the backstop.",
+      ],
+      failures:[
+        {t:"Fixed ~1km cells; Times Square packs 100K drivers into one",b:"A query drags back 100K candidates; that cell's shard pins at 100%.",m:"Adaptive resolution shrinks dense cells to ~65m; cap candidates per query; spread the hot cell across shards; let dispatch do the fine discrimination."},
+        {t:"The downtown-SF index shard crashes during surge",b:"Every downtown query fails at the worst moment.",m:"Replica groups take over with no rebuild; if both replicas are lost, cold-rebuild from the store in seconds (working set is tens of MB) while degrading via match-layer cache + radius expansion."},
+        {t:"A driver goes offline but lingers in a cell",b:"Stale entries pollute results.",m:"TTL (~10-15s, 2-3&times; the report interval) auto-evicts — presence is a renewed lease."},
+      ],
+      tradeoffs:[
+        {a:"Geohash grid",b:"H3 hexagons",pick:"Geohash is simple and prefix-scannable but has awkward diagonal-vs-edge neighbors and the neighbor-edge problem; H3's 6 equidistant neighbors make 'expand one ring' uniform — cleaner for radius, movement, and ETA."},
+        {a:"One index node (cheap, rebuildable)",b:"Replica groups + hot-metro sharding",pick:"One node is cheapest but a crash blanks the busiest region mid-surge; replicas avoid the rebuild window, sharding stops one node owning a scorching cell — availability, not memory, sets the count."},
+      ],
+      probes:[
+        "Geohash vs quadtree vs H3 — how do you bucket the earth, and why do hexagons matter?",
+        "Downtown SF puts 100K drivers in one cell — fix the imbalance, including the case where even fine cells overflow.",
+        "Drivers move constantly — how does the index stay fresh without re-indexing a million drivers every 4s?",
+      ],
+    },
+    notify:{
+      role:"The dispatch tier that turns 'these 12 are nearby' into 'this one driver gets the trip' — pushing offers over the live channel and driving the accept/decline loop. Its defining lever: <strong>an atomic claim on the trip</strong>, the one strongly-consistent write that guarantees exactly one driver is assigned.",
+      capacity:[
+        ["Ride requests","~50K/s at surge","driven by requests, not the 250K location firehose"],
+        ["Live offers","~100-150K at any instant","sequential / 2-3 parallel, not a 10-way broadcast"],
+        ["Offer state","~1 KB each &asymp; ~150 MB","request id, candidate list, timeout"],
+        ["Fleet","~12 nodes","50K req/s ÷ ~5K/s/node + headroom"],
+      ],
+      data:"Per-offer state in a <strong>short-TTL external store</strong> keyed by request id (survives a node crash). The one authoritative durable write is the trip record's <code>assignedDriver</code> field, mutated by a linearizable <strong>compare-and-set</strong>.",
+      scaling:[
+        "Offer <strong>sequentially or in small (2-3) parallel batches</strong> with per-offer timeouts — never a 10-way broadcast race.",
+        "<strong>Partition dispatch by region</strong> so a surging city loads only its own shards and autoscales locally.",
+        "Rank by <strong>acceptance likelihood</strong>, not just distance, so the first offer sticks — best latency win is not needing a second round.",
+        "Fall back to a push notification (APNs/FCM) to wake a dead socket, then pull the pending offer.",
+      ],
+      failures:[
+        {t:"A dispatch node crashes with 5K live offers",b:"5K riders on a spinner, 5K pending cards.",m:"Offer state is external short-TTL, so another instance resumes or offers time out and re-enter matching (idempotent on request id) — a delay, not a lost ride."},
+        {t:"Two drivers accept the same ride within 100ms",b:"Double-dispatch one car.",m:"Atomic compare-and-set (assignedDriver == null → me) serialized on one key — the first wins, the second gets 'already taken'."},
+        {t:"A late accept from a dead node races a fresh re-offer",b:"Potential double assignment across the crash boundary.",m:"Same atomic claim is the single source of truth — exactly one CAS wins regardless of message races."},
+      ],
+      tradeoffs:[
+        {a:"Broadcast the offer to all 12",b:"Sequential / small-batch offers",pick:"Broadcast causes a thundering accept race (11 losers, eroded trust); sequential/2-3-parallel with timeouts keeps at most one live claim while capping rider wait at ~one timeout."},
+        {a:"In-process offer state",b:"External short-TTL store",pick:"In-process is fastest but lost on crash; externalizing costs a little latency to buy crash-safety and regional isolation."},
+      ],
+      probes:[
+        "Surge fans out ~500K offer messages/s each needing a response in ~10s — design dispatch to carry it while staying snappy.",
+        "A dispatch node with 5K live offers crashes — what happens to those riders and drivers?",
+        "Your location data is all eventual consistency — why is the assignment write suddenly strongly consistent, and what does it cost?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Location store",
     load:"~250K location writes/s (blind latest-wins overwrites, one tiny record each) + ~20K nearby geo-queries/s (peak ~80K reads/s) + ~1M current driver positions held in memory (working set only ~150MB). Access = point write by driverId and point-radius search — no joins, no history, no range scans.",

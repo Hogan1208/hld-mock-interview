@@ -17,6 +17,202 @@ window.DATA['ratelimiter'] = {
   edges:[["client","gw","request"],["gw","limiter","check"],["limiter","store","incr"],["limiter","algo","evaluate"],["limiter","config","load rules"],["store","sync","replicate"]],
   core:["client","gw","limiter","store"],
   basic:["client","gw","limiter","store"],
+  deepDive:{
+    client:{
+      role:"The API caller. It's thin, but its behavior on a <code>429</code> decides whether rate limiting is a cooperative contract or a retry-storm amplifier. The single most consequential lever it owns: whether it <strong>honors <code>Retry-After</code></strong> and paces off <code>X-RateLimit-Remaining</code>, or ignores both and hammers a tight retry loop that turns one rejection into more load.",
+      capacity:[
+        ["Decision budget it rides on","p99 < 5ms","limiter answers on every call"],
+        ["Over-limit response","HTTP 429 + Retry-After","cheap to reject vs allow"],
+        ["Good-client behavior","backoff + jitter","self-throttle before hitting 0"],
+      ],
+      data:"Stateless from the server's view. The only client-side state that matters is the <code>X-RateLimit-*</code> counters it reads back (limit / remaining / reset) and the <code>Retry-After</code> it should be tracking — hints for self-pacing, never authoritative. The server never trusts the client to limit itself.",
+      scaling:[
+        "Honor <code>Retry-After</code> and add <strong>exponential backoff + jitter</strong> so a fleet of clients doesn't retry in lockstep at the window boundary.",
+        "Watch <code>X-RateLimit-Remaining</code> and slow down <em>before</em> hitting zero, cutting the 429s the server has to serve.",
+        "Treat a 429 as a signal to pace, not an error to immediately retry.",
+      ],
+      failures:[
+        {t:"Client ignores Retry-After and retry-storms",b:"One 429 becomes a tight retry loop, adding over-limit load exactly when the system is stressed.",m:"Reject the over-limit key cheaply at the gateway from the local cache (no limiter/store hop); persistent offenders get flagged by the heavy-hitter detector and shed at the edge."},
+        {t:"10K clients share one reset boundary and fire at 12:01:00",b:"A synchronized 10K-request spike every minute — a thundering herd.",m:"Jitter <code>Retry-After</code> and, structurally, move to continuous-refill (token bucket / sliding window) so there's no shared unlock instant."},
+      ],
+      tradeoffs:[
+        {a:"Trust client self-throttling",b:"Enforce server-side regardless",pick:"Client cooperation is an optimization that reduces load; correctness must never depend on it, so the server rejects over-limit traffic cheaply whether or not the client behaves."},
+      ],
+      probes:[
+        "Your API returns 429 with Retry-After: 30 — what should a good client do, and what do bad ones do?",
+        "You can't control third-party clients — how do you protect yourself from retry-storms?",
+        "A shared limit resets on the minute and 10K clients all fire at once — fix the stampede.",
+      ],
+    },
+    gw:{
+      role:"The enforcement choke point every request passes through: terminate TLS, authenticate, resolve the key's rule, call the limiter for allow/deny, and return <code>429</code> when over. Its single most consequential lever is that a <strong>rejected request must be far cheaper than an allowed one</strong> — over-limit keys are rejected in-process from a local cache without ever touching the limiter or store, which is what lets it survive a flood.",
+      capacity:[
+        ["Arrival rate","~1M req/s (3-5x peak)","spread across the fleet"],
+        ["Per-node budget","~20K req/s","TLS + conn handling dominate, not the limiter hop"],
+        ["Nodes","~50, ~65 with headroom","1M ÷ 20K, across 3 AZs"],
+        ["Rule resolution","in-memory hash lookup","microseconds, off the store"],
+      ],
+      data:"Horizontally <strong>stateless</strong> — no durable per-request state, so it scales by adding nodes. It caches two things in memory: the rule set (pushed from config) and a short-lived <strong>over-limit / denylist cache</strong> of hot abusive keys, both derived and rebuildable, never a source of truth.",
+      scaling:[
+        "Reject known-over-limit keys <strong>in-process</strong> from the local cache so a flood of a few abusive keys costs almost nothing.",
+        "Autoscale on connection/CPU; front it with upstream <strong>L3/L4 protection</strong> so volumetric garbage never reaches L7.",
+        "Enforce a per-node <strong>concurrency/connection cap</strong> that sheds (429/503 + Retry-After) rather than collapsing while autoscaling warms.",
+      ],
+      failures:[
+        {t:"DDoS-like flood pushes arrivals 1M→8M/s",b:"Gateway CPU/connections saturate; the limiter and store melt if every junk request triggers a decision.",m:"In-process rejection of over-limit keys, autoscaling, and L3/L4 shedding make the flood cheap — most of the 8M/s never reaches a real decision."},
+        {t:"Gateway→limiter path flaps, 40% of decision RPCs time out",b:"The gateway blocks on hung calls and latency climbs for <em>all</em> requests.",m:"Tight timeout + circuit breaker: on trip, fall back to the local approximate limiter with a conservative cap; a decision call must be bounded and non-blocking."},
+      ],
+      tradeoffs:[
+        {a:"Enforce at the gateway",b:"In-app library",pick:"The gateway is the single choke point that sees all traffic for a key, so a global limit stays global; an in-app library only sees one process, silently multiplying '1000/min' by fleet size."},
+        {a:"Reject cheaply in-process",b:"Call the limiter for every request",pick:"A rejected request must cost a fraction of an allowed one, so a flood of abusive keys is shed locally — the gateway is part of the DDoS defense, not a victim sized to absorb it."},
+      ],
+      probes:[
+        "Enforce at the gateway, a sidecar, or an in-app library — where and why?",
+        "What exactly do you return over-limit — status and headers — and why send limit headers on 200s too?",
+        "A flood pushes arrivals to 8M/s of mostly-junk — what falls over and how do you keep legit traffic flowing?",
+      ],
+    },
+    limiter:{
+      role:"The stateless decision service: resolve the rule, identify the window/bucket, do <strong>one atomic op</strong> against the counter store, compare to the limit, return allow + remaining or deny. Its single most consequential lever is that the decision is a <em>single atomic operation</em>, not a read-then-write — that's the difference between a limit that holds and one that leaks under concurrency.",
+      capacity:[
+        ["Throughput floor","~1M decisions/s","one per request"],
+        ["Per-instance (strict-central)","~25K/s","rule lookup + one store round-trip"],
+        ["Instances","~40, ~52 with headroom","1M ÷ 25K, across 3 AZs"],
+        ["Per-instance (local counting)","~200K/s → 5-8 instances","microsecond in-process decision"],
+      ],
+      data:"<strong>Stateless</strong> — every durable count lives in the counter store, so any instance answers for any key. It caches the rule set in memory. Optionally it holds <em>local per-node counters</em> for the highest-volume tiers, a deliberate volatile buffer traded against bounded overshoot between syncs.",
+      scaling:[
+        "Stateless → scale linearly by adding instances; the count is really set by the store round-trip, not CPU.",
+        "For accuracy-critical tiers stay <strong>strict-central</strong> (increment the shared counter every request); batch/pipeline store ops to cut the per-decision cost.",
+        "For high-volume tiers use <strong>local counting</strong> with periodic reconcile — microsecond decisions at the cost of a few percent overshoot.",
+      ],
+      failures:[
+        {t:"Counter store fully unreachable at 1M req/s",b:"The limiter can't read/write any count — every decision fails.",m:"Apply the configured <strong>fail direction</strong> (default fail-open) but never to <em>unlimited</em>: fall back to a local in-memory cap (global/N), a conservative static ceiling, and a local denylist; alert loudly."},
+        {t:"A limiter pod is SIGKILLed with ~90K un-synced local increments",b:"Those counts are lost — brief under-counting, so a few callers exceed their limit until the window resets.",m:"Bounded + self-healing (one sync-interval of one node); for billing-grade tiers don't buffer at all — run strict-central so every allowed request is counted before admission."},
+      ],
+      tradeoffs:[
+        {a:"Strict-central counting",b:"Local + async sync",pick:"Central is exact but pays a network hop per request and pins throughput to the store; local decides in microseconds but overshoots between syncs — pick per tier by how contractual the limit is."},
+        {a:"Atomic single op",b:"Read-then-write",pick:"Read-modify-write lets two nodes both see 999 and both allow (1001 through); a single atomic <code>INCR</code>/<code>EVAL</code> returns the post-increment value so exactly one crosses the line."},
+      ],
+      probes:[
+        "Walk me through one allow/deny decision end to end, and why atomic matters for a single decision.",
+        "At 1M req/s every decision is a Redis round-trip and p99 is 8ms — keep hitting central or move state local?",
+        "How many limiter instances, and what actually sets that number?",
+      ],
+    },
+    store:{
+      role:"The source-of-truth counter store: an in-memory Redis cluster holding one small counter per (key, window), <strong>hash-slotted by api-key</strong> so all of a key's windows converge on one owning shard. Its single most consequential property is <strong>atomicity per key</strong> — <code>INCR</code> returns the post-increment value and <code>Lua EVAL</code> runs token-bucket refill-check-decrement as one indivisible step, so the limit can't leak under concurrent nodes.",
+      capacity:[
+        ["Throughput floor","~1M ops/s","one op per request, sharded"],
+        ["Shards","~10-12 (×100K ops/s/node)","throughput, not RAM, sets the count"],
+        ["Nodes","~24","each shard a primary + replica"],
+        ["Memory","~1-2GB × RF3 ≈ 3-6GB","~100 bytes × 10M keys — nearly empty"],
+      ],
+      data:"Ephemeral by design: key <code>rl:user:{id}:{window}</code> → one integer, with native <code>EXPIRE</code> of ~2 windows so stale buckets self-delete — never a scan, never history. One owner per key means atomic, coordination-free increments. Consistency comes from single-owner atomics + replica failover, not disk durability; a lost counter just resets and re-establishes next window.",
+      scaling:[
+        "<strong>Hash-slot by api-key</strong> so 10M keys spread across shards and each key's counter is a single-node atomic op.",
+        "Keep every per-key structure to <strong>O(1) integers</strong> so memory never binds (avoid sliding-window-log's per-request timestamps).",
+        "For a genuinely hot key, split it into <code>key#1..#N</code> sub-counters across shards and sum, spreading the write load.",
+      ],
+      failures:[
+        {t:"Two nodes race a key at 999/1000",b:"Both read 999, both allow, 1001 admitted — the limit leaks by one.",m:"Never split read and write: atomic <code>INCR</code> returns 1000 (allow) / 1001 (deny); multi-step token bucket runs as one <code>Lua EVAL</code> on the owning shard."},
+        {t:"One abusive key at 400K req/s hotspots its shard to 100%",b:"Every key on that shard goes slow — sharding balances keys, not load per key.",m:"Shed the flagged key at the edge (no store op), cache 'blocked' locally, and fan the hot counter into sub-counters across shards; a count-min heavy-hitter detects it in a second or two."},
+      ],
+      tradeoffs:[
+        {a:"Redis (atomic + Lua + TTL)",b:"Memcached / disk-backed DB",pick:"Redis is the only candidate hitting all five criteria; Memcached lacks server-side scripting so token bucket becomes a racy CAS loop, and a disk DB's ms-scale fsync/quorum commit blows the 5ms budget for durability ephemeral counters don't need."},
+        {a:"In-memory, replication for failover",b:"Disk durability",pick:"Counters are TTL'd and self-rebuild each window, so paying disk-write latency 1M times/s buys nothing; failover comes from a promoted replica, not persistence."},
+      ],
+      probes:[
+        "Give me the concrete key shape, value, and TTL for '1000 req/min per key', and what sharding by api-key costs at 10M keys.",
+        "Token bucket needs read-check-refill-decrement — INCR alone doesn't cover it. Now what?",
+        "A shard node dies and its counters are gone — are those keys now unlimited?",
+      ],
+    },
+    algo:{
+      role:"The counting engine co-located in the limiter that turns '1000/min' into an actual allow/deny. It's the heart of correctness: the algorithm choice decides whether a boundary burst lets 2x through, and whether per-key state is <strong>O(1) integers</strong> or an O(requests) log. Its most consequential lever is defaulting to a continuous-refill, O(1) algorithm (token bucket / sliding-window-counter).",
+      capacity:[
+        ["Cost per decision (O(1) algos)","sub-microsecond","a few arithmetic ops"],
+        ["Engine CPU at 1M/s","a small fraction of a core","free by construction"],
+        ["Sliding-window-counter state","2 integers/key","current + previous window"],
+        ["Sliding-window-log state","~1000 entries/key","O(requests) — the outlier"],
+      ],
+      data:"Holds <strong>no durable state</strong> — the counters live in the store; the engine is pure computation. Token bucket keeps <code>{tokens, last_refill_ts}</code> per key and <strong>recomputes tokens from elapsed time on read</strong>, so even a reset bucket self-corrects deterministically rather than depending on what was persisted.",
+      scaling:[
+        "Default to <strong>O(1)</strong> algorithms (token bucket, sliding-window-counter) so engine CPU stays free and the store holds 1-2 integers per key.",
+        "Use <strong>sliding-window-counter</strong> to kill the fixed-window boundary burst cheaply — blend current + previous window by overlap, accurate to within a few percent.",
+        "Per-tier algorithm selection driven by config — reserve the exact-but-expensive log only for the low-volume tiers that need it.",
+      ],
+      failures:[
+        {t:"Fixed window allows a boundary burst",b:"1000 at 12:00:59 + 1000 at 12:01:00 = 2000 in 2s, both windows 'legal' — 2x the intended rate.",m:"Default to continuous-refill (token bucket) or sliding-window-counter, which weights the trailing window so the burst can't hide across the boundary."},
+        {t:"Sliding-window-log memory explodes",b:"10M keys × ~1000 timestamps ≈ 10B entries (~80GB+) — past cluster capacity.",m:"Switch to sliding-window-counter: 2 integers/key (~160MB total), a ~500x cut for a few-percent boundary error; keep the log only for the few tiers needing exactness."},
+      ],
+      tradeoffs:[
+        {a:"Token bucket",b:"Leaky bucket",pick:"Token bucket allows controlled bursts up to a cap while bounding the average — the normal API case; leaky bucket enforces a strictly smooth output (and a real queue adds latency), for protecting a spike-averse downstream."},
+        {a:"Sliding-window-counter (O(1))",b:"Sliding-window-log (exact)",pick:"The counter is approximate within a few percent but O(1) integers; the log is exact but O(requests) memory — for a limiter, bounding the order of magnitude beats billing to the exact request, so pay for the log only per-tier."},
+      ],
+      probes:[
+        "Lay out the five algorithms for '1000/min' — what each gets right and wrong.",
+        "Give me the sliding-window-counter formula — how does it approximate without storing every request?",
+        "Token bucket state resets on a node restart — what's the correctness impact and how do you handle it?",
+      ],
+    },
+    config:{
+      role:"The rules/config plane that owns limits per tier plus per-key overrides, and pushes changes fleet-wide without a redeploy. It's off the hot path (nodes cache it in memory), but it's a <strong>live control</strong> — its most consequential property is that a bad push is a <em>global outage</em>, so safe rollout matters more than throughput.",
+      capacity:[
+        ["Rule-set size","~1MB","handful of tiers + ~10K overrides × ~100 bytes"],
+        ["Nodes caching it","~80","full set in memory, refreshed on change"],
+        ["Propagation","~1-2s fleet-wide","push (watch/pub-sub) + poll backstop"],
+        ["Config store","3-node etcd-class","rare writes + ~80 subscriptions"],
+      ],
+      data:"A small, <strong>versioned, immutable</strong> rule set — base tier rules plus per-key overrides resolved by precedence (override &gt; tier), each rule naming the limit, window, <em>and</em> algorithm. The etcd-class store is the runtime source of truth for distribution and versioning; a git/control-plane mirror carries the human audit + two-person review. Nodes cache the latest version and hot-swap; each reports the version it enforces.",
+      scaling:[
+        "<strong>Push-based</strong> distribution (watch/pub-sub) for ~1-2s propagation, with periodic polling as a backstop so a missed notification still converges.",
+        "Nodes persist a <strong>last-known-good snapshot</strong> and boot from it if the store is unreachable, reconciling later — config-store downtime degrades freshness, never enforcement availability.",
+        "Keep the whole set cached in memory so rule resolution is a microsecond hash lookup, never a per-request store hit.",
+      ],
+      failures:[
+        {t:"Fat-fingered rule sets a tier limit to 0",b:"Propagates to all 80 nodes in 2s — every default-tier request 429s, a global outage.",m:"Validation at write time, canary/staged rollout watching 429 rates, two-person review, plus a limiter sanity guardrail that refuses a tier-wide 0 without an explicit flag; recover by publishing the previous immutable version."},
+        {t:"Config store unreachable at node startup",b:"A fresh node has no rules — risk of 'no limits' or a crash-loop.",m:"Boot from the local last-known-good snapshot, or a conservative built-in default floor if none exists; keep retrying and report the enforced version so 'stale forever' is visible and paged."},
+      ],
+      tradeoffs:[
+        {a:"etcd for push + versioning",b:"RDBMS or versioned git file",pick:"etcd gives native watches (sub-second push), revision numbers as versions, and HA in one; an RDBMS has no native watch, and a git file has a great audit trail but slow propagation — so split roles: etcd on the hot path, git for review/audit."},
+        {a:"Push distribution",b:"Poll distribution",pick:"Push propagates a limit change in ~1-2s but holds a connection per node; poll is simpler but slower — use push for speed with poll as a convergence backstop."},
+      ],
+      probes:[
+        "Describe the rule shape — tiers, overrides, precedence — and how a request ends up with one number.",
+        "An enterprise limit must go from 5M to 20M/min now across 80 caching nodes — how does it reach every node, and how fast?",
+        "Someone pushes a tier limit of 0 and it fans out in 2s — walk me through prevention and recovery.",
+      ],
+    },
+    sync:{
+      role:"The coordination layer that lets many nodes share one global count when a single-owner counter isn't enough (hot keys, or local per-node counting for latency). It reconciles per-node deltas into a global view and hands back budgets. Its most consequential lever is <strong>proportional budget allocation</strong> — reallocating the remaining global limit toward where traffic actually is, rather than a wasteful static global/N.",
+      capacity:[
+        ["Fleet","~50 limiter nodes","report deltas every ~500ms"],
+        ["Report rate","~100 reports/s","batched, many keys each — bandwidth-bound"],
+        ["Aggregator state","~500MB","one budget per active key, ~50 bytes × 10M"],
+        ["Deployment","1 HA aggregator + standby","shard by key-hash only if it outgrows a node"],
+      ],
+      data:"Holds only <strong>derived, ephemeral</strong> state — the authoritative counts live in the replicated counter store, so anything the aggregator computes is reconstructable from node deltas + the store. That's why it runs redundantly for availability but deliberately <em>without</em> its own persistence.",
+      scaling:[
+        "Track budgets only for <strong>active/high-volume keys</strong> (most of the 10M are idle), keeping the real working set far below 10M.",
+        "Allocate budget <strong>proportional to recent traffic</strong> per node, refreshed every ~500ms, so busy nodes get a bigger slice and idle nodes don't hoard.",
+        "Shard the aggregator by key-hash only once the active-key set or report bandwidth outgrows one node — don't pay sharding for a 500MB problem.",
+      ],
+      failures:[
+        {t:"Sync channel partitions for 10s under budget-splitting",b:"Nodes spend stale allocations with no reconciliation — over-admission bounded by the sum of stale budgets.",m:"Allocations <strong>expire</strong> (decay toward a conservative floor after ~2s), fall back to strict-central via the still-reachable store, and cap the max any node allows between syncs."},
+        {t:"The central aggregator restarts with empty state",b:"In-flight global sums are gone.",m:"The state is soft and reconstructable — nodes re-report local deltas and the authoritative counts sit in the store, so the global view rebuilds within a sync cycle; worst case one interval of slightly-stale allocations."},
+      ],
+      tradeoffs:[
+        {a:"Strict-central (small limits)",b:"Budget-splitting via sync (large limits)",pick:"For a hard 100/min across 20 nodes, central atomic counting is exact and cheap (low volume anyway); budget-splitting shines when the limit is large relative to node count (100K ÷ 20 = 5000 each), and rounds badly when small."},
+        {a:"Err strict on coordination loss",b:"Err generous",pick:"On a sync failure decay budgets toward conservative so a few legit requests get 429+retry rather than letting the global limit blow out — the whole point of the component is bounding load."},
+      ],
+      probes:[
+        "What's the actual coordination mechanism — central store, periodic flush, or gossip — and how does budget get divided?",
+        "Limit is 100/min, a 500-request burst hits 20 nodes evenly — how does sync stop each node allowing 100?",
+        "The sync channel partitions for 10s under budget-splitting — what goes wrong and how do you bound it?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Counter store",
     load:"Sits on <strong>every</strong> request and does one counter op per decision, so its throughput floor is the full request rate: ~1M req/s &rarr; ~1M counter ops/s the store must sustain, sharded. Memory is tiny: one small counter per (key, window) &asymp; ~100 bytes/key &times; ~10M active keys &asymp; ~1GB live; token-bucket / sliding-window-counter is 1-2 integers per key, so still low single-digit GB &times;3 replication &asymp; ~3-6GB. Access = atomic read-modify-write on a single key, native TTL, p99 inside the 5ms decision budget.",

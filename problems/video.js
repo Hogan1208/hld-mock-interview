@@ -17,6 +17,215 @@ window.DATA['video'] = {
   edges:[["client","upload","upload"],["upload","storage","store raw"],["storage","cdn","distribute"],["upload","transcode","trigger"],["transcode","storage","renditions"],["upload","meta","metadata"],["cdn","player","stream"]],
   core:["client","upload","storage","cdn"],
   basic:["client","upload","storage","cdn"],
+  deepDive:{
+    client:{
+      role:"The web / mobile / TV app that both <strong>uploads</strong> masters and, overwhelmingly, <strong>plays</strong> them back. It's an <strong>ABR player</strong>, not a dumb GET — and it owns the single most consequential lever: the <strong>client picks the quality per segment</strong>, so the server can stay a dumb, cacheable file host that a CDN absorbs at any scale.",
+      capacity:[
+        ["Read:write skew","uploaded once, watched millions of times","every design choice favors the read path"],
+        ["Startup budget","&lt; ~2s to first frame","start after 1-2 small low-rung segments"],
+        ["Steady-state buffer","~20-30s ahead","~7-8 segments at ~4s each, rides out a network dip"],
+        ["Device spread","~40 codec/resolution profiles","one manifest, many pre-made renditions"],
+      ],
+      data:"Mostly stateless per session — the durable client artifacts are the <strong>offline download</strong> (segments + manifest + DRM license on device, flushed to disk so an app-kill survives) and a <strong>local watch position</strong> checkpointed to the watch-history service for cross-device resume. The ABR decision (which rendition next) is pure client-local state: measured buffer level and throughput.",
+      scaling:[
+        "Keep quality selection <strong>client-side</strong> so the delivery tier is a static-file cache hit — this is what lets a CDN carry ~500 Tbps of egress.",
+        "Buffer ahead so an 8s tunnel drop is invisible and a PoP failover is masked; downshift before the buffer drains rather than stalling.",
+        "Support <strong>client-side multi-CDN steering</strong> so the player itself routes around a degrading CDN at the next segment boundary.",
+      ],
+      failures:[
+        {t:"Throughput collapses mid-segment (tunnel, congestion)",b:"Risk of a rebuffer / spinner for that viewer.",m:"~20-30s buffer absorbs the dip; player downshifts to a low rung (240p @ 300kbps) and keeps playing; a failed segment fetch is an idempotent retry, possibly against a different edge."},
+        {t:"The serving CDN starts 5xx-ing for a metro",b:"Every viewer on that CDN in the region loses segments.",m:"Player retries the same idempotent GET against an alternate CDN/edge; if all degrade, drop to the lowest rendition and rebuffer gracefully rather than hard-fail."},
+        {t:"App killed with 2GB downloaded offline",b:"Offline episodes could be lost or un-resumable.",m:"Segments, manifest, and license are written to durable device storage as they download, so reopen reads entirely from local with no network."},
+      ],
+      tradeoffs:[
+        {a:"Buffer-based ABR",b:"Throughput-based ABR",pick:"Buffer occupancy is the honest signal of what's sustainable; throughput estimates oscillate. Modern players blend both — throughput for startup ramp, buffer for steady state."},
+        {a:"Deep buffer (minutes)",b:"Shallow buffer (~20-30s)",pick:"A deep buffer wastes RAM (~75MB at 1080p for 2 min) and data on abandoned sessions and delays start; ~20-30s rides out the typical dip while starting sub-2s."},
+      ],
+      probes:[
+        "A viewer drives into a tunnel for 8s mid-segment — walk me through exactly what the player does and why it isn't a spinner.",
+        "The CDN the player is on starts 5xx-ing with ~20s of buffer left. Turn that into zero visible disruption.",
+        "Resume at 47:00 on a different device after an app crash — where's that position stored and how durable must it be?",
+      ],
+    },
+    upload:{
+      role:"A thin <strong>control plane</strong> for ingest: it authenticates, issues scoped <strong>pre-signed URLs</strong>, tracks the resumable session, and on completion writes the master and enqueues transcode. The key lever it owns: bytes go <strong>direct to object storage</strong>, never through this service, so it never becomes a bandwidth bottleneck.",
+      capacity:[
+        ["Raw ingest bandwidth","~300 Gbps sustained, ~1 Tbps peak","500 hours/min &times; ~10 Mbps — bypasses the service entirely"],
+        ["Control-plane rate","~50 initiates/s + completes","low thousands of req/s even at peak"],
+        ["Fleet size","a handful of stateless nodes / 3 AZs","sized for redundancy, not throughput"],
+        ["Part size","~5-10 MB multipart chunks","a 50GB master &asymp; ~5,000 independent parts"],
+      ],
+      data:"Holds <strong>upload-session</strong> state — upload-id, parts received, their ETags, expected count — but keeps it in the shared metadata / object store, <em>not</em> in pod memory, so any pod can resume any session. The master bytes are owned by object storage; the video row (<code>status = uploaded</code>) is owned by the metadata DB.",
+      scaling:[
+        "Separate data plane (bytes &rarr; object storage) from control plane (this service) so ~1 Tbps never touches the app fleet.",
+        "Keep pods <strong>stateless</strong> — externalize session state so autoscale and pod death are transparent.",
+        "Decouple ingest from processing: write master + enqueue a transcode job, return success in seconds.",
+      ],
+      failures:[
+        {t:"Connection dies at 90% of a 50GB upload",b:"Re-uploading 45GB would be unacceptable.",m:"Chunked resumable multipart — each part acked with an ETag; on resume the client asks which parts landed and re-sends only the missing ~10%."},
+        {t:"The coordinating pod is OOM-killed with 300 active sessions",b:"Orphaned sessions would force full restarts of huge uploads.",m:"Session state lives in the shared store, not pod memory; client reconnects to any pod, which reads the parts list and resumes."},
+        {t:"Abandoned / incomplete multipart sessions",b:"Leaked partial objects accumulate cost.",m:"Storage lifecycle TTL garbage-collects incomplete sessions after a few days; complete verifies every part (checksums) before assembling."},
+      ],
+      tradeoffs:[
+        {a:"Proxy bytes through the service",b:"Direct-to-storage via pre-signed URLs",pick:"Proxying is simpler to reason about but forces a ~1 Tbps app fleet for zero benefit; direct-to-storage keeps the tier tiny and stateless."},
+      ],
+      probes:[
+        "A 50GB upload dies at 90% — make the resume cost only the missing 10%, and prove part 4,500 isn't corrupt.",
+        "Bytes go straight to object storage, not through your service. Why, and what does the service actually do then?",
+        "Size the upload fleet for 500 hours/min of arriving video — what number do you provision against, and why not the ingest bandwidth?",
+      ],
+    },
+    storage:{
+      role:"Durable home for the large, immutable, write-once blobs — masters and every rendition's segments. The lever it owns: <strong>redundancy per tier</strong> (replication vs erasure coding) and <strong>hot/cold tiering</strong>, which together decide whether exabytes are affordable.",
+      capacity:[
+        ["Growth rate","~6.5 PB/day, ~2.4 EB/year","720K hours/day &times; ~9 GB per video-hour across the ladder + master"],
+        ["Durability target","~11 nines","object store spreads each object across nodes &amp; AZs"],
+        ["Redundancy overhead","3&times; (replication) vs ~1.3-1.5&times; (erasure)","replicate the hot head, erasure-code the cold tail"],
+        ["Read shape","key-based GETs by CDN","HTTP-native, no DB on the byte path"],
+      ],
+      data:"Opaque object bytes keyed by a deterministic scheme (<code>renditions/{videoId}/{rendition}/</code>). No relational model — the <em>knowledge</em> about the bytes (which renditions exist, where) lives in the metadata DB. Masters are always retained, which makes any rendition <strong>regenerable</strong> by re-running transcode — the ultimate durability backstop.",
+      scaling:[
+        "Tier by popularity: hot SSD-backed tier for new/trending, cold/archive for the long tail via access-frequency lifecycle policies.",
+        "Erasure-code masters + cold content (~1.3-1.5&times; overhead), replicate only the hot renditions where read latency justifies 3&times;.",
+        "<strong>Just-in-time transcoding</strong> for the cold tail: keep only the master, encode on the rare request, cache at the edge.",
+        "Multi-region replicate the hot set + all masters so the CDN can origin-failover.",
+      ],
+      failures:[
+        {t:"A storage node holding hot 1080p renditions loses its disk",b:"Those trending renditions could be unavailable.",m:"Every object is stored redundantly across many nodes/AZs; a node loss routes reads to another copy and rebuilds redundancy in the background — transparent to viewers."},
+        {t:"The origin storage region goes dark for 20 min",b:"Cache-miss fetches (cold content, cold PoPs) fail.",m:"Multi-region origin + CDN origin-failover to a second region; hot content stays cached at edges, so blast radius is limited to misses."},
+        {t:"A dormant title suddenly trends (cold-miss)",b:"First views hit slow archive — latency spikes.",m:"Keep masters always retrievable, promote on first-access signal, feed trend detection into pre-warming."},
+      ],
+      tradeoffs:[
+        {a:"Cloud object store (S3-class)",b:"Self-managed (Ceph/Open Connect)",pick:"Cloud gives 11-nines and zero ops but brutal per-GB egress fees at hundreds of Tbps; owned hardware collapses egress cost at huge capex — hybrid: cloud first, migrate the hot high-egress path to owned edge once volume justifies it."},
+        {a:"Replication (3&times;)",b:"Erasure coding (~1.4&times;)",pick:"Replication serves reads at low latency without reconstruction (worth it for the hot set); erasure coding's cost win applies to masters and the vast cold tail."},
+      ],
+      probes:[
+        "Renditions multiply footprint 5-6&times; and add petabytes/day. Cut storage cost without hurting playback.",
+        "Erasure coding vs replication for video — which, where, and why?",
+        "Would you ever <em>not</em> store all renditions at all? When, and what does that cost the first viewer?",
+      ],
+    },
+    cdn:{
+      role:"The delivery tier that serves the two static artifacts — the <strong>manifest</strong> and immutable <strong>segments</strong> — from close to viewers. It owns the lever that makes the whole system possible: a high <strong>edge cache-hit ratio</strong> keeps origin bandwidth a rounding error against ~500 Tbps of egress.",
+      capacity:[
+        ["Peak egress","~500 Tbps","~100-150M concurrent streams &times; ~5 Mbps"],
+        ["Edge hit ratio","~95-99%","segments immutable + popularity skewed → cache once, serve everywhere"],
+        ["Origin egress","~5-25 Tbps","only the miss stream reaches origin at 99% hit"],
+        ["Segment TTL","long / effectively immutable","content-addressed URLs, no invalidation on the hot path"],
+      ],
+      data:"Holds no source of truth — it's a <strong>cache</strong>. Origin storage + the manifest are authoritative. Cached objects are immutable segments keyed by content-hash/versioned URLs, so a re-encode produces new URLs rather than needing a purge.",
+      scaling:[
+        "<strong>Request coalescing (single-flight)</strong> per PoP so concurrent misses for one segment collapse to one origin fetch.",
+        "<strong>Tiered cache / origin shield</strong> so hundreds of PoP misses funnel to a few shield nodes that coalesce again — origin sees ~one read per segment.",
+        "<strong>Pre-position</strong> predictable hits (premieres) to edges; pull the unpredictable tail on demand.",
+        "Owned appliances inside ISP networks (Open Connect-style) for last-mile egress economics.",
+      ],
+      failures:[
+        {t:"Viral title, 2M concurrent, uncached at most PoPs",b:"Every edge misses the same segment and stampedes origin.",m:"Coalescing + origin shield turn the herd into ~one origin read per segment; pre-position and hot-tier promotion on the first spike."},
+        {t:"An edge PoP serving a metro fails, 500K mid-stream",b:"Those players lose their edge.",m:"Anycast reroutes in seconds, GeoDNS health-checks stop resolving to it, and client-side multi-CDN switches at the next boundary — buffer masks the gap."},
+        {t:"Stale segments cached with 30-day TTL after a re-encode; a DMCA takedown",b:"Viewers get the broken version / removed content lingers.",m:"Versioned/content-hash URLs make updates free (old URLs never referenced); active purge API + origin removal for hard takedowns."},
+      ],
+      tradeoffs:[
+        {a:"Commercial CDN (CloudFront/Akamai)",b:"Owned (Open Connect) + multi-CDN",pick:"Commercial is instant global reach with no capex but brutal per-GB at video scale; owned collapses egress cost at big capex — stage it: commercial for speed and the tail, owned edge for the popular head, multi-CDN for resilience."},
+        {a:"Push / pre-position",b:"Pull / cache-on-miss",pick:"Push buys zero first-view misses for predictable, concentrated demand (premieres) at edge-storage cost; pull is right for the unpredictable long tail."},
+      ],
+      probes:[
+        "From ~5B views/day, derive peak egress and explain why the number itself dictates edge delivery.",
+        "A viral video triggers a cache-miss storm on origin — contain it in layers.",
+        "A segment is re-encoded to fix bad audio but 300 PoPs hold the old one with a 30-day TTL. Fix it — and separately handle a takedown that must vanish in minutes.",
+      ],
+    },
+    transcode:{
+      role:"The asynchronous, queue-fed pipeline that fans one master out into the <strong>bitrate ladder</strong> (~6-8 rungs across codecs). It owns the lever between cost and speed: <strong>per-title / per-shot encoding</strong> (tailor the ladder to content complexity) and chunk-level parallelism decide both storage footprint and time-to-watchable.",
+      capacity:[
+        ["Encode fleet","~300K cores steady, ~1M at peak","30,000 video-min/min &times; ~10 core-min per video-min"],
+        ["Ladder","~6-8 rungs, 240p@300kbps → 4K@16Mbps","plus codec variants (h264/hevc/av1)"],
+        ["Parallelism per title","chunks &times; rungs","a 2h master in 2-min chunks = 60 &times; 8 = 480 independent jobs"],
+        ["Crash rate absorbed","~2% of jobs continuously","idempotent retries make it a non-event"],
+      ],
+      data:"Stateless workers; the durable state is the <strong>job queue</strong> (at-least-once) and the master in object storage (always available as input). Rendition outputs are written to <strong>deterministic keys</strong> keyed by (titleId, chunkId, rendition), giving an exactly-once <em>effect</em> on an at-least-once queue.",
+      scaling:[
+        "Split masters into <strong>GOP-aligned chunks</strong> and fan out parallel (chunk &times; rendition) jobs so wall-clock &asymp; one chunk-encode, not serial length.",
+        "<strong>Per-title / per-shot encoding</strong> to spend bits only where complexity needs them — the biggest documented storage+bandwidth win.",
+        "Elastic <strong>spot/preemptible</strong> fleet buffered by the queue; modest reserved floor + spot for peaks.",
+        "<strong>Priority lanes</strong>: a new title's cheapest watchable rung jumps ahead of 4K rungs and re-encodes.",
+      ],
+      failures:[
+        {t:"A bad deploy slows workers 4&times;; queue backs up to a 6-hour lag",b:"New uploads sit un-watchable; creators furious.",m:"Nothing lost (queue decouples ingest); roll back, autoscale hard, add priority lanes, rush one watchable rung per title, order by expected viewership, shed re-encodes."},
+        {t:"A worker crashes 80% through a chunk",b:"At ~2% continuously, lost work would compound.",m:"Ack only after full output; visibility timeout redelivers the chunk to a healthy worker; only that ~2-min chunk is redone."},
+        {t:"Chunk stitching seams / A/V drift",b:"Visible glitches at segment joins.",m:"Cut only at IDR/keyframe boundaries, pin encoder params per rendition across chunks, validate continuity before publishing."},
+      ],
+      tradeoffs:[
+        {a:"Fixed ladder",b:"Per-title (or per-shot) encoding",pick:"A fixed ladder wastes bits on a cartoon and starves an action film; per-title tailors bitrate/rungs to complexity — a title is encoded once and streamed billions of times, so the analysis cost is trivially repaid."},
+        {a:"Reserve for peak",b:"Elastic spot on a reserved floor",pick:"Reserving ~1M cores idle most of the day is safe but ruinous; spot is cheap because jobs are idempotent/retryable — accept a longer backlog under a big burst."},
+      ],
+      probes:[
+        "Encode a 2-hour 4K master into 8 renditions in minutes, not hours — and tell me the risk when you stitch chunks back.",
+        "Same bitrate ladder for a cartoon and an action movie? Justify per-title (and per-shot) encoding.",
+        "Sizing: how many cores to keep pace with 500 hours/min, and do you reserve them or something cheaper?",
+      ],
+    },
+    meta:{
+      role:"The structured facts about videos — title, owner, state, and the <strong>rendition map</strong> the manifest is built from — served as a point read by <code>video_id</code> on the playback hot path. Its defining lever: <strong>keep view counts off the store's hot path</strong>, because a naive per-view UPDATE melts a hot title's partition.",
+      capacity:[
+        ["Core size","~8B rows &times; ~2 KB &asymp; ~16 TB","tiny — pressure is request rate, not bytes"],
+        ["Playback reads","~58K/s avg, few hundred K/s peak","cache absorbs most; point read by video_id"],
+        ["Writes","~50/s (~4M new videos/day)","gentle, plus status flips"],
+        ["View increments","5B/day &asymp; 58K/s, hot title tens of thousands/s","never a per-view row UPDATE"],
+      ],
+      data:"Two profiles under one label. <strong>Core metadata</strong> is write-once, read-often, strongly-structured — happy in a wide-column store keyed by <code>video_id</code>, cached hard. <strong>View counts</strong> are a monotonic, tolerant-of-fuzz counter kept as a <strong>sharded, salted counter</strong> (N sub-rows summed on read) fed by Kafka windowed aggregation. List-by-uploader gets its own key/table, never a scan.",
+      scaling:[
+        "Partition on <code>video_id</code> for O(1) point reads in every region; a second table/GSI keyed on <code>uploader_id</code> + <code>created_at</code> for channel pages.",
+        "<strong>Sharded counters</strong> + salted shard keys so a hot title's increments spread across partitions.",
+        "<strong>Local pre-aggregation</strong> at the app tier (batch +N per ~1s) collapses 50K/s of raw increments to a handful of writes.",
+        "Detect hot keys with an approximate top-K / count-min sketch, then promote them (more shards / Kafka path).",
+      ],
+      failures:[
+        {t:"The metadata primary loses its disk",b:"Videos become unplayable even though bytes are safe.",m:"Replicate across AZs with quorum writes (promote a replica); backups + PITR for logical corruption; core map is reconstructible by scanning deterministic storage keys."},
+        {t:"One viral video melts its counter partition",b:"Sharded shards hash to one partition sitting at 100%.",m:"Salt the shard key across partitions + local pre-aggregation flushed every ~1s collapses the write rate before it reaches the partition."},
+        {t:"A per-view UPDATE on a hot row",b:"All writers serialize on one lock; partition melts, WAL bloats.",m:"Never store counts as a row you UPDATE per view — sharded/aggregated counter path instead."},
+      ],
+      tradeoffs:[
+        {a:"Cassandra-class (or DynamoDB global tables)",b:"PostgreSQL",pick:"Wide-column wins for global always-on reads with multi-region write availability — ~58K+ reads/s from the nearest region, multi-master, no single primary on the hot path. Postgres' joins are real but reads scale only via replicas off one primary continent."},
+        {a:"Approximate counts for display",b:"Exact counts",pick:"Display '1.2M views' is already fuzzy/deduplicated — approximate + eventually-consistent lets you batch freely; reserve exact counting for the offline monetization pipeline over the raw Kafka log."},
+      ],
+      probes:[
+        "5B view increments/day, a hot title taking tens of thousands/s — design counting that scales, and say whether it's exact.",
+        "Cassandra vs Postgres vs DynamoDB for the core metadata — pin the load first, then commit.",
+        "Do view counts get the same durability bar as the rendition map? Justify tiering durability by value.",
+      ],
+    },
+    player:{
+      role:"The adaptive (ABR) client that turns a menu of static rendition files into smooth playback. It owns the <strong>quality decision</strong> — which rendition to fetch per segment — and CDN failover, entirely client-side, because only it sees real device capability, buffer level, and throughput.",
+      capacity:[
+        ["Segment stream","~5 Mbps, one rendition at a time","fetches short segments one-by-one from a manifest"],
+        ["Buffer","~20-30s (~7-8 segments)","memory: ~19 MB at 1080p, ~60 MB at 4K"],
+        ["Startup","after 1-2 small low-rung segments","sub-2s to first frame, quality ramps after"],
+        ["Device negotiation","~40 profiles → a sub-ladder","never offered a 4K HEVC rung it can't decode"],
+      ],
+      data:"Client-local: current buffer occupancy, throughput estimate, chosen rendition, and a checkpointed <strong>watch position</strong> (also synced to a replicated watch-history service for cross-device resume). No server-side playback session — playback is a sequence of stateless cacheable GETs.",
+      scaling:[
+        "Buffer-led ABR with a throughput signal for startup ramp; step up on headroom, down before the buffer drains.",
+        "<strong>Client-side multi-CDN steering</strong>: score each CDN on throughput/latency/error rate, switch at a segment boundary.",
+        "Device-capability negotiation so the manifest exposes only a decodable sub-ladder.",
+        "Throttle watch-position checkpoints to ~10-30s + on meaningful events (pause/seek/exit).",
+      ],
+      failures:[
+        {t:"The player's CDN starts 5xx-ing mid-movie",b:"Segment fetches fail for that viewer.",m:"~20s buffer covers it; retry the idempotent GET against an alternate CDN/edge; downshift to refill the buffer faster."},
+        {t:"All CDNs degrade at once",b:"No healthy path.",m:"Drop to the lowest rendition (smallest segments most likely to squeak through); rebuffer gracefully — spinner + retry, resume the instant a segment lands; emit QoE telemetry."},
+        {t:"App crashes 47 min into a 90-min film",b:"User expects resume at 47:00 on any device.",m:"Position checkpointed to a replicated watch-history service (~10-30s cadence + on exit) and cached locally; furthest-position/LWW reconciliation across devices."},
+      ],
+      tradeoffs:[
+        {a:"Gate playback on a full buffer",b:"Start on 1-2 low-rung segments",pick:"Gating hurts the two things that matter most — startup latency and wasted bandwidth on abandoned sessions; start fast at low quality, then ramp and build to ~20-30s."},
+        {a:"Checkpoint every 1s",b:"Every ~10-30s + on events",pick:"Per-second hammers the backend; ~10-30s plus pause/seek/exit captures the common 'close the app' case while losing at most a few seconds of progress."},
+      ],
+      probes:[
+        "Explain the algorithm that jumps 480p → 1080p and back — and why lean on the buffer over throughput?",
+        "40 device classes and 3 CDNs — how does the player scale quality across all that diversity?",
+        "How big a buffer, and what does it cost in memory and startup time? Why not buffer minutes ahead?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Metadata DB",
     load:"~58K point reads/s by <code>video_id</code> on the playback hot path (a few hundred K/s at peak, cache absorbs most); writes are gentle — ~4M new videos/day &approx; ~50 writes/s plus status flips. View events add ~5B/day &approx; ~58K increments/s, spiking to tens of thousands/s on one trending title — kept off the store's hot path (Kafka + sharded counters). Size is small: ~8B rows &times; ~2 KB &approx; ~16 TB. The pressure is request rate and global reach, not bytes.",

@@ -18,6 +18,231 @@ window.DATA['adclick'] = {
   edges:[["client","gw","click"],["gw","stream","ingest"],["stream","agg","consume"],["agg","olap","rollup"],["stream","dedup","dedup"],["agg","batch","reconcile"],["olap","query","read"]],
   core:["client","gw","stream","agg"],
   basic:["client","gw","stream","agg"],
+  deepDive:{
+    client:{
+      role:"The ad or browser that fires a compact click beacon. Thin, but it owns the single most consequential lever in the whole pipeline: the <strong><code>clickId</code></strong> minted <em>once</em> per user action and reused on every retry — that stable id is what makes exactly-once-ish counting possible downstream.",
+      capacity:[
+        ["Peak click rate","~10M/s","bursty; ~1M/s steady average"],
+        ["Event size","~100 bytes","tiny beacon, ~8.6 TB/day raw"],
+        ["Delivery","fire-and-forget","<code>navigator.sendBeacon</code>, never blocks navigation"],
+      ],
+      data:"Stateless. The only durable client artifact is the <code>clickId</code> generated at click time and cached for the lifetime of that action, so every retry of the same click carries the same id. If the client mints a fresh id per retry, dedup cannot collapse them and the advertiser is over-charged.",
+      scaling:[
+        "Fire-and-forget beacons with a tiny payload — no blocking, no client-side aggregation state.",
+        "Terminate at the nearest <strong>edge PoP via anycast</strong> so 10M tiny requests never all cross oceans.",
+        "Reuse connections — HTTP/2 or HTTP/3 keep-alive + TLS session resumption — so the origin never pays 10M full handshakes/s.",
+      ],
+      failures:[
+        {t:"A bug mints a new <code>clickId</code> per retry",b:"The 4 copies of one click look distinct — dedup can't tell them apart and the advertiser is billed 4x.",m:"Treat the <code>clickId</code> lifecycle as a hard SDK contract: generate once in the click handler, cache it, reuse for every retry; cover with tests and treat a regression as a billing incident."},
+        {t:"Beacon lost on a flaky network / gateway crash",b:"A real click could vanish before it lands durably.",m:"SDK retries with jitter always reusing the same <code>clickId</code>; at-least-once + downstream dedup makes the retry free."},
+      ],
+      tradeoffs:[
+        {a:"Fire-and-forget beacon",b:"Ack-after-Kafka + client retry",pick:"Analytics keeps fire-and-forget and accepts a sliver of loss; the billable stream confirms delivery in the background and re-sends — a per-stream lever, not one global choice."},
+      ],
+      probes:[
+        "A flaky mobile client retries one click 4 times — is that an over-count, and what invariant saves you?",
+        "10M mostly-new TLS handshakes/s from browsers — what reduces that load?",
+        "A bot clicks the ad — does it enter the billable count, and where is it removed?",
+      ],
+    },
+    gw:{
+      role:"The thin, stateless ingest tier. It validates schema, authenticates the source, enriches (server receive-time, geo from IP, <code>campaignId &rarr; advertiserId</code>), keys the event by <code>adId</code>, and produces to Kafka. Its consequential lever: <strong>whether to ack the client before or after Kafka durably accepts</strong> the event — fire-and-forget for analytics, ack-after-durable for billing.",
+      capacity:[
+        ["Per-instance throughput","~50K events/s","validate + enrich + produce"],
+        ["Fleet at peak","~200 instances","10M/s &divide; ~50K/s, plus headroom"],
+        ["Produce mode","batched + compressed async","<code>linger.ms</code> + <code>batch.size</code>, not 1 RTT/event"],
+      ],
+      data:"Stateless — all durable state lives in Kafka downstream, so any instance handles any event. The only in-memory state is a small, slow-changing <strong>campaign metadata cache</strong> (refreshed async) and the <strong>unacked producer buffer</strong>, which is volatile and lost if the pod dies.",
+      scaling:[
+        "Horizontal behind an L4 load balancer, autoscaled on produce-rate/CPU.",
+        "Batched, compressed, async produce so throughput isn't one round-trip per event.",
+        "Regional gateways behind anycast keep the fan-in local; on a cache miss attach the raw <code>campaignId</code> and enrich downstream rather than blocking on a DB.",
+      ],
+      failures:[
+        {t:"Pod SIGKILLed with events still in the producer buffer",b:"Those unacked, in-memory events are lost on that pod.",m:"For billing, don't ack the client until Kafka accepts (<code>acks=all</code>); the client re-sends the same <code>clickId</code> and dedup absorbs any duplicate — net no loss."},
+        {t:"Kafka unreachable ~15s during a leader election",b:"~75M events at 5M/s have nowhere to go.",m:"Bounded local spool bridges the blip and replays; if it fills, apply backpressure (retryable error) rather than silently dropping; client retry backstops the rest."},
+      ],
+      tradeoffs:[
+        {a:"Fire-and-forget produce",b:"Ack after Kafka durably accepts",pick:"Fire-and-forget is fastest but loses a crash's buffer; ack-after-durable adds a background confirm for the billable stream — chosen per stream, since money can't tolerate silent loss."},
+        {a:"Enrich campaign lookup inline",b:"Enrich downstream",pick:"In-process cache keeps enrichment on the hot path cheap; a miss defers to the stream layer so ingest never blocks on a DB call."},
+      ],
+      probes:[
+        "A deploy SIGKILLs a gateway holding buffered events — are those clicks gone, and does it matter?",
+        "Enrichment needs a campaign lookup — how do you avoid coupling the hot path to a DB?",
+        "Kafka is down for 15 seconds at 5M/s — where do the clicks go?",
+      ],
+    },
+    stream:{
+      role:"The durable event log (Kafka) between ingest and processing. It does three jobs: <strong>absorbs bursts</strong> (10M/s buffers instead of dropping), is <strong>replayable</strong> for recovery/backfill, and gives <strong>ordered per-key streams</strong>. Its defining lever is the partition key — <code>adId</code> gives cheap local aggregation but creates the hot-partition risk when one ad goes viral.",
+      capacity:[
+        ["Partitions","~120","~250K events/s each; ~40 floor rounded up for headroom + salting"],
+        ["Raw volume","~8.6 TB/day","86B events/day &times; ~100B"],
+        ["Hot retention","~180 TB","7-day window &times; RF3; older tiered to object storage"],
+      ],
+      data:"Partitioned by <code>adId</code> so every event for an ad is ordered in one partition and one consumer aggregates it locally with no cross-consumer shuffle. Durability from <strong>RF=3, <code>acks=all</code>, <code>min.insync.replicas=2</code></strong>. Consumer offsets are the only external state and must be checkpointed atomically with window state.",
+      scaling:[
+        "Over-provision partitions to ~2-3x peak (repartitioning a live topic is painful) with room for hot-ad salting.",
+        "<strong>Salt</strong> a viral ad across K sub-partitions (<code>adId#0..adId#K-1</code>) and recombine with two-stage aggregation; cold ads pay nothing.",
+        "Keep Kafka retention to the hot replay window and <strong>tier older raw events to object storage</strong> for the batch layer.",
+      ],
+      failures:[
+        {t:"A viral ad — 3M of 10M clicks/s on one <code>adId</code>",b:"One partition/consumer saturates and lags hours while the rest idle.",m:"Salt the hot key across K sub-partitions (~300K/s each), detected in seconds by a heavy-hitters / count-min sketch; two-stage combine sums the partials."},
+        {t:"A broker holding partition leaders dies mid-spike",b:"Potential loss of in-flight/acked events.",m:"RF=3 + <code>acks=all</code> + <code>min.insync.replicas=2</code> — an in-sync replica is promoted, no acked data lost; consumers resume from committed offsets."},
+        {t:"Replay re-delivers events already counted",b:"Double-count on recovery.",m:"Checkpoint window state and consumed offset atomically (or Kafka transactions), so replay from exactly the checkpointed offset applies each event once."},
+      ],
+      tradeoffs:[
+        {a:"Key by <code>adId</code>",b:"Random partitioning",pick:"adId keying gives ordered, local, per-ad aggregation (no shuffle); random balances perfectly but scatters an ad across every consumer and forces a merge per ad. adId wins, hot ads get salted."},
+        {a:"Kafka",b:"Kinesis / Pulsar",pick:"Kafka for per-partition throughput, replay, and the exactly-once ecosystem; Kinesis shard math (~1,000+ shards at ~1 GB/s) is punishing; revisit Pulsar if tiered-storage retention dominates cost."},
+      ],
+      probes:[
+        "Why land clicks in a log at all — why not have the gateway write counts straight to a DB?",
+        "At 10M/s how many partitions, and what does 7-day retention cost?",
+        "A broker dies mid-spike — are acked events lost, and can the aggregator recover without double-counting?",
+      ],
+    },
+    agg:{
+      role:"The stateful stream processor. It does <strong>tumbling 1-minute windowed aggregation</strong> keyed by <code>(adId, minute)</code>, keeps running counts (plus dim breakdowns) in local state, and emits per-ad counts to the OLAP store on window close. Its central lever: aggregate on <strong>event-time with a watermark and allowed-lateness grace</strong> — trading finalization delay + state for catching stragglers live.",
+      capacity:[
+        ["Per-task throughput","~200K events/s","stateful keyed windowed count"],
+        ["Tasks","~50, aligned to ~120 partitions","parallelism can't exceed partitions"],
+        ["Window state","single-digit GB/shard","~10M ads &times; ~15 open windows &times; ~50B"],
+        ["Grace period","~15 min","covers p99 of observed lateness"],
+      ],
+      data:"Local window state in RocksDB, checkpointed durably <em>together with</em> the consumed offset (à la Flink) and backed by a compacted changelog. Open state is bounded by the grace length — active ads &times; windows-in-grace — not unbounded.",
+      scaling:[
+        "Tasks ≈ partitions; to scale further raise partition count (with salting) rather than adding orphan tasks.",
+        "For skew (80% of clicks = top 0.1% of advertisers) apply the <strong>salted two-stage</strong> pattern — partial counts per salt, then a combine keyed by real <code>adId</code>.",
+        "Local pre-aggregation shrinks volume before any combine shuffle — only compact partials cross the network.",
+      ],
+      failures:[
+        {t:"Aggregator crashes mid-window holding in-memory counts",b:"A minute of counts for thousands of ads at risk of loss or double-count.",m:"Atomic state+offset checkpoint: a standby restores state as of the last checkpoint and replays from that same offset, applying each event exactly once."},
+        {t:"A deploy bug writes wrong counts for an hour",b:"Advertisers mis-billed off corrupted aggregates.",m:"Batch reconciliation recomputes authoritative counts from raw events and idempotently overwrites keyed <code>(adId, minute)</code>; billing reads finalized batch."},
+        {t:"Skewed load pins one task at 100% CPU",b:"A few hot tasks lag while the rest idle.",m:"Salt the hot key so load fans across K tasks; combine sums partials per minute within the freshness SLO."},
+      ],
+      tradeoffs:[
+        {a:"Longer grace",b:"Shorter grace",pick:"Longer catches more stragglers live but costs state and delays finalization; shorter finalizes fast but pushes more corrections to batch. Pick grace from the lateness distribution (cover p99)."},
+        {a:"Tasks = partitions",b:"Independent task scaling",pick:"In the Kafka consumer model parallelism can't exceed partitions — extra tasks sit idle; scale by raising partitions instead."},
+      ],
+      probes:[
+        "A click's event-time is 12:00:59 but it arrives at 12:20 — what happens to it?",
+        "The last checkpoint was at 12:00:20 and the task crashed at 12:00:30 — what happens to those 10 seconds?",
+        "How many tasks at 10M/s, and how much memory does the window state need?",
+      ],
+    },
+    olap:{
+      role:"The read-optimized, column-oriented store (Druid) holding pre-aggregated <code>(adId, minute)</code> rows advertisers query. Its defining lever: <strong>pre-aggregate at write time into time-partitioned immutable segments</strong>, so range + group-by scans stay sub-second and the batch layer corrects a bad window by atomically swapping segments.",
+      capacity:[
+        ["Write rate","~17K upserts/s steady","scales with active ads/min, not clicks; ~2M/s spike buffered"],
+        ["Read rate","~5K scan QPS","50K dashboard QPS cut ~90% by a result cache; p99 &lt; 1s"],
+        ["Rows/day","~1.44B minute-rows","~10M ads &times; dims (geo, device)"],
+        ["Cluster","~10 nodes","~20 TB (90d &times; RF2), storage-dominated"],
+      ],
+      data:"Key = <strong>(time-bucket, adId)</strong>; segments partitioned by time (minute&rarr;hour&rarr;day) so a range scan touches only in-window segments and old data drops whole segments. Columnar layout + ingest rollup make group-by cheap; a <code>batch_version</code> column lets the higher finalized version supersede the speed-layer write.",
+      scaling:[
+        "Buffer writes through a topic so the store <em>pulls</em> at its sustainable rate — a spike buffers in the log instead of overwhelming ingestion.",
+        "Separate query brokers from data nodes; brokers fan out to replicated historicals for read concurrency.",
+        "Multi-resolution rollups + tiering — recent minute-granularity hot, older hour/day rolled up, cold history tiered off the fast nodes.",
+      ],
+      failures:[
+        {t:"Write path can't keep up during a 2M/s spike",b:"Ingestion lag grows, dashboards go stale.",m:"Emit per-minute rollups (upserts scale with active ads), buffer via a topic and pull; near-real-time tolerates seconds of lag and billing reads batch, so it's a freshness blip not a correctness one."},
+        {t:"A data node holding recent segments dies",b:"Last few hours of aggregates at risk.",m:"Handed-off segments live in deep storage + RF≥2; replicated real-time tasks cover not-yet-handed-off data; Kafka replay of the aggregate topic is the last resort."},
+        {t:"Half the query nodes down during upgrade",b:"Queries risk silent partial sums — under-counting an advertiser.",m:"Brokers fan out to replicas (RF≥2) so survivors cover the dataset; if coverage can't be guaranteed, fail/flag with a coverage indicator or serve last-good cached rollup — never a confidently-wrong low number."},
+      ],
+      tradeoffs:[
+        {a:"Druid",b:"ClickHouse / Cassandra",pick:"Druid for time-partitioned segments + rollup + deep-storage durability that fits the lambda segment-swap; ClickHouse's merge-based upsert is awkward for idempotent overwrite; Cassandra is a point-read KV with no group-by engine."},
+        {a:"Minute granularity forever",b:"Multi-resolution rollups",pick:"Rollups make long-range queries cheap (30 day-rows vs 43,200 minute-rows) at the cost of fine detail on old data — keep minute for the recent window, roll up the tail."},
+      ],
+      probes:[
+        "Which OLAP store, and do the node math — give me a cluster size, not a vibe.",
+        "A data node with recent segments dies — are those aggregates gone forever?",
+        "Half the query fleet is down and a query might return a partial sum — what does the advertiser see?",
+      ],
+    },
+    dedup:{
+      role:"The idempotency stage between the log and counting. It keeps a <strong>seen-set of <code>clickId</code>s</strong> and drops any already seen, giving exactly-once-ish counting on an at-least-once log. Its key lever: dedup only needs a <strong>bounded TTL window</strong> in embedded, co-partitioned state — duplicates arrive close in time — with the batch layer as the authoritative backstop.",
+      capacity:[
+        ["Dedup window","~24h TTL","a retry arrives seconds-to-minutes later, not days"],
+        ["Window state","~29 GB/partition","86B ids &times; ~40B &divide; ~120 partitions on RocksDB"],
+        ["Exact hot set","~0.5 GB/partition","recent ~5 min: 5M/s &times; 300s &times; ~40B &divide; 120"],
+      ],
+      data:"Embedded <strong>RocksDB co-partitioned by key</strong> so a given <code>clickId</code> always routes to the same task — check-and-set is an O(1) on-box operation, no network hop. Backed by a compacted changelog so the seen-set survives crashes; older tail can use a bloom/cuckoo filter, recent hot window stays exact.",
+      scaling:[
+        "Scale with partition count — add partitions, add dedup capacity; no shared hot tier.",
+        "A <strong>bloom/cuckoo filter</strong> for the older tail cuts memory ~8-10x; exact set only for the recent high-value window.",
+        "Co-partition dedup with aggregation so it scales the same way the counting does.",
+      ],
+      failures:[
+        {t:"Local RocksDB lost on a crash before checkpoint",b:"The task forgets seen ids and re-admits duplicates it would have dropped.",m:"Restore the seen-set from the compacted changelog on restart, bounded by the same TTL window — it doesn't rebuild from nothing."},
+        {t:"Bloom-filter false positive",b:"A real click is wrongly dropped — an under-count (under-charge).",m:"Tune FPR very low, keep the recent window exact, and lean on the batch layer to re-dedup authoritatively from raw events — bloom is a speed optimization, never the source of truth for money."},
+        {t:"Crash after OLAP write but before offset commit",b:"Replay re-processes and the write double-counts.",m:"Kafka transactions bundling offset + output write, or an idempotent upsert keyed <code>(adId, minute)</code> with a monotonic version; prefer writing aggregates back to a topic transactionally."},
+      ],
+      tradeoffs:[
+        {a:"Embedded RocksDB",b:"Redis / Cassandra",pick:"Embedded co-partitioned state is an O(1) on-box check-and-set that scales with partitions; a remote seen-set means 10M network RTTs/s against a shared hot service — the bottleneck. Redis only if the set must be shared across independent consumers."},
+        {a:"Exact seen-set",b:"Probabilistic filter",pick:"Exact catches every dupe but costs state; a filter is cheap but risks under-counting via false positives — use exact for the recent hot window, filter for the tail, batch as backstop."},
+      ],
+      probes:[
+        "How do you dedup a firehose at 10M/s without the state store becoming the bottleneck?",
+        "Storing every <code>clickId</code> is terabytes and grows forever — bound it without letting dupes slip through.",
+        "A bloom filter has false positives that drop a real click — acceptable for billing?",
+      ],
+    },
+    batch:{
+      role:"The batch/serving layer of the <strong>lambda architecture</strong>. It periodically recomputes <em>authoritative</em> counts from the retained raw log — the ground truth — and idempotently overwrites the speed layer's approximate aggregates. Its lever: <strong>billing reads finalized batch, never the speed layer</strong>, so speed = timely-approximate and batch = eventually-exact.",
+      capacity:[
+        ["Full-day recompute","86B events","parallelized by hour + adId range (Spark/Parquet)"],
+        ["Steady-state work","just the late tail","incremental via correction markers, not all history"],
+        ["Raw retention","billing-dispute horizon","~90 days in object storage, well beyond Kafka's hot window"],
+      ],
+      data:"Reads immutable raw events; writes <strong>idempotent overwrites</strong> keyed <code>(adId, minute)</code> — it <em>sets</em>, never increments — stamped with a batch version/watermark, and the serving layer prefers the higher finalized version. Corrected windows are exposed via an atomic segment swap.",
+      scaling:[
+        "Parallelize the recompute by hour and <code>adId</code> range over columnar raw data in object storage — throughput scales with cluster size.",
+        "Incrementalize: only recompute windows flagged by correction markers (late data, bug range), since most finalized windows never change.",
+        "Reserve a full recompute for a known-bad range; steady-state batch is tiny.",
+      ],
+      failures:[
+        {t:"Batch job dies 60% through writing corrections",b:"Some keys corrected, some still bad — a mixed state.",m:"Idempotent overwrites keyed <code>(adId, minute, version)</code> make a rerun reproduce identical results; version isolation / atomic swap means readers never see the partial mix."},
+        {t:"Raw events aged out of Kafka before a late-found bug",b:"Can't recompute the affected window.",m:"Raw is tiered to object storage with retention set by the billing-dispute horizon (~90d); batch reads old ranges from there, not Kafka."},
+        {t:"Recompute lands on top of already-wrong numbers",b:"Would compound the error.",m:"Writes set (not increment) and a higher batch version deterministically supersedes; the bad window is replaced, not added to."},
+      ],
+      tradeoffs:[
+        {a:"Lambda (separate batch layer)",b:"Kappa (replay the stream)",pick:"Kappa avoids dual codebases by replaying raw through corrected streaming logic; lean kappa-style but keep this as the reconciliation path — a dedicated batch engine can be cheaper for huge historical recompute."},
+      ],
+      probes:[
+        "Kappa says drop the separate batch layer and just replay the stream — why keep batch?",
+        "Reconciling a day is 86B events and a nightly job can't finish — how do you keep it affordable?",
+        "Kafka retention is 7 days but the bug was found after 10 — the raw events aged out, now what?",
+      ],
+    },
+    query:{
+      role:"The stateless read API advertisers hit for dashboards. It translates requests into <strong>range + group-by scans</strong> over multi-resolution rollups, caches results, rate-limits, and labels recent buckets provisional. Its highest-leverage move: a short-TTL <strong>result cache</strong> that collapses 50K dashboard QPS into ~5K scan QPS on the brokers.",
+      capacity:[
+        ["Peak dashboard QPS","~50K","1M advertisers on auto-refresh"],
+        ["API pods","~13","~5K QPS each + ~30% headroom, across 3 AZs"],
+        ["Post-cache scan QPS","~5K","~90% result-cache hit rate"],
+        ["Last-24h query","~1,440 minute-buckets","summed in ms, never raw events"],
+      ],
+      data:"Stateless — the only state is a <strong>result cache</strong> keyed by <code>(query, time-bucket)</code> with a 15-30s TTL, plus optionally pre-materialized common shapes (per-advertiser daily/hourly totals). A query planner picks the coarsest rollup that answers the requested range.",
+      scaling:[
+        "Scale API pods horizontally (stateless); size for peak QPS while brokers are sized for the cache-miss rate + warm floor.",
+        "<strong>Pre-warm</strong> the top advertisers' common views — traffic is heavily skewed toward big spenders.",
+        "Multi-resolution rollups keep every query bounded regardless of range (30 day-rows for a 30-day view).",
+      ],
+      failures:[
+        {t:"100K advertisers auto-refresh — 50K identical repeated reads",b:"OLAP brokers strain under duplicate scans.",m:"Result cache keyed by (query, time-bucket) with a short TTL + pre-materialized common shapes collapses ~90% of reads into lookups."},
+        {t:"OLAP store unreachable for 2 minutes during upgrade",b:"Every dashboard query errors, advertisers see a broken page.",m:"Circuit breaker serves last-good cached rollups labelled as-of a timestamp; uncached queries return a clear degraded response with retry-after — never a fabricated number."},
+        {t:"Dashboard count differs from the invoice for 12:00",b:"Advertiser confusion / distrust.",m:"Dashboard reads the provisional speed layer, invoice reads finalized batch; label recent buckets provisional and visibly settle them to final — recency from speed, money from batch."},
+      ],
+      tradeoffs:[
+        {a:"Short cache TTL",b:"Always-fresh reads",pick:"A 15-30s TTL cuts read load by orders of magnitude within the near-real-time expectation; underlying data only advances a minute at a time, and the freshness timestamp keeps it honest."},
+        {a:"Size brokers for full 50K QPS",b:"Size for cache-miss + warm floor",pick:"Scan nodes are far pricier than stateless pods; size brokers for miss traffic + a warm floor and pre-warm the skewed top advertisers so a cache blip degrades gracefully."},
+      ],
+      probes:[
+        "100K advertisers keep dashboards on auto-refresh — 50K QPS of mostly identical reads. Cut the load.",
+        "The OLAP store is down for 2 minutes — improve the experience instead of erroring.",
+        "The dashboard number and the invoice for 12:00 disagree — why, and which do you show where?",
+      ],
+    },
+  },
   dbDoc:{
     component:"OLAP / aggregate store",
     load:"Writes are per-<code>(ad_id, minute)</code> upserts, so they scale with <strong>active ads/minute</strong>, not clicks: ~1M ads active/min &approx; <strong>~17K upserts/s</strong> steady, bursting toward ~2M/s during a spike (buffered through a topic). Reads: ~50K advertiser dashboard QPS at peak, cut to <strong>~5K scan QPS</strong> after a result cache, each a range + group-by over minute-buckets with p99 &lt; 1s. Time-series cardinality ~10M distinct ads &times; dims (geo, device) over ~1.44B minute-rows/day.",

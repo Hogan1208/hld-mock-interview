@@ -18,6 +18,242 @@ window.DATA['ticketmaster'] = {
   edges:[["client","gw","HTTP"],["gw","booking","reserve"],["booking","db","lock seat"],["booking","cache","seat map"],["gw","queue","throttle"],["booking","payment","charge"],["gw","search","browse"]],
   core:["client","gw","booking","db"],
   basic:["client","gw","booking","db"],
+  deepDive:{
+    client:{
+      role:"The web/app that browses the seat map and drives reserve → pay. Thin, but owns the lever: treat availability as an <em>optimistic hint</em> and the <strong>reserve response as the only truth</strong>, plus a client-generated <strong>idempotency key</strong> that makes flaky-network retries safe.",
+      capacity:[
+        ["Seat-map polls","~500K/s at peak","1M clients polling ~every 2s"],
+        ["Hold countdown","~10 min","server-returned expiry timestamp"],
+        ["Read:write","~100:1","map views dwarf reserves"],
+      ],
+      data:"Stateless view of server truth. Holds only a <strong>reservation token</strong> + expiry and an idempotency key — never authority over a seat. The DB owns seat state; the client repaints from the reserve response (<code>409</code> greys the seat out).",
+      scaling:[
+        "Serve the seat map from a <strong>CDN/edge cache</strong> (1–2s TTL) so a million viewers collapse to a trickle of origin fetches.",
+        "Replace tight polling with server-push (SSE/WebSocket) or <strong>jittered backoff</strong> so clients don't align on one tick.",
+        "Reuse the same idempotency key on retry so a duplicate reserve returns the same hold.",
+      ],
+      failures:[
+        {t:"Reserve request times out",b:"User doesn't know if the hold succeeded and taps again.",m:"Idempotency key: the retry returns the same reservation instead of a second hold or a 409."},
+        {t:"Two clients tap 14A a millisecond apart",b:"Both saw it green.",m:"The DB serializes; the loser gets a clean 409 and the client repaints + suggests the nearest seat."},
+        {t:"User abandons a successful hold",b:"Seat looks taken.",m:"Nothing needed client-side — the 10-min TTL auto-expires the hold."},
+      ],
+      tradeoffs:[
+        {a:"Stale (1–2s) seat map",b:"Live seat map",pick:"Stale wins: a few wasted clicks + 409s beats putting a 500K/s read stampede on the inventory DB you must protect for writes."},
+      ],
+      probes:[
+        "Reserve times out after 8s and the user taps again — how do you avoid two holds?",
+        "The cached map says 14A is free but it sold 1s ago — what does the client experience?",
+        "Why is holding a reservation token a fact but seeing a seat green only a hint?",
+      ],
+    },
+    gw:{
+      role:"The edge: TLS, auth, validation, and <strong>rate limiting</strong>. It separates the fat anonymous read path (<code>GET seatmap</code>, cacheable) from the scarce authenticated write path (<code>POST reserve</code>, per-user limited), and gates reserve behind a valid <strong>waiting-room admission token</strong> so the DB never sees the raw stampede.",
+      capacity:[
+        ["Steady browse","~10K req/s","baseline"],
+        ["On-sale polls","~330K/s","1M users ~every 3s; edge serves ~95% → ~17K origin"],
+        ["Origin mix","~32K/s","browse + admitted reserve ~5K"],
+        ["Nodes","~5 (warm floor)","~10K req/s each, +30%, 3 AZs"],
+      ],
+      data:"Stateless. Validates admission tokens and idempotency keys, terminates TLS, and routes; no session affinity so any node serves any request. Correctness lives in the inventory DB, not here.",
+      scaling:[
+        "Let the CDN/edge answer most seat-map reads; origin is a miss fallback.",
+        "Per-user (and per-IP, per-payment-instrument) rate-limit reserve to stop bot inventory-hoarding.",
+        "Warm floor sized for the edge-working case + autoscale on request rate.",
+        "The waiting room caps how much reserve traffic ever reaches origin.",
+      ],
+      failures:[
+        {t:"Bot fires 1,000 reserve/s to lock a section",b:"Real fans denied inventory.",m:"Per-user/IP/payment-instrument limits + bot detection at the edge, before a request touches inventory."},
+        {t:"Edge cache is cold or bypassed",b:"Gateway eats the full ~330K/s — a 7× swing to 35+ nodes.",m:"The real lever is edge hit-ratio; keep a warm floor and lean on the waiting room to cap reserve traffic."},
+        {t:"TLS cert expires",b:"Total handshake failure.",m:"Automated rotation with early expiry alarms."},
+      ],
+      tradeoffs:[
+        {a:"Rate-limit at the edge",b:"In the service",pick:"Edge stops abuse before it costs app/DB capacity; service-level is a per-user fairness backstop."},
+        {a:"Provision for cold edge",b:"Trust autoscale",pick:"Warm floor + waiting-room cap beats sizing for the cold-edge 35-node worst case; cost is some idle capacity."},
+      ],
+      probes:[
+        "A <code>GET seatmap</code> and a <code>POST reserve</code> both hit here — what does the gateway do to each?",
+        "Why rate-limit reserve per user specifically — what abuse are you stopping?",
+        "At the on-sale second, what actually keeps the gateway from seeing the raw million?",
+      ],
+    },
+    booking:{
+      role:"Stateless orchestrator of reserve → pay → confirm. Owns the concurrency lever: the reserve is an <strong>atomic conditional write</strong> the DB serializes, and the flow is a small <strong>saga</strong> with the hold TTL as a backstop so no seat is ever double-sold or stuck.",
+      capacity:[
+        ["Admitted concurrency","~5K checkouts","set by the waiting room"],
+        ["Op rate","~2–3K short ops/s","reserve + confirm over a ~3-min window"],
+        ["Nodes","~3–5","~1K ops/s each, across AZs"],
+        ["Lock held","milliseconds","never across the pay step"],
+      ],
+      data:"Stateless; seat truth lives in the DB. It persists a durable <code>booking_saga</code> (<code>RESERVED → CHARGING → CONFIRMED/COMPENSATED</code>) so a recovery worker can resolve any stuck flow. Reserve never holds a DB lock across the slow external charge.",
+      scaling:[
+        "Default to an optimistic conditional <code>UPDATE ... WHERE status='AVAILABLE'</code> — no lock held across a round trip.",
+        "Split reserve (HELD + TTL) from pay so locks stay millisecond-scale.",
+        "Size to the admission ceiling, not the 1M stampede.",
+        "Keep it a touch over the admission rate so the DB/payment ceilings are the governor, not booking.",
+      ],
+      failures:[
+        {t:"Pod SIGKILLed after flipping a seat to HELD",b:"Hundreds of ghost holds during an on-sale.",m:"Each HELD row carries <code>hold_expiry</code>; reserve treats <code>HELD AND hold_expiry &lt; now</code> as claimable — self-expiring, no live process needed."},
+        {t:"Reaper (hold sweeper) crashes for 20 min",b:"Expired holds linger on the seat map.",m:"Release is lazy + DB-enforced, so seats are reclaimed on the next reserve attempt regardless; the reaper only improves map freshness."},
+        {t:"Payment succeeds but booking never hears back",b:"Sold-but-unconfirmed or paid-but-no-seat.",m:"Durable saga + idempotent charge: a recovery worker re-queries by idempotency key and drives to a terminal state."},
+      ],
+      tradeoffs:[
+        {a:"Optimistic conditional write",b:"Pessimistic SELECT FOR UPDATE",pick:"Conditional write degrades better on a hot seat (no lock queue); FOR UPDATE is cleaner when a reservation spans multiple seats that must all succeed atomically."},
+        {a:"Reserve-then-pay saga",b:"Charge inside the reserve txn",pick:"Saga keeps locks in milliseconds; charging inside the txn holds a row lock across seconds of human think-time and melts the DB."},
+      ],
+      probes:[
+        "Two reserves for 14A arrive within a millisecond — exactly how does only one win?",
+        "The pod dies the instant after flipping 14A to HELD — how does the seat come back?",
+        "Payment times out after reserve — did they pay, and who resolves it if booking also crashes?",
+      ],
+    },
+    db:{
+      role:"The single source of truth for seat state — a strongly-consistent relational/NewSQL store. The lever it owns: enforcing <strong>one-seat-one-order</strong> under concurrency via ACID transactions + row-level locking. Tiny data; the scarce resource is correctness, not throughput or bytes.",
+      capacity:[
+        ["Data","~100MB/event","~100K seats × ~1KB; 10K events ≈ ~1TB"],
+        ["Peak writes","~5–10K/s","single-row conditional, bounded by admission"],
+        ["True contention","tiny slice","only same-hot-seat writes conflict"],
+        ["Replicas","3 across AZs","quorum-acked writes"],
+      ],
+      data:"PK <code>(event_id, seat_id)</code>; secondary index <code>(event_id, status)</code> renders the map and lets the reaper sweep. Correctness = the DB serializing writers on a row: exactly one conditional <code>UPDATE</code> matches AVAILABLE; the loser affects zero rows and gets a 409. Reads offloaded to the seat-map cache.",
+      scaling:[
+        "Partition a hot event's 100K seats across nodes/partitions — one hot event becomes many warm partitions.",
+        "The waiting room bounds the write rate the DB ever sees.",
+        "Read replicas + seat-map cache keep the huge read load off the write path.",
+        "NewSQL (CockroachDB/Spanner) for managed horizontal scale + built-in failover.",
+      ],
+      failures:[
+        {t:"A shard's disk dies",b:"Seat state + confirmed orders for 60K attendees at risk.",m:"Replica group across AZs with synchronous quorum-acked writes; a paid ticket isn't confirmed until durably committed."},
+        {t:"Write-primary crashes, old primary rejoins",b:"Split-brain could sell 14A to two buyers.",m:"Consensus promotion grants a monotonic epoch; replicas fence writes carrying a stale epoch — never two authorities."},
+        {t:"One event's 100K rows take all reserve traffic",b:"Sharding by event pins one shard.",m:"Sub-partition by (event_id, seat_id)/seat block so load spreads across distinct rows."},
+      ],
+      tradeoffs:[
+        {a:"Strongly-consistent relational/NewSQL",b:"Cassandra / Dynamo",pick:"Relational wins: ACID spanning seat + order and row-level locking are native. A stale eventually-consistent replica can double-sell — you won't trade a correctness property for throughput you don't need."},
+        {a:"Synchronous quorum writes",b:"Async replication",pick:"Quorum costs a few ms per reserve but guarantees a confirmed order survives a node loss — the right trade for scarce, precious writes."},
+      ],
+      probes:[
+        "Data is ~100MB — so why is the datastore choice hard at all?",
+        "The write-primary fails mid-sale and you promote a replica — how do you avoid overselling on failover?",
+        "One mega on-sale concentrates all writes on one event's rows — keep writes moving without double-selling.",
+      ],
+    },
+    queue:{
+      role:"The virtual waiting room: a load shedder that converts an unbounded arrival spike into a bounded, steady <strong>admission rate</strong> the backend can absorb. The lever it owns: peak DB load becomes a constant you choose, independent of demand. Advisory, never the source of truth.",
+      capacity:[
+        ["Joins","~100K/s","1M arrivals in ~10s"],
+        ["Queued state","~200 B/user","1M ≈ ~200MB; 5M ≈ ~1GB in one Redis node"],
+        ["Active pool","~5K admitted","matched to backend capacity"],
+        ["Admission token TTL","a few min","tied to the seat-hold window"],
+      ],
+      data:"A Redis sorted set keyed by arrival timestamp gives live positions + atomic admit; a durable append log records admissions so a failover rebuilds who was let in. No seat/order state lives here — a wipe can't corrupt inventory.",
+      scaling:[
+        "Joins are cheap appends across stateless nodes fronting a partitioned counter.",
+        "Serve position polls from a cache/CDN — one 'admitted through position N' value everyone reads.",
+        "Only the admission rate matters downstream, so a 1M or 5M on-sale look identical to the DB.",
+        "Memory is trivial (~1GB); scale for throughput + HA, not capacity.",
+      ],
+      failures:[
+        {t:"Queue store fails over and loses recent state",b:"Positions in question for 1M users.",m:"Replicated cluster + durable admission log; rebuild positions from token timestamps. Fail safe on correctness, degraded on fairness."},
+        {t:"Dispatcher hangs — nobody admitted",b:"500K frozen in line, inventory unsold.",m:"Leader-elected redundant dispatchers on durable watermark state; alert when admissions=0 while queue non-empty + backend has headroom."},
+        {t:"Dispatcher recovers with a backlog",b:"Temptation to burst-admit and swamp the DB.",m:"Resume at the same safe steady rate — a longer line, never a compensating flood."},
+      ],
+      tradeoffs:[
+        {a:"Redis sorted set + durable log",b:"Kafka alone / SQS alone",pick:"SQS gives no stable position; Kafka can't cheaply answer 'my position now'. Pair a fast in-memory position store with a durable admission log for real-time UX + crash-safe fairness."},
+      ],
+      probes:[
+        "Mechanically, how does a user go from 'in line' to 'allowed to reserve' — be concrete about tokens.",
+        "The queue store fails over and loses positions — what do you protect and what do you sacrifice?",
+        "On dispatcher recovery, why not admit faster to catch up?",
+      ],
+    },
+    cache:{
+      role:"A Redis tier serving the seat-map read path (and reservation locks/queue via its data structures). The lever it owns: absorb the ~500K/s display reads so the inventory DB is reserved for the sacred writes. The map is a <em>display hint</em>; exactness only ever comes from the DB at reserve.",
+      capacity:[
+        ["Seat state","~50 B/seat","100K-seat event ≈ ~5MB; thousands of events ≈ a few GB"],
+        ["Hot event","~450K reads/s","~90% of read traffic on one key"],
+        ["TTL","1–2s","short; re-checked at reserve"],
+      ],
+      data:"Read-through with event-driven updates: each reserve/release publishes a seat-state change so the map converges within ~1s. It's derived + eventually consistent by contract; a stale entry causes a harmless 409, never a double-sell. Biased to publish 'taken' fast, 'freed' as it converges.",
+      scaling:[
+        "Replicate the hot key across N nodes (<code>seatmap:42#1..#N</code>); clients read a random replica.",
+        "Serve the map from CDN/edge (1–2s TTL) — the biggest lever, since it's the same for everyone.",
+        "Single-flight/request-coalescing so one miss per map hits the DB.",
+        "Serve reads from DB read replicas, never the write-primary.",
+      ],
+      failures:[
+        {t:"Cache node restarts empty mid-sale",b:"100% of ~450K reads/s miss through to the inventory DB, starving reserve writes.",m:"Coalescing + replicated cluster (fail over to a warm replica) + pre-warm the hot event + jittered TTLs + edge last-good copy."},
+        {t:"Hot key pins one node",b:"One node at 100% CPU while others idle.",m:"Replicate the hot key + edge caching spread the fan-out; staleness contract already tolerates N copies."},
+        {t:"Reader under duress",b:"Read surge threatens the DB.",m:"Shed/slow seat-map reads (display only); never shed the reserve write path."},
+      ],
+      tradeoffs:[
+        {a:"Redis",b:"Memcached",pick:"Redis: needs atomic <code>SET NX EX</code> locks, sorted-set queues, and pub/sub for map updates in one store — worth giving up Memcached's slight raw-KV edge."},
+        {a:"Cache display, exact at reserve",b:"Strongly-consistent live map",pick:"A live map for 1M viewers puts the read stampede on the DB; stale-read/exact-write costs only wasted clicks."},
+      ],
+      probes:[
+        "Inventory must be exact — isn't a cached seat map a lie that causes double-sells? Draw the line.",
+        "The cache node restarts empty at peak — walk the blast radius and containment.",
+        "One event is 90% of reads — how do you unpin that single hot node?",
+      ],
+    },
+    payment:{
+      role:"Wraps the third-party charge processor, called <em>outside</em> any DB lock. The lever it owns: <strong>idempotent</strong> charges + reconciliation so a timeout is treated as <em>unknown</em>, never guessed — money-in strictly precedes seat-gone, and no charge is kept for a seat that couldn't be delivered.",
+      capacity:[
+        ["End-of-hold burst","~5K charges in seconds","admitted buyers submit together"],
+        ["Gateway round-trip","~1–2s","external, rate-limited, occasional 503"],
+        ["In-flight","~250","to clear 5K in ~30s at ~1.5s each"],
+        ["Workers","a small I/O-bound pool","not a big fleet"],
+      ],
+      data:"Each charge carries an <strong>idempotency key</strong> so retries never double-charge. State lives in the booking saga; on success booking flips HELD→SOLD, on failure/timeout the hold expires. Charge intents are enqueued on a durable path drained at the gateway's rate.",
+      scaling:[
+        "Enqueue charge intents; a worker pool drains at a rate the gateway accepts, with retries + exponential backoff on 503.",
+        "Backpressure from payment up to the waiting room so you never admit more buyers than you can charge in a hold window.",
+        "Idempotent retries make the async path safe.",
+        "Size workers to the gateway ceiling — they're I/O-bound waiters.",
+      ],
+      failures:[
+        {t:"Charge call times out after 30s",b:"Unknown whether they paid; user on a spinner.",m:"Query/retry by idempotency key; seat stays HELD while reconciling; fate follows the confirmed payment truth."},
+        {t:"Charge lands one second after the hold expired",b:"Money taken, seat gone.",m:"Re-assert the hold via conditional write before SOLD; if reclaimed, void/refund via saga compensation; small grace buffer shrinks the window."},
+        {t:"On-sale charge surge hits a rate-limited gateway",b:"503s could drop sales.",m:"Async durable queue smooths the burst; slow admission rather than let holds expire mid-charge."},
+      ],
+      tradeoffs:[
+        {a:"Async queued charges",b:"Fire all 5K at the gateway",pick:"Queue + backoff respects the gateway's limit and turns a 503 into a short delay; bursting drops charges. User sees 'processing' while the hold protects the seat."},
+      ],
+      probes:[
+        "The seat is HELD, the charge call times out — did they pay, and do they get the seat?",
+        "The charge succeeds but the hold expired 1s earlier — untangle it without double-selling.",
+        "5K buyers submit cards at once into a rate-limited gateway — don't drop sales.",
+      ],
+    },
+    search:{
+      role:"Read-optimized discovery (Elasticsearch-style inverted index) over event metadata. The lever it owns: being <strong>eventually consistent and fully decoupled</strong> from inventory, so a browse spike never competes with booking and search being down is a discovery outage, not a sales outage.",
+      capacity:[
+        ["Query rate","~50K/s steady","spikes on a marquee announcement"],
+        ["Index size","a few GB","few million events × ~1KB"],
+        ["Nodes","~10","~5–10K q/s each + replicas for HA"],
+        ["Freshness lag","seconds","tunable by consumer parallelism"],
+      ],
+      data:"Its own replicated/sharded index, fed <strong>asynchronously via change-data-capture</strong> from the catalog + inventory event stream — push, not pull. Approximate availability for discovery; nothing here can cause a double-book. Rebuildable from the durable stream.",
+      scaling:[
+        "Replicate + shard the index; scale query throughput by adding read replicas.",
+        "CDN-cache popular query pages ('concerts in Chicago') with a short TTL.",
+        "Reads its own index → zero queries on the strongly-consistent core.",
+        "CDC consumers apply updates; freshness flows push, buffering naturally.",
+      ],
+      failures:[
+        {t:"Search cluster down 15 min",b:"Discovery outage.",m:"Not a sales outage — direct event links still load the map, reserve, and pay; buying never touches search."},
+        {t:"Uncached query during the outage",b:"Blank error.",m:"Fall back to CDN last-good pages + a static trending/featured list; soft 'search temporarily limited' banner."},
+        {t:"Index drifts or corrupts",b:"Stale/incorrect discovery results.",m:"Rebuild from the durable catalog + event stream — it's a rebuildable read model, no source-of-truth loss."},
+      ],
+      tradeoffs:[
+        {a:"Elasticsearch-style index",b:"Postgres full-text",pick:"ES for relevance ranking, facets, typo tolerance, and independent read scaling on a primary high-QPS spiky workload; Postgres full-text is fine only for a small catalog where search is secondary."},
+        {a:"Eventually consistent search",b:"Read live inventory",pick:"Eventual keeps discovery's huge spiky reads off the core; a stale 'available' badge just yields an empty seat map, never a double-book."},
+      ],
+      probes:[
+        "Search shows 'available' but it sold out 30s ago — bug or by design?",
+        "How does the index stay current without querying inventory to refresh it?",
+        "Search is down during a live on-sale — can users still buy?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Inventory DB",
     load:"~5-10K single-row conditional writes/s at peak on-sale, spread across one event's ~100K distinct seat rows; the truly contended rate (two buyers on the same hot seat) is a tiny slice. Data is trivial — ~100K seats × ~1KB ≈ 100MB/event. The scarce resource is <strong>correctness under concurrency</strong> (one-seat-one-order), NOT raw throughput or bytes: every candidate below can physically serve this write rate.",
