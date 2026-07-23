@@ -18,6 +18,237 @@ window.DATA['url'] = {
   edges:[["client","lb","HTTP"],["lb","svc","route"],["svc","db","write"],["svc","cache","read"],["cache","db","on miss"],["svc","key","get id"],["db","replica","replicate"],["svc","analytics","async"]],
   core:["client","lb","svc","db"],
   basic:["client","lb","svc","db"],
+  deepDive:{
+    client:{
+      role:"The browser or app that <strong>creates</strong> links (<code>POST /shorten</code>) and, far more often, <strong>follows</strong> them (<code>GET /aX9bQ</code> → HTTP redirect). It's thin, but it's where the single most consequential design lever lives: whether the redirect is a cacheable <code>301</code> or an always-revalidated <code>302</code>, which decides how much traffic ever reaches you.",
+      capacity:[
+        ["Read:write mix","~100:1","clicks vastly outnumber creates"],
+        ["301 cached hop","0 origin hits after 1st","browser/CDN answer locally"],
+        ["302 hop","every click → origin","required to count clicks"],
+      ],
+      data:"Stateless. The only durable client-side artifact is a <strong>cached redirect</strong>: a <code>301</code> is stored by the browser (and any intermediary) with the mapping baked in. That cached copy is <em>outside your control</em> — you cannot invalidate it — which is why 301 and mutable/deletable links are fundamentally in tension.",
+      scaling:[
+        "Push the redirect decision to the <strong>edge</strong>: a <code>301</code> with a long <code>Cache-Control</code> means most clicks are served by the browser/CDN and never cost you anything.",
+        "Keep the create call small and idempotent so retries on flaky mobile networks don't mint duplicate keys (idempotency key on <code>POST /shorten</code>).",
+      ],
+      failures:[
+        {t:"Stale 301 after the link changes/expires",b:"Clients keep redirecting to the old destination for as long as their cache lives — you can't recall it.",m:"Use <code>302</code> for any link that may change/expire/be revoked; reserve <code>301</code> for immutable, permanent links. This is a per-link decision, not global."},
+        {t:"Client retries a create that actually succeeded",b:"Duplicate rows / wasted keys, or a double-charged custom alias.",m:"Idempotency key per create; server dedupes and returns the original short URL."},
+      ],
+      tradeoffs:[
+        {a:"301 (permanent)",b:"302 (found)",pick:"301 maximizes cache/latency but loses click counts and can't be recalled; 302 guarantees you see every hit at the cost of origin load."},
+      ],
+      probes:[
+        "You returned a 301, then the user deletes the link. What does a click do now, and whose fault is it?",
+        "How do you stop a flaky mobile client from creating three links when it retries one <code>POST /shorten</code>?",
+        "If analytics is the product, which redirect code do you pick and what does that do to your origin traffic?",
+      ],
+    },
+    lb:{
+      role:"The edge tier. The <strong>load balancer</strong> spreads connections across healthy service instances (health-check ejection); the <strong>gateway</strong> owns cross-cutting concerns: TLS termination, auth/API-keys, request validation, and <strong>rate limiting</strong>. Creates are authenticated + throttled (expensive, abuse-prone); redirects are anonymous and should be made as cheap as possible — ideally answered at the edge before touching an app server.",
+      capacity:[
+        ["Redirect rate","~116K rps sustained","peak 3–5× on viral spikes"],
+        ["Create rate","~1,160 rps","cheap to rate-limit hard"],
+        ["TLS","terminated at edge","offloads crypto from app fleet"],
+      ],
+      data:"Stateless by design — no per-request state lives here, which is what lets you add/remove LB nodes freely. Session affinity is deliberately avoided so any instance can serve any request.",
+      scaling:[
+        "Horizontally redundant, connection-based — scale by adding nodes behind <strong>anycast / GeoDNS</strong>.",
+        "Terminate TLS and enable HTTP keep-alive so the app fleet isn't paying handshake cost 116K times/s.",
+        "Serve the redirect from a <strong>CDN/edge cache</strong> so the LB+app path is a fallback for misses, not the hot path.",
+      ],
+      failures:[
+        {t:"An LB node dies",b:"Its in-flight connections drop; clients see resets until DNS/anycast re-homes them.",m:"N+1 redundancy, short health-check intervals, connection draining on planned removal; anycast withdraws the dead node's route in seconds."},
+        {t:"A backend instance is unhealthy but still 'up'",b:"A fraction of requests hit a bad instance and error/time out.",m:"Active health checks + <strong>outlier detection</strong> (eject on rising 5xx/latency), plus retries with budget to a different instance."},
+        {t:"TLS certificate expires",b:"Every client fails the handshake — total outage, not degradation.",m:"Automated cert rotation with expiry alarms well before the deadline."},
+      ],
+      tradeoffs:[
+        {a:"L4 (TCP)",b:"L7 (HTTP)",pick:"L4 is cheaper/faster and protocol-agnostic; L7 lets the gateway route by path, rate-limit, and cache — worth it here because create vs redirect need different treatment."},
+        {a:"Rate-limit at the edge",b:"Rate-limit in the service",pick:"Edge stops abuse before it costs you app capacity; service-level is a backstop for per-user fairness."},
+      ],
+      probes:[
+        "A <code>POST /shorten</code> and a <code>GET /aX9bQ</code> both land here — trace exactly what the gateway does to each.",
+        "How do you eject a backend that's up but returning 5xx, without flapping?",
+        "Traffic 10×'s in a minute from one viral key — what in this tier fails first, and what absorbs it?",
+      ],
+    },
+    svc:{
+      role:"The stateless shortener service. On <strong>create</strong>: validate the URL, obtain a unique key (from key-gen), persist <code>key → {long_url, owner, created_at, expiry}</code>, warm the cache, return the short URL. On <strong>redirect</strong>: read-through the cache, fall back to a replica/DB on a miss, return the redirect, and fire an async click event. All heavy state lives elsewhere so any instance can serve any request.",
+      capacity:[
+        ["Instances","autoscaled on rps","each handles a slice of 116K reads/s"],
+        ["Per-request work (read)","1 cache GET (hit)","~O(1), no joins"],
+        ["ID block held in memory","e.g. 1,000 ids","leased from key-gen, burned locally"],
+      ],
+      data:"Effectively stateless. The only in-memory state is a <strong>leased block of IDs</strong> for fast local key minting — and it's intentionally disposable: if an instance dies with 400 ids unused, those ids are simply skipped. Gaps in the id space are harmless because keys carry no meaning.",
+      scaling:[
+        "Stateless → scale out horizontally and autoscale on request rate; no coordination between instances.",
+        "Keep the redirect path to a single cache lookup; never do a synchronous analytics write on it.",
+        "Lease ID blocks so key minting needs zero per-create coordination.",
+      ],
+      failures:[
+        {t:"Instance crashes mid-create",b:"The client's create may fail; the leased ID block is lost.",m:"Client retries (idempotent) and hits another instance; lost ids are acceptable gaps. Nothing durable was owned by the dead instance."},
+        {t:"A slow dependency (DB/cache) backs up",b:"Threads pile up, the instance stops serving redirects too.",m:"Per-dependency timeouts, circuit breakers, and bulkheads so a slow write path can't starve the fast read path."},
+      ],
+      tradeoffs:[
+        {a:"Read-through cache in the service",b:"Cache-aside in the client",pick:"Service-side keeps clients dumb and centralizes the miss/populate logic; the service owns correctness."},
+        {a:"Stateless service",b:"Sticky sessions",pick:"Stateless wins — trivial scaling and failover; there is no per-user session worth pinning for a redirect."},
+      ],
+      probes:[
+        "What state is the service allowed to hold, and what must never live here?",
+        "The DB write path gets slow — how do you keep redirects fast anyway?",
+        "An instance dies holding a block of 1,000 ids — what happens to those ids, and does it matter?",
+      ],
+    },
+    db:{
+      role:"The source of truth for <code>short_key → long_url</code>: a horizontally-sharded, hash-partitioned KV / wide-column store. Every read and write is a single-key point lookup — no joins, no range scans. Sized by <strong>storage</strong> (~90TB raw, ~270TB replicated), not read QPS, because the cache and replicas absorb the read fan-out.",
+      capacity:[
+        ["Rows","~180B mappings","100M/day × 365 × 5y"],
+        ["Raw storage","~90 TB","~500 B/row"],
+        ["Replicated","~270 TB","×3 replication"],
+        ["Nodes (storage-bound)","~135","270TB ÷ ~2TB usable/node"],
+        ["Write rate","~1,160 wps","peak ~5K"],
+      ],
+      data:"Primary key <code>short_key</code>, <strong>hash-partitioned</strong> so every access resolves to one partition in O(1). Custom-alias uniqueness uses a <strong>conditional write</strong> (put-if-absent / LWT) — the one place strong consistency is required. Expiry is a lazily-reclaimed <code>TTL</code> attribute, never a scan. A reverse index on <code>hash(long_url)</code> for dedupe would double write cost and risk a hot partition, so it's skipped unless dedupe is a hard requirement.",
+      scaling:[
+        "Add nodes → the hash ring rebalances; no manual resharding.",
+        "Counter-derived keys hash to different partitions, so writes spread evenly (no monotonic-key hotspot).",
+        "Reads are mostly served by cache + replicas; the primary sees writes + cold misses only.",
+      ],
+      failures:[
+        {t:"A shard node loses its disk",b:"Up to ~22B mappings on that node — catastrophic if it were a single copy.",m:"Every shard is a replica group (≥3 nodes across AZs) with quorum writes; a lost replica rebuilds from the others, zero data loss."},
+        {t:"A single key goes viral (hot partition)",b:"One partition saturates while the rest idle.",m:"The CDN/cache absorb reads of a hot immutable key; for hot <em>writes</em>, salt/split the key. Here reads dominate, so caching is the answer."},
+        {t:"Custom-alias race (two users, same alias)",b:"Double-booked alias / lost write.",m:"Conditional write (put-if-absent) — exactly one succeeds, the other gets a clean 409."},
+      ],
+      tradeoffs:[
+        {a:"KV / wide-column (Dynamo/Cassandra)",b:"Relational (Postgres)",pick:"KV wins: pure point lookups, linear horizontal write-scale, TTL, conditional writes. Relational tops out on single-primary write throughput and forces manual sharding at 270TB."},
+        {a:"Strong (conditional) writes",b:"Eventual",pick:"Strong only where needed (alias uniqueness); everything else tolerates eventual because mappings are immutable."},
+      ],
+      probes:[
+        "Why a KV store over a relational DB with an auto-increment PK — be specific about where relational breaks.",
+        "How do you guarantee two users can't claim the same custom alias?",
+        "What makes a partition hot here, and does it matter given the workload is reads of immutable data?",
+        "How is expiry implemented without ever scanning the table?",
+      ],
+    },
+    cache:{
+      role:"A Redis tier in front of the DB that serves the redirect hot path. The workload is read-dominated (100:1) and <strong>heavily skewed</strong> (a few links get most clicks), so a high hit ratio collapses DB read load. Because mappings are <strong>immutable</strong>, cached entries never go stale — long TTLs, no invalidation logic.",
+      capacity:[
+        ["Hit ratio","~95%","skewed access, hot links stay resident"],
+        ["DB reads after cache","116K → ~5.8K rps","95% absorbed"],
+        ["Eviction","LRU","matches skew: hot in, cold out"],
+        ["TTL","long + jitter","immutable data; jitter avoids sync expiry"],
+      ],
+      data:"Read-through: check cache → hit redirects immediately → miss reads DB/replica, populates cache, then redirects. Values are immutable so there is no invalidation problem. Consider <strong>negative caching</strong> (short TTL) for known-missing keys to blunt 404-scanning abuse.",
+      scaling:[
+        "Shard the keyspace across a Redis cluster; add replicas per shard for read scale + failover.",
+        "Pre-warm the top-N hottest keys on cold start to shorten recovery.",
+        "Replicate hot keys to each region so a Sydney click never round-trips to Virginia.",
+      ],
+      failures:[
+        {t:"Cache node restarts empty mid-day (cold cache)",b:"DB instantly sees 100% of reads instead of ~5% — a thundering herd that can topple the DB.",m:"Request coalescing / single-flight (one miss per key hits the DB), jittered TTLs, replicated cluster so a restart fails over to a replica that still holds data, plus pre-warming."},
+        {t:"Cache stampede on a hot key expiring",b:"Thousands of concurrent misses for the same key hammer the DB at once.",m:"Single-flight per key + probabilistic early recompute; hot immutable keys get very long TTLs."},
+        {t:"404-scan abuse fills the cache with junk",b:"Attacker requests random keys, evicting hot entries.",m:"Negative-cache misses briefly and rate-limit high-miss clients at the gateway."},
+      ],
+      tradeoffs:[
+        {a:"Read-through",b:"Write-through / write-around",pick:"Read-through fits a read-heavy, immutable workload; writes just best-effort warm the cache. Write-through adds create latency for little benefit."},
+        {a:"LRU",b:"LFU",pick:"LRU is simple and matches temporal skew; LFU better protects long-term-hot keys but costs bookkeeping."},
+      ],
+      probes:[
+        "The cache node restarts empty at peak — walk me through exactly what happens to the DB and how you contain it.",
+        "Mappings are immutable — so what, concretely, does that buy you for caching?",
+        "How do you stop someone hammering random non-existent keys from thrashing your cache?",
+      ],
+    },
+    key:{
+      role:"Mints the unique 64-bit integer that gets <strong>base62</strong>-encoded into the short key. The whole point is to avoid a central bottleneck: a single DB auto-increment row would serialize every create across every instance. Instead, hand each instance a <em>block</em> of ids to burn locally, or mint Snowflake-style ids with no coordination.",
+      capacity:[
+        ["Keyspace","62^7 ≈ 3.5T","7 base62 chars; 62^6 ≈ 56B at 6"],
+        ["Key length","6–8 chars","short + URL-safe"],
+        ["Create rate","~1,160 wps","block leasing amortizes coordination"],
+        ["Block size","e.g. 1,000 ids","1 range-table write per 1,000 creates"],
+      ],
+      data:"An <code>id_ranges</code> table records leased blocks (<code>range_start, range_end, instance_id</code>). An instance leases a block, mints locally, and leases the next when it runs low. Base62 of a compact integer is collision-free <em>by construction</em> (the integer is already unique) — no collision detection needed, unlike hashing the URL.",
+      scaling:[
+        "Block leasing turns 1,160 coordination events/s into ~1/s (one lease per 1,000 keys).",
+        "<strong>Snowflake ids</strong> (timestamp+machine+seq) need zero central coordination and are naturally region-independent.",
+        "Per-region id ranges make creates survive a region loss with no cross-region calls.",
+      ],
+      failures:[
+        {t:"Instance crashes with a half-used block",b:"Unused ids in that block are lost.",m:"Acceptable — the id space is 3.5T; gaps are meaningless. Just lease a fresh block on restart."},
+        {t:"Contention on the id_ranges table",b:"Lease writes serialize and slow creates.",m:"Large blocks (fewer leases) or switch to Snowflake to eliminate the shared row entirely."},
+        {t:"Snowflake clock skew / rewind",b:"Duplicate or out-of-order ids.",m:"NTP discipline, refuse to mint if the clock moves backward, dedicate sequence bits per ms."},
+      ],
+      tradeoffs:[
+        {a:"Counter blocks",b:"Snowflake ids",pick:"Blocks give the shortest keys and dense space; Snowflake gives zero coordination + region independence at the cost of longer keys."},
+        {a:"Base62 of an int",b:"Hash of the long URL",pick:"Base62 is short and collision-free; hashing invites collisions you must detect/resolve and wastes entropy."},
+      ],
+      probes:[
+        "Why not just use a DB auto-increment column — what exactly breaks at scale?",
+        "Sequential ids are enumerable — a scraper can walk every link. How do you defend without losing short keys?",
+        "Two regions mint keys independently — how do you guarantee global uniqueness?",
+      ],
+    },
+    replica:{
+      role:"Read replicas of each DB shard. They (1) multiply read capacity for cache misses and (2) provide <strong>durability + failover</strong>: if the primary dies, a replica is promoted. Because mappings are immutable, reading a slightly-behind replica is safe — the only staleness is not-yet-knowing a brand-new key, handled by a primary/cache fallback on miss.",
+      capacity:[
+        ["Replicas / shard","≥3 across AZs","quorum durability"],
+        ["Write ack","quorum (e.g. 2/3)","before returning success"],
+        ["Read fan-out","reads split across replicas","multiplies read capacity"],
+        ["Failover","seconds","promote a replica on primary loss"],
+      ],
+      data:"Quorum writes: a create is acked once a majority of replicas persist it, so a single node loss loses nothing. Reads from a replica may lag by milliseconds — fine for immutable data, except <strong>read-your-writes</strong> for the creator, which is served from the primary or the warmed cache immediately after create.",
+      scaling:[
+        "Add replicas to scale reads without touching the write primary.",
+        "Place replicas in different failure domains (AZs/regions) so a zone loss is survivable.",
+        "Route the creator's immediate read to primary/cache to guarantee read-after-write.",
+      ],
+      failures:[
+        {t:"Replication lag spikes",b:"A brand-new key isn't on the replica yet → a redirect 404s momentarily.",m:"On a replica miss, fall back to the primary (or the cache warmed at create time); mappings never change so lag is otherwise harmless."},
+        {t:"Split-brain after promotion",b:"Old primary rejoins still thinking it's primary → two authorities write the same key → corruption.",m:"Promotion via consensus/leader election granting a monotonically-increasing <strong>epoch</strong>; replicas reject the stale primary's writes via the fencing token, and it demotes + re-syncs."},
+        {t:"Quorum unavailable (too many replicas down)",b:"Writes stall to preserve consistency.",m:"Enough replicas across AZs that a single-zone loss keeps quorum; accept write pause over accepting divergent data."},
+      ],
+      tradeoffs:[
+        {a:"Sync (quorum) writes",b:"Async replication",pick:"Quorum guarantees durability at a few ms of create latency (off the hot path); async is faster but can lose recent writes on primary loss."},
+        {a:"Read from replicas",b:"Read from primary",pick:"Replicas scale reads and are safe for immutable data; primary only for the creator's read-your-writes."},
+      ],
+      probes:[
+        "Quorum writes add latency to every create — why is that acceptable here but wouldn't be on the read path?",
+        "You promote a replica; two minutes later the old primary rejoins as 'primary'. Exactly what stops corruption?",
+        "A user creates a link and immediately clicks it, but the replica hasn't caught up. What do they see?",
+      ],
+    },
+    analytics:{
+      role:"The off-critical-path click pipeline. On redirect the service fires a click event to a <strong>message queue</strong> (Kafka) and returns immediately — analytics <em>never</em> blocks or slows the redirect. Stream consumers do windowed aggregation and write <strong>aggregates</strong> (not raw rows) to an OLAP store the dashboard reads.",
+      capacity:[
+        ["Spike","up to ~500K clicks/s","marketing blast; Kafka buffers it"],
+        ["Window","1-min tumbling","per-key counts, not per-click rows"],
+        ["Write reduction","raw → aggregates","orders of magnitude less OLAP write"],
+        ["Goal","approximate + timely","not exact accounting"],
+      ],
+      data:"Events are produced <strong>async, fire-and-forget</strong> with a bounded local buffer. Consumers aggregate in tumbling windows and upsert counts. Exactly-once is expensive; the pragmatic target is <strong>at-least-once + idempotent aggregation</strong> (dedup by event_id) so retries don't over-count. Late/out-of-order events are handled with a grace window.",
+      scaling:[
+        "Kafka partitions + consumer groups scale ingestion and aggregation independently.",
+        "Aggregate early (per-minute) so the OLAP store stores rollups, not a firehose of raw clicks.",
+        "Backpressure via the bounded producer buffer — drop/spill rather than slow the redirect.",
+      ],
+      failures:[
+        {t:"Kafka briefly unavailable",b:"Producers can't emit; risk of blocking redirects.",m:"Fire-and-forget with a capped in-memory buffer; when full, <strong>drop</strong> (or spill to a local log). Losing a slice of analytics is fine; adding latency to a billion redirects is not."},
+        {t:"Duplicate events (at-least-once retries)",b:"Inflated click counts.",m:"Idempotent aggregation keyed by <code>event_id</code>; dedup within the window."},
+        {t:"Consumer lag builds during a spike",b:"Dashboards fall behind real time.",m:"Kafka buffers the backlog; consumers autoscale on lag; counts are eventually-consistent, which the product accepts."},
+        {t:"301 caching hides clicks",b:"Systematic undercount — cached hops never reach you.",m:"Use 302 for links where counting is the product; accept that 301 trades accuracy for origin savings."},
+      ],
+      tradeoffs:[
+        {a:"At-least-once + idempotent",b:"Exactly-once",pick:"At-least-once with dedup is far cheaper and good enough for counts; exactly-once adds heavy coordination for marginal benefit."},
+        {a:"Stream (windowed) aggregation",b:"Batch recompute",pick:"Streaming gives near-real-time counts; a periodic batch job reconciles for accuracy (lambda-style)."},
+      ],
+      probes:[
+        "Kafka is down for 30s — do redirects slow down? What happens to those clicks?",
+        "You're at-least-once, so events can duplicate. How do you avoid over-counting?",
+        "A link goes viral and consumers lag 10 minutes — is that acceptable, and why?",
+        "How does your 301/302 choice bias the numbers you report?",
+      ],
+    },
+  },
   dbDoc:{
     component:"Database (mapping store)",
     load:"~1,160 writes/s (peak ~5K); up to ~116K reads/s on a cold cache (but the cache/replicas absorb ~95%+); ~180B rows ≈ 90TB raw, ×3 replication ≈ 270TB. Access = single-key point lookup, no joins, no range scans.",
@@ -428,6 +659,15 @@ window.DATA['url'] = {
         {title:"Apache Kafka documentation",url:"https://kafka.apache.org/documentation/"},
         {title:"System Design Primer — async & message queues",url:"https://github.com/donnemartin/system-design-primer#asynchronism"},
       ]},
+      {l:"hard",tag:"consistency",q:"Exactly-once counting for a viral link — is the count even right?",turns:[
+        {who:"intv",text:"<span class='scenario'><b>Scenario:</b> a customer pays for click analytics and disputes their numbers. Your pipeline is Kafka + stream aggregation, at-least-once delivery. On a consumer rebalance you reprocessed a window and double-counted; on a producer drop you under-counted a viral link doing 300K clicks/s. Are your counts wrong, and how right can you make them?</span>"},
+        {who:"cand",text:"With naive at-least-once, yes — retries and rebalances double-count, and my fire-and-forget producer under-counts on drops. True <strong>exactly-once</strong> end-to-end is expensive, so I decide per use-case. For <strong>billing-grade</strong> counts I use <strong>idempotent aggregation</strong>: tag each event with a unique <code>event_id</code> and make the sink dedupe (upsert keyed by event_id, or Kafka's transactional exactly-once between consume→aggregate→produce). For <strong>dashboard</strong> counts I accept at-least-once with approximate structures. The honest framing: 'timely + approximately right' for dashboards, 'reconciled + exactly right' for billing, computed on a slower batch path."},
+        {who:"intv",text:"The viral link is one key at 300K/s. Even if delivery is correct, aren't you hot-spotting a single counter?"},
+        {who:"cand",text:"Yes — a single <code>count[key]</code> becomes a write hot-spot and a partition hot-spot. Fixes: <strong>(1)</strong> shard the counter — maintain N sub-counters <code>count[key][0..N]</code> across partitions and sum on read, so no single row/partition takes 300K/s. <strong>(2)</strong> pre-aggregate in the stream: each consumer emits one <em>windowed</em> partial (per-minute sum) instead of 300K increments, collapsing the write rate by ~six orders of magnitude before it hits the store. <strong>(3)</strong> for pure top-N/uniques where exactness isn't paid for, use <strong>probabilistic sketches</strong> — HyperLogLog for unique visitors, Count-Min for hot keys — bounded memory, tunable error. So the key insight: I never let a per-event write reach a single counter; aggregation happens in-stream and the counter is sharded."},
+      ],resources:[
+        {title:"Kafka exactly-once semantics",url:"https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"},
+        {title:"HyperLogLog — cardinality estimation",url:"https://en.wikipedia.org/wiki/HyperLogLog"},
+      ]},
     ],
     client:[
       {l:"medium",tag:"concept",q:"What can you push to the client/edge, and its limits?",turns:[
@@ -438,6 +678,15 @@ window.DATA['url'] = {
       ],resources:[
         {title:"Cloudflare Workers — edge compute",url:"https://developers.cloudflare.com/workers/"},
         {title:"System Design Primer — CDNs",url:"https://github.com/donnemartin/system-design-primer#content-delivery-network"},
+      ]},
+      {l:"hard",tag:"concept",q:"301 or 302 for the redirect? It changes everything downstream.",turns:[
+        {who:"intv",text:"The redirect itself: do you return <code>301 Moved Permanently</code> or <code>302 Found</code>? It looks trivial — argue both sides and tell me what breaks with the wrong choice."},
+        {who:"cand",text:"It's a real trade-off between <strong>performance</strong> and <strong>control</strong>. A <strong>301</strong> is cached aggressively by browsers, proxies, and CDNs — the client often skips me entirely on repeat visits, so latency is near-zero and my origin/edge load drops hugely. The cost: <strong>I lose the click</strong>. A cached 301 never comes back, so my <em>analytics undercounts</em> and I can't revoke or re-target the link — the browser has memorized the destination. A <strong>302</strong> is treated as temporary: clients re-request each time, so every click hits my system — I <strong>capture analytics, can revoke, and can change the target</strong> — at the price of serving every redirect."},
+        {who:"intv",text:"So which do you ship for a link shortener, and does it depend on the link?"},
+        {who:"cand",text:"For a shortener I default to <strong>302</strong>: click analytics and the ability to revoke/re-point are core product features, and a 301's browser-side caching silently destroys both. The immutable-mapping performance win I get from my <em>own</em> CDN/edge cache instead — I control that TTL and can purge it, unlike a 301 baked into every user's browser. Where it depends: for links that are truly permanent and where analytics don't matter, 301 is cheaper. I'd even make it <strong>per-link configurable</strong> — but the safe default is 302, because a wrong 301 is effectively irreversible on already-served clients. Trade-off stated plainly: 302 buys observability and control; 301 buys latency and load reduction I can get elsewhere."},
+      ],resources:[
+        {title:"MDN — 301 Moved Permanently",url:"https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/301"},
+        {title:"MDN — 302 Found",url:"https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/302"},
       ]},
     ],
   },

@@ -76,6 +76,8 @@
   .edge.new{animation:edgein .6s ease .2s both}
   @keyframes flowpulse{0%,100%{stroke:var(--accent2);stroke-width:2}50%{stroke:#a99bff;stroke-width:3.5}}
   .node.flowon .box{animation:flowpulse 1s ease-in-out infinite;fill:#221a3a}
+  .pulse{fill:#c3b6ff;filter:drop-shadow(0 0 6px var(--accent2))}
+  @keyframes pulsegrow{0%{r:3}50%{r:6}100%{r:3}}
   .difftools{display:flex;gap:7px;align-items:center;flex-wrap:wrap;padding:0 10px 8px}
   .difftools .lab{font-size:11px;color:var(--muted);margin-left:4px}
   .difftools button{font-size:11.5px;padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:5px}
@@ -148,6 +150,42 @@
   .compbtn{font-size:12px;padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer}
   .compbtn.on{border-color:var(--accent);background:#1c2836}
   .compbtn.done{border-color:var(--cand)}
+
+  /* study-notes (deep dive) mode */
+  .modetoggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:13px}
+  .modetoggle .mt{background:var(--panel2);color:var(--muted);border:none;padding:7px 13px;font-size:12.5px;cursor:pointer;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+  .modetoggle .mt.on{background:#1c2836;color:var(--text)}
+  .modetoggle .mt+.mt{border-left:1px solid var(--line)}
+  .modetoggle .mt:hover:not(.on){color:var(--text)}
+  .study{display:flex;flex-direction:column;gap:11px;margin-bottom:14px}
+  .sect{border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+  .sect>h5{margin:0;padding:9px 13px;font-size:11.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px;background:#12161d;border-bottom:1px solid var(--line)}
+  .sect .body{padding:11px 13px;font-size:13px;color:#cdd8e3;line-height:1.62}
+  .sect .body p{margin:0 0 8px}.sect .body p:last-child{margin:0}
+  .sect .body ul{margin:0;padding-left:18px}.sect .body li{margin:6px 0}
+  .sect .body code{background:#0e1116;padding:1px 6px;border-radius:5px;color:#7ad;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+  .sect .body strong{color:#fff;font-weight:600}
+  .sect.role>h5{color:var(--t-concept)} .sect.capacity>h5{color:var(--t-capacity)}
+  .sect.data>h5{color:#7ad} .sect.scaling>h5{color:var(--t-scaling)}
+  .sect.failures>h5{color:var(--t-failover)} .sect.tradeoffs>h5{color:var(--accent2)} .sect.probes>h5{color:var(--cand)}
+  .captbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  .captbl td{padding:7px 13px;border-top:1px solid var(--line);vertical-align:top}
+  .captbl tr:first-child td{border-top:none}
+  .captbl td.m{color:var(--muted);white-space:nowrap;width:36%}
+  .captbl td.v{color:#e6edf3;font-family:ui-monospace,Menlo,monospace}
+  .captbl td.v .n{color:var(--muted);font-family:inherit}
+  .fail{border-top:1px solid var(--line);padding:10px 13px}
+  .fail:first-child{border-top:none}
+  .fail .ft{font-weight:700;color:#ff8f8f;font-size:12.5px;margin-bottom:5px;display:flex;gap:7px;align-items:baseline}
+  .fail .frow{font-size:12.5px;color:#cdd8e3;margin:3px 0;line-height:1.55}
+  .fail .frow b{color:var(--muted);font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:.5px;margin-right:7px;display:inline-block;min-width:66px}
+  .fail .frow.mit b{color:var(--cand)}
+  .trade{border-top:1px solid var(--line);padding:9px 13px;font-size:12.5px;color:#cdd8e3;line-height:1.55}
+  .trade:first-child{border-top:none}
+  .trade .tw{color:#fff;font-weight:600}
+  .probe{display:flex;gap:8px;align-items:flex-start;padding:8px 13px;border-top:1px solid var(--line);font-size:12.5px;color:#cdd8e3;line-height:1.5}
+  .probe:first-child{border-top:none}
+  .probe i{color:var(--cand);margin-top:2px;flex-shrink:0}
 
   .askbox{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#12161d}
   .askbox label{font-size:12px;color:var(--muted);display:block;margin-bottom:8px}.askbox label b{color:var(--accent2)}
@@ -239,7 +277,7 @@ const PHASE_META = [
 
 let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
   reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null,
-  flowNode:null, showSchema:false, showDbDoc:false};
+  flowNode:null, showSchema:false, showDbDoc:false, studyMode:false};
 
 const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
 
@@ -385,7 +423,7 @@ function walkFlow(flowId){
   cand.innerHTML=`<div class="who"><span class="av">C</span>Candidate</div><div class="body"><p>Sure — tracing it through the current architecture:</p><ol id="flowol"></ol></div>`;
   const t=document.getElementById('transcript'); t.appendChild(cand); t.scrollTop=t.scrollHeight;
   const ol=cand.querySelector('#flowol');
-  let i=0;
+  let i=0, prev=null;
   const step=()=>{
     if(i>=steps.length){ state.flowNode=null; renderDiagram(); state.playing=false; renderStepper(); renderDifftools(); renderPanel(); return; }
     const s=steps[i];
@@ -394,9 +432,33 @@ function walkFlow(flowId){
     const li=document.createElement('li');
     li.innerHTML=(compName?`<span class="comp">${compName}:</span> `:'')+s.text.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
     ol.appendChild(li); t.scrollTop=t.scrollHeight;
-    i++; setTimeout(step, 780);
+    const from=prev, to=s.node; if(s.node) prev=s.node; i++;
+    const advance=(d)=>setTimeout(step, d);
+    if(from && to && from!==to){ travelPulse(from,to,540,()=>advance(300)); }
+    else advance(760);
   };
   step();
+}
+// animate a glowing "request" dot travelling from one component to another along the wire
+function travelPulse(fromId,toId,ms,done){
+  const svg=document.querySelector('#diagram svg'), p=DATA[state.prob];
+  const A=(p.nodes||[]).find(n=>n.id===fromId), B=(p.nodes||[]).find(n=>n.id===toId);
+  const finish=()=>{ if(done) done(); };
+  if(!svg||!A||!B||!state.revealed.has(fromId)||!state.revealed.has(toId)){ finish(); return; }
+  const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
+  const ax=A.x+hw, ay=A.y+hh, bx=B.x+hw, by=B.y+hh;
+  const s=borderPt(ax,ay,bx,by,hw,hh,2), e=borderPt(bx,by,ax,ay,hw,hh,5);
+  const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  c.setAttribute('r','5'); c.setAttribute('class','pulse'); c.setAttribute('cx',s.x); c.setAttribute('cy',s.y);
+  svg.appendChild(c);
+  const t0=performance.now();
+  const tick=(now)=>{
+    const k=Math.min(1,(now-t0)/ms), ease=k<.5?2*k*k:1-Math.pow(-2*k+2,2)/2;
+    c.setAttribute('cx', s.x+(e.x-s.x)*ease); c.setAttribute('cy', s.y+(e.y-s.y)*ease);
+    c.setAttribute('r', 4+2*Math.sin(k*Math.PI));
+    if(k<1) requestAnimationFrame(tick); else { c.remove(); finish(); }
+  };
+  requestAnimationFrame(tick);
 }
 
 /* ---------------- diagram ---------------- */
@@ -516,11 +578,25 @@ function renderComponents(p){
   html+=`</div>`;
   if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill into it — concept, scaling, durability and failover threads.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
   const node=p.nodes.find(n=>n.id===nid);
+  const dd=(p.deepDive||{})[nid];
+  if(!dd) state.studyMode=false;
+  const toggle=dd?`<div class="modetoggle"><button class="mt ${!state.studyMode?'on':''}" data-m="qa"><i class="ti ti-messages"></i> Interview Q&amp;A</button><button class="mt ${state.studyMode?'on':''}" data-m="study"><i class="ti ti-book-2"></i> Study notes</button></div>`:'';
+  const wireCommon=()=>{
+    document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
+    document.querySelectorAll('#panel .mt').forEach(el=>el.onclick=()=>{state.studyMode=(el.dataset.m==='study');renderPanel();});
+    wireAsk(nid);
+  };
+  if(dd&&state.studyMode){
+    html+=`<div class="phead"><h4>${node.name} <span style="color:var(--muted);font-weight:400;font-size:12px">— study notes</span></h4><span class="counter">deep reference</span></div>`+toggle+renderStudyNotes(dd)+askBoxHTML(node.name,nid);
+    document.getElementById('panel').innerHTML=html;
+    document.getElementById('ptip').innerHTML='Deep reference — role, capacity, data &amp; consistency, scaling, <span style="color:var(--t-failover)">failure modes</span>, trade-offs, and what gets probed next.';
+    wireCommon(); return;
+  }
   let all=(p.q[nid]||[]).filter(q=>DIFF_ALLOWED[state.diff].includes(q.l));
   const tagsP=[...new Set(all.map(q=>q.tag||'concept'))];
   if(state.filter) all=all.filter(q=>(q.tag||'concept')===state.filter);
   const answered=state.answeredCount[nid]||0, capped=answered>=MAX_FOLLOWUPS;
-  html+=`<div class="phead"><h4>${node.name}</h4><span class="counter">${answered}/${MAX_FOLLOWUPS} asked${capped?' · max':''}</span></div>`;
+  html+=`<div class="phead"><h4>${node.name}</h4><span class="counter">${answered}/${MAX_FOLLOWUPS} asked${capped?' · max':''}</span></div>`+toggle;
   if(tagsP.length>1){ html+=`<div class="filters"><button class="fchip ${!state.filter?'on':''}" data-f="">all</button>`; tagsP.forEach(t=>html+=`<button class="fchip ${state.filter===t?'on':''}" data-f="${t}"><i class="ti ${TAGS[t]?TAGS[t].icon:'ti-bulb'}"></i> ${t}</button>`); html+=`</div>`; }
   all.forEach(q=>{ const gi=p.q[nid].indexOf(q),key=nid+':'+gi,asked=state.asked[key],dis=asked||(capped&&!asked)||state.playing,tag=q.tag||'concept';
     const rev=(q.reveal&&q.reveal.some(id=>!state.revealed.has(id)))?` <i class="ti ti-circle-plus" style="color:var(--accent2)"></i>`:'';
@@ -528,10 +604,22 @@ function renderComponents(p){
   html+=askBoxHTML(node.name,nid);
   document.getElementById('panel').innerHTML=html;
   document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.';
-  document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
   document.querySelectorAll('#panel .fchip').forEach(el=>el.onclick=()=>{state.filter=el.dataset.f||null;renderPanel();});
   document.querySelectorAll('#panel .item').forEach(el=>el.onclick=()=>{ if(!el.disabled) playThread(nid,parseInt(el.dataset.idx)); });
-  wireAsk(nid);
+  wireCommon();
+}
+
+function studySection(cls,icon,title,inner){ return `<div class="sect ${cls}"><h5><i class="ti ${icon}"></i>${title}</h5><div class="body">${inner}</div></div>`; }
+function renderStudyNotes(dd){
+  let h='<div class="study">';
+  if(dd.role) h+=studySection('role','ti-focus-2','Role &amp; responsibility',dd.role);
+  if(dd.capacity&&dd.capacity.length){ const rows=dd.capacity.map(r=>`<tr><td class="m">${r[0]}</td><td class="v">${r[1]}${r[2]?` <span class="n">· ${r[2]}</span>`:''}</td></tr>`).join(''); h+=`<div class="sect capacity"><h5><i class="ti ti-calculator"></i>Capacity &amp; numbers</h5><table class="captbl">${rows}</table></div>`; }
+  if(dd.data) h+=studySection('data','ti-database','Data model &amp; consistency',dd.data);
+  if(dd.scaling&&dd.scaling.length) h+=studySection('scaling','ti-trending-up','Scaling levers','<ul>'+dd.scaling.map(x=>`<li>${x}</li>`).join('')+'</ul>');
+  if(dd.failures&&dd.failures.length){ const f=dd.failures.map(x=>`<div class="fail"><div class="ft"><i class="ti ti-alert-triangle"></i>${x.t}</div><div class="frow"><b>blast</b>${x.b}</div><div class="frow mit"><b>mitigation</b>${x.m}</div></div>`).join(''); h+=`<div class="sect failures"><h5><i class="ti ti-alert-triangle"></i>Failure modes &amp; mitigations</h5>${f}</div>`; }
+  if(dd.tradeoffs&&dd.tradeoffs.length){ const tr=dd.tradeoffs.map(x=> typeof x==='string'?`<div class="trade">${x}</div>`:`<div class="trade"><span class="tw">${x.a}</span> vs <span class="tw">${x.b}</span> — ${x.pick}</div>`).join(''); h+=`<div class="sect tradeoffs"><h5><i class="ti ti-arrows-left-right"></i>Key trade-offs</h5>${tr}</div>`; }
+  if(dd.probes&&dd.probes.length){ const pr=dd.probes.map(x=>`<div class="probe"><i class="ti ti-chevron-right"></i><span>${x}</span></div>`).join(''); h+=`<div class="sect probes"><h5><i class="ti ti-message-2-question"></i>The interviewer will probe next</h5>${pr}</div>`; }
+  return h+'</div>';
 }
 
 /* ---------------- playback ---------------- */
