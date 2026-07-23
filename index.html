@@ -277,7 +277,7 @@ const PHASE_META = [
 
 let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
   reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null,
-  flowNode:null, showSchema:false, showDbDoc:false, studyMode:false};
+  flowNode:null, showSchema:false, showDbDoc:false, studyMode:true};
 
 const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
 
@@ -573,14 +573,14 @@ function renderDives(p){
 function renderComponents(p){
   const nid=state.activeNode;
   let html=`<div class="compbar">`;
-  p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return; const has=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l)); if(!has)return;
+  p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return; const hasQ=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l)); const hasDD=!!(p.deepDive||{})[n.id]; if(!hasQ&&!hasDD)return;
     html+=`<button class="compbtn ${nid===n.id?'on':''} ${state.answeredCount[n.id]?'done':''}" data-n="${n.id}">${n.name}${state.answeredCount[n.id]?' ·'+state.answeredCount[n.id]:''}</button>`; });
   html+=`</div>`;
-  if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill into it — concept, scaling, durability and failover threads.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
+  if(!nid){ html+=`<div class="empty">Pick a component (above or in the diagram) to drill in. Each one has <b><i class="ti ti-book-2"></i> Study notes</b> — role, capacity, data &amp; consistency, scaling, failure modes, trade-offs and interviewer probes — and an <b><i class="ti ti-messages"></i> Interview Q&amp;A</b> tab.</div>`; document.getElementById('panel').innerHTML=html; document.getElementById('ptip').innerHTML='Tip: <b>Study notes</b> is the deep reference; toggle to <b>Interview Q&amp;A</b> to be grilled. Chips: <span style="color:var(--t-concept)">concept</span>, <span style="color:var(--t-capacity)">capacity</span>, <span style="color:var(--t-scaling)">scaling</span>, <span style="color:var(--t-durability)">durability</span>, <span style="color:var(--t-failover)">failover</span>.'; document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;renderDiagram();renderPanel();}); return; }
   const node=p.nodes.find(n=>n.id===nid);
   const dd=(p.deepDive||{})[nid];
   if(!dd) state.studyMode=false;
-  const toggle=dd?`<div class="modetoggle"><button class="mt ${!state.studyMode?'on':''}" data-m="qa"><i class="ti ti-messages"></i> Interview Q&amp;A</button><button class="mt ${state.studyMode?'on':''}" data-m="study"><i class="ti ti-book-2"></i> Study notes</button></div>`:'';
+  const toggle=dd?`<div class="modetoggle"><button class="mt ${state.studyMode?'on':''}" data-m="study"><i class="ti ti-book-2"></i> Study notes</button><button class="mt ${!state.studyMode?'on':''}" data-m="qa"><i class="ti ti-messages"></i> Interview Q&amp;A</button></div>`:'';
   const wireCommon=()=>{
     document.querySelectorAll('#panel .compbtn').forEach(el=>el.onclick=()=>{state.activeNode=el.dataset.n;state.filter=null;renderDiagram();renderPanel();});
     document.querySelectorAll('#panel .mt').forEach(el=>el.onclick=()=>{state.studyMode=(el.dataset.m==='study');renderPanel();});
