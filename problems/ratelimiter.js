@@ -14,7 +14,7 @@ window.DATA['ratelimiter'] = {
     {id:"config",name:"Rules / config",sub:"limits per tier",x:210,y:40},
     {id:"sync",name:"Cluster sync",sub:"coordination",x:550,y:40},
   ],
-  edges:[["client","gw"],["gw","limiter"],["limiter","store"],["limiter","algo"],["limiter","config"],["store","sync"]],
+  edges:[["client","gw","request"],["gw","limiter","check"],["limiter","store","incr"],["limiter","algo","evaluate"],["limiter","config","load rules"],["store","sync","replicate"]],
   core:["client","gw","limiter","store"],
   basic:["client","gw","limiter","store"],
   dbDoc:{

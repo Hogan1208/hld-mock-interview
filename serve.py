@@ -1,6 +1,6 @@
 import os, json, http.server, socketserver
 
-BASE = "/Users/mayank.garg/Desktop/hld-mock"
+BASE = os.path.dirname(os.path.abspath(__file__))
 LIVE = os.path.join(BASE, "live")
 ANS = os.path.join(LIVE, "answers")
 QFILE = os.path.join(LIVE, "questions.jsonl")

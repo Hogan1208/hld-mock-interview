@@ -14,7 +14,7 @@ window.DATA['gdocs'] = {
     {id:"presence",name:"Presence / cursors",sub:"live state",x:210,y:40},
     {id:"persist",name:"Persistence",sub:"snapshot + durability",x:550,y:40},
   ],
-  edges:[["client","gw"],["gw","collab"],["collab","doc"],["collab","engine"],["gw","presence"],["doc","persist"]],
+  edges:[["client","gw","WS"],["gw","collab","edits"],["collab","doc","apply"],["collab","engine","transform"],["gw","presence","cursors"],["doc","persist","snapshot"]],
   core:["client","gw","collab","doc"],
   basic:["client","gw","collab","doc"],
   dbDoc:{

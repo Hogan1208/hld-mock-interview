@@ -14,7 +14,7 @@ window.DATA['video'] = {
     {id:"meta",name:"Metadata DB",sub:"info, views",x:210,y:40},
     {id:"player",name:"Adaptive player",sub:"ABR client",x:720,y:150},
   ],
-  edges:[["client","upload"],["upload","storage"],["storage","cdn"],["upload","transcode"],["transcode","storage"],["upload","meta"],["cdn","player"]],
+  edges:[["client","upload","upload"],["upload","storage","store raw"],["storage","cdn","distribute"],["upload","transcode","trigger"],["transcode","storage","renditions"],["upload","meta","metadata"],["cdn","player","stream"]],
   core:["client","upload","storage","cdn"],
   basic:["client","upload","storage","cdn"],
   dbDoc:{

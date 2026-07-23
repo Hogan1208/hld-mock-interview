@@ -15,7 +15,7 @@ window.DATA['crawler'] = {
     {id:"dns",name:"DNS resolver",sub:"cached",x:210,y:40},
     {id:"politeness",name:"Politeness / rate",sub:"per-domain",x:380,y:260},
   ],
-  edges:[["seed","frontier"],["frontier","fetcher"],["fetcher","parser"],["parser","frontier"],["parser","store"],["fetcher","dns"],["fetcher","politeness"],["parser","dedup"]],
+  edges:[["seed","frontier","seed URLs"],["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","frontier","new links"],["parser","store","save page"],["fetcher","dns","resolve"],["fetcher","politeness","rate check"],["parser","dedup","seen?"]],
   core:["seed","frontier","fetcher","parser"],
   basic:["seed","frontier","fetcher","parser"],
   dbDoc:{

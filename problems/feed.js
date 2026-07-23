@@ -14,7 +14,7 @@ window.DATA['feed'] = {
     {id:"cache",name:"Feed cache",sub:"Redis lists",x:550,y:40},
     {id:"media",name:"Media / CDN",sub:"images, video",x:720,y:150},
   ],
-  edges:[["client","lb"],["lb","feed"],["feed","db"],["feed","cache"],["cache","db"],["feed","fanout"],["fanout","cache"],["feed","media"]],
+  edges:[["client","lb","HTTP"],["lb","feed","route"],["feed","db","write post"],["feed","cache","read feed"],["cache","db","on miss"],["feed","fanout","on post"],["fanout","cache","push"],["feed","media","media"]],
   core:["client","lb","feed","db"],
   basic:["client","lb","feed","db"],
   dbDoc:{

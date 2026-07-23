@@ -15,7 +15,7 @@ window.DATA['url'] = {
     {id:"replica",name:"DB replicas",sub:"read + failover",x:550,y:40},
     {id:"analytics",name:"Analytics",sub:"async clicks",x:550,y:260},
   ],
-  edges:[["client","lb"],["lb","svc"],["svc","db"],["svc","cache"],["cache","db"],["svc","key"],["db","replica"],["svc","analytics"]],
+  edges:[["client","lb","HTTP"],["lb","svc","route"],["svc","db","write"],["svc","cache","read"],["cache","db","on miss"],["svc","key","get id"],["db","replica","replicate"],["svc","analytics","async"]],
   core:["client","lb","svc","db"],
   basic:["client","lb","svc","db"],
   dbDoc:{

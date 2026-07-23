@@ -15,7 +15,7 @@ window.DATA['ticketmaster'] = {
     {id:"payment",name:"Payment service",sub:"charge",x:720,y:150},
     {id:"search",name:"Search / browse",sub:"events",x:550,y:40},
   ],
-  edges:[["client","gw"],["gw","booking"],["booking","db"],["booking","cache"],["gw","queue"],["booking","payment"],["gw","search"]],
+  edges:[["client","gw","HTTP"],["gw","booking","reserve"],["booking","db","lock seat"],["booking","cache","seat map"],["gw","queue","throttle"],["booking","payment","charge"],["gw","search","browse"]],
   core:["client","gw","booking","db"],
   basic:["client","gw","booking","db"],
   dbDoc:{

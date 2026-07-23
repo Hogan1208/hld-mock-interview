@@ -14,7 +14,7 @@ window.DATA['chat'] = {
     {id:"presence",name:"Presence service",sub:"online status",x:210,y:40},
     {id:"push",name:"Notification svc",sub:"APNs / FCM",x:550,y:40},
   ],
-  edges:[["client","gw"],["gw","chat"],["chat","store"],["chat","queue"],["queue","push"],["gw","presence"],["chat","push"]],
+  edges:[["client","gw","WS"],["gw","chat","send"],["chat","store","persist"],["chat","queue","enqueue"],["queue","push","deliver"],["gw","presence","heartbeat"],["chat","push","notify"]],
   core:["client","gw","chat","store"],
   basic:["client","gw","chat","store"],
   dbDoc:{

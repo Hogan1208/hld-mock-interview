@@ -14,7 +14,7 @@ window.DATA['proximity'] = {
     {id:"index",name:"Geo index",sub:"spatial buckets",x:380,y:40},
     {id:"notify",name:"Dispatch / notify",sub:"push updates",x:550,y:40},
   ],
-  edges:[["client","gw"],["gw","match"],["match","db"],["gw","location"],["location","index"],["match","index"],["match","notify"]],
+  edges:[["client","gw","request"],["gw","match","nearby?"],["match","db","lookup"],["gw","location","update loc"],["location","index","index"],["match","index","query"],["match","notify","dispatch"]],
   core:["client","gw","match","db"],
   basic:["client","gw","match","db"],
   dbDoc:{

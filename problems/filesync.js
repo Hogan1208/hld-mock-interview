@@ -14,7 +14,7 @@ window.DATA['filesync'] = {
     {id:"block",name:"Block storage",sub:"chunks / S3",x:550,y:40},
     {id:"notif",name:"Notification svc",sub:"change events",x:210,y:40},
   ],
-  edges:[["client","gw"],["gw","meta"],["meta","db"],["gw","chunk"],["chunk","block"],["gw","notif"]],
+  edges:[["client","gw","sync"],["gw","meta","file ops"],["meta","db","index"],["gw","chunk","upload"],["chunk","block","store chunks"],["gw","notif","notify"]],
   core:["client","gw","meta","db"],
   basic:["client","gw","meta","db"],
   dbDoc:{

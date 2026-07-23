@@ -9,6 +9,7 @@
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --line:#2a323d;
     --text:#e6edf3; --muted:#9aa7b4; --accent:#4f8cff; --accent2:#7c5cff;
+    --edge:#48566a;
     --intv:#f0a742; --cand:#4fd1a1; --easy:#4fd1a1; --medium:#f0a742; --hard:#ff6b6b;
     --t-concept:#6ea8ff; --t-scaling:#f0a742; --t-durability:#4fd1a1; --t-failover:#ff6b6b; --t-capacity:#a78bfa;
     --radius:12px;
@@ -51,22 +52,30 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
   .card .hd{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
   .card .hd h3{margin:0;font-size:14px;font-weight:600}.card .hd .hint{font-size:12px;color:var(--muted)}
-  .diagram{padding:10px}
+  .diagram{padding:14px 12px 6px}
   svg{width:100%;height:auto;display:block}
-  .node{cursor:pointer}.node rect{transition:.15s}
-  .node:hover rect{stroke:var(--accent);stroke-width:2}
-  .node.active rect{stroke:var(--accent);stroke-width:2.5;fill:#1e2a3a}
-  .node.done rect{stroke:var(--cand)}
-  .node text{fill:var(--text);font-size:12px;font-weight:500;pointer-events:none}
-  .node .sub{fill:var(--muted);font-size:10px}
-  .edge{stroke:#3a4652;stroke-width:1.5;fill:none;marker-end:url(#arr)}
+  .node{cursor:pointer}.node rect{transition:.18s}
+  .node .box{fill:url(#nodegrad);stroke:var(--line);stroke-width:1.25;filter:url(#nodeshadow)}
+  .node:hover .box{stroke:var(--accent);stroke-width:1.75}
+  .node.active .box{stroke:var(--accent);stroke-width:2.25;fill:#1e2a3a}
+  .node.done .box{stroke:var(--cand)}
+  .node .stripe{transition:.18s}
+  .node text{fill:var(--text);font-size:12px;font-weight:600;letter-spacing:.15px;pointer-events:none}
+  .node .sub{fill:var(--muted);font-size:9.5px;font-weight:500;letter-spacing:.1px}
+  .node .ico{pointer-events:none}
+  .edge{stroke:var(--edge);stroke-width:1.6;fill:none;marker-end:url(#arr);stroke-linecap:round}
+  .elabel{fill:var(--muted);font-size:9px;font-weight:600;letter-spacing:.3px;pointer-events:none;text-transform:uppercase}
+  .elabel-bg{fill:var(--panel);stroke:var(--line);stroke-width:1;rx:5}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;padding:2px 12px 10px;margin-top:2px}
+  .legend .lg{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;color:var(--muted)}
+  .legend .lg i{width:9px;height:9px;border-radius:3px;display:inline-block}
   @keyframes pop{0%{opacity:0;transform:scale(.6)}60%{opacity:1;transform:scale(1.08)}100%{transform:scale(1)}}
   @keyframes edgein{from{opacity:0}to{opacity:1}}
   .node.new{animation:pop .5s cubic-bezier(.2,1.3,.5,1) both;transform-box:fill-box;transform-origin:center}
-  .node.new rect{stroke:var(--accent2);stroke-width:2.5}
+  .node.new .box{stroke:var(--accent2);stroke-width:2.25}
   .edge.new{animation:edgein .6s ease .2s both}
   @keyframes flowpulse{0%,100%{stroke:var(--accent2);stroke-width:2}50%{stroke:#a99bff;stroke-width:3.5}}
-  .node.flowon rect{animation:flowpulse 1s ease-in-out infinite;fill:#221a3a}
+  .node.flowon .box{animation:flowpulse 1s ease-in-out infinite;fill:#221a3a}
   .difftools{display:flex;gap:7px;align-items:center;flex-wrap:wrap;padding:0 10px 8px}
   .difftools .lab{font-size:11px;color:var(--muted);margin-left:4px}
   .difftools button{font-size:11.5px;padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:5px}
@@ -391,23 +400,71 @@ function walkFlow(flowId){
 }
 
 /* ---------------- diagram ---------------- */
+// classify a component into a visual "tier" so the diagram is colour-coded like a Hello-Interview sketch
+const NODE_KINDS=[
+  {k:'client', c:'#6ea8ff', re:/client|user|browser|mobile|\bapp\b|seed|player/i},
+  {k:'lb',     c:'#7c5cff', re:/\blb\b|gateway|\bgw\b|proxy|balanc|ingress/i},
+  {k:'cdn',    c:'#8bd5ff', re:/\bcdn\b|edge|\bdns\b/i},
+  {k:'cache',  c:'#f0a742', re:/cache|redis|memcache/i},
+  {k:'queue',  c:'#a78bfa', re:/queue|kafka|stream|broker|pubsub|topic|\bsqs\b|kinesis|fanout|dead|notif|\bpush\b/i},
+  {k:'db',     c:'#4fd1a1', re:/\bdb\b|database|store|storage|\bsql\b|dynamo|cassandra|mongo|postgres|table|block|olap|persist|\bmeta\b|warehouse|blob|\bs3\b/i},
+  {k:'search', c:'#ff8fb0', re:/search|\bindex\b|elastic|analytic|\bml\b|rank|dedup|\bagg\b|query/i},
+  {k:'service',c:'#4f8cff', re:/./},
+];
+const KC=Object.fromEntries(NODE_KINDS.map(t=>[t.k,t.c]));
+const KIND_LABEL={client:'Client',cdn:'Edge / CDN',lb:'Gateway / LB',cache:'Cache',queue:'Async / Queue',db:'Datastore',search:'Search / Compute',service:'Service'};
+const ICONS={
+  client:'<rect x="1.5" y="2.5" width="13" height="9" rx="1.2"/><path d="M6 14h4M8 11.5V14"/>',
+  cdn:'<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2.4 2 2.4 10 0 12M8 2c-2.4 2-2.4 10 0 12"/>',
+  lb:'<circle cx="3.5" cy="8" r="1.4"/><path d="M5 8h4.5M9.5 8 7.5 6M9.5 8 7.5 10M9.5 4.5v7"/>',
+  cache:'<path d="M9 1.5 3 9h4l-1 5.5L13 6.5H8z"/>',
+  queue:'<rect x="1.5" y="3" width="13" height="2.6" rx="1"/><rect x="1.5" y="6.7" width="13" height="2.6" rx="1"/><rect x="1.5" y="10.4" width="13" height="2.6" rx="1"/>',
+  db:'<path d="M3 4c0-1.2 2.2-2.2 5-2.2s5 1 5 2.2v8c0 1.2-2.2 2.2-5 2.2s-5-1-5-2.2z"/><path d="M3 4c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2M3 8c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2"/>',
+  search:'<circle cx="6.8" cy="6.8" r="4.3"/><path d="M13 13l-3-3"/>',
+  service:'<rect x="1.8" y="2.5" width="12.4" height="4.2" rx="1.2"/><rect x="1.8" y="9.3" width="12.4" height="4.2" rx="1.2"/><path d="M4.3 4.6h.01M4.3 11.4h.01"/>',
+};
+function kindOf(n){ const s=(n.id+' '+n.name+' '+(n.sub||'')); return NODE_KINDS.find(t=>t.re.test(s)); }
+// point where the ray from a box centre toward a target meets the box border (pushed out by gap)
+function borderPt(cx,cy,tx,ty,hw,hh,gap){
+  const dx=tx-cx, dy=ty-cy, len=Math.hypot(dx,dy)||1;
+  const s=Math.min(Math.abs(dx)>1e-6?hw/Math.abs(dx):1e9, Math.abs(dy)>1e-6?hh/Math.abs(dy):1e9);
+  const t=s+(gap||0)/len;
+  return {x:cx+dx*t, y:cy+dy*t};
+}
 function renderDiagram(){
-  const p=DATA[state.prob], cellW=132, cellH=54;
+  const p=DATA[state.prob], cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
   const maxX=Math.max(...p.nodes.map(n=>n.x))+cellW+40, maxY=Math.max(...p.nodes.map(n=>n.y))+cellH+30;
   const pos={}; p.nodes.forEach(n=>pos[n.id]={x:n.x,y:n.y});
-  let edges='';
-  p.edges.forEach(([a,b])=>{ if(!state.revealed.has(a)||!state.revealed.has(b))return; const A=pos[a],B=pos[b];
+  let edges='', elabels='';
+  p.edges.forEach(e=>{ const [a,b,label]=e; if(!state.revealed.has(a)||!state.revealed.has(b))return; const A=pos[a],B=pos[b];
+    const ax=A.x+hw, ay=A.y+hh, bx=B.x+hw, by=B.y+hh;
+    const s=borderPt(ax,ay,bx,by,hw,hh,2), t=borderPt(bx,by,ax,ay,hw,hh,5);
     const isNew=state.justRevealed.has(a)||state.justRevealed.has(b);
-    edges+=`<line class="edge ${isNew?'new':''}" x1="${A.x+cellW/2}" y1="${A.y+cellH/2}" x2="${B.x+cellW/2}" y2="${B.y+cellH/2}"></line>`; });
+    edges+=`<line class="edge ${isNew?'new':''}" x1="${s.x.toFixed(1)}" y1="${s.y.toFixed(1)}" x2="${t.x.toFixed(1)}" y2="${t.y.toFixed(1)}"></line>`;
+    if(label){ const mx=(s.x+t.x)/2, my=(s.y+t.y)/2, w=label.length*5.4+12;
+      elabels+=`<g class="edge-lbl ${isNew?'new':''}"><rect class="elabel-bg" x="${(mx-w/2).toFixed(1)}" y="${(my-8).toFixed(1)}" width="${w.toFixed(1)}" height="16" rx="5"></rect><text class="elabel" x="${mx.toFixed(1)}" y="${(my+3).toFixed(1)}" text-anchor="middle">${label}</text></g>`; }
+  });
   let nodes='';
   p.nodes.forEach(n=>{ if(!state.revealed.has(n.id))return;
     const hasQ=(p.q&&p.q[n.id]||[]).some(q=>DIFF_ALLOWED[state.diff].includes(q.l));
     const isNew=state.justRevealed.has(n.id);
     const cls=[(state.activeNode===n.id?'active':''),(state.answeredCount[n.id]>=1?'done':''),(isNew?'new':''),(state.flowNode===n.id?'flowon':'')].join(' ');
-    const cnt=state.answeredCount[n.id]||0;
-    const badge=cnt>0?`<text class="sub" x="${n.x+cellW-12}" y="${n.y+18}" text-anchor="end" style="fill:var(--cand)">${cnt}</text>`:'';
-    nodes+=`<g class="node ${cls}" data-node="${n.id}" style="${(state.phase===4&&!hasQ)?'opacity:.5':''}"><rect x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="9" fill="var(--panel2)" stroke="var(--line)" stroke-width="1.5"></rect><text x="${n.x+12}" y="${n.y+23}">${n.name}</text><text class="sub" x="${n.x+12}" y="${n.y+40}">${n.sub}</text>${badge}</g>`; });
-  document.getElementById('diagram').innerHTML=`<svg viewBox="0 0 ${maxX} ${maxY}"><defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6" fill="none" stroke="#4a5663" stroke-width="1.2"/></marker></defs>${edges}${nodes}</svg>`;
+    const cnt=state.answeredCount[n.id]||0, kind=kindOf(n);
+    const badge=cnt>0?`<text class="sub" x="${n.x+cellW-12}" y="${n.y+17}" text-anchor="end" style="fill:var(--cand)">${cnt}</text>`:'';
+    nodes+=`<g class="node ${cls}" data-node="${n.id}" style="${(state.phase===4&&!hasQ)?'opacity:.5':''}">`+
+      `<rect class="box" x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="11"></rect>`+
+      `<rect class="stripe" x="${n.x+2.5}" y="${n.y+9}" width="3.5" height="${cellH-18}" rx="1.75" fill="${kind.c}"></rect>`+
+      `<g class="ico" transform="translate(${n.x+12},${n.y+9}) scale(0.9)" fill="none" stroke="${kind.c}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${ICONS[kind.k]}</g>`+
+      `<text x="${n.x+34}" y="${n.y+21}">${n.name}</text>`+
+      `<text class="sub" x="${n.x+13}" y="${n.y+42}">${n.sub}</text>${badge}</g>`; });
+  const kindsUsed=[...new Set(p.nodes.filter(n=>state.revealed.has(n.id)).map(n=>kindOf(n).k))];
+  const legend=`<div class="legend">`+kindsUsed.map(k=>`<span class="lg"><i style="background:${KC[k]}"></i>${KIND_LABEL[k]}</span>`).join('')+`</div>`;
+  const defs=`<defs>`+
+    `<linearGradient id="nodegrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#232d3a"/><stop offset="1" stop-color="#171d27"/></linearGradient>`+
+    `<filter id="nodeshadow" x="-20%" y="-25%" width="140%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2.2" flood-color="#000" flood-opacity="0.4"/></filter>`+
+    `<marker id="arr" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 L3,5 Z" fill="var(--edge)"/></marker>`+
+    `</defs>`;
+  document.getElementById('diagram').innerHTML=`<svg viewBox="0 0 ${maxX} ${maxY}">${defs}${edges}${nodes}${elabels}</svg>`+legend;
   document.querySelectorAll('#diagram .node').forEach(el=>el.onclick=()=>{ if(state.playing)return; state.activeNode=el.dataset.node; if(state.phase!==4)setPhase(4); else{renderDiagram();renderPanel();} });
   const total=p.nodes.length, shown=state.revealed.size;
   const dh=document.getElementById('dhint'); if(dh) dh.textContent=shown<total?`${shown}/${total} components`:`all ${total} components`;

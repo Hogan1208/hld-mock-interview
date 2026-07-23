@@ -15,7 +15,7 @@ window.DATA['scheduler'] = {
     {id:"coordinator",name:"Coordinator",sub:"leader / locks",x:210,y:40},
     {id:"deadletter",name:"Dead-letter",sub:"failed / retries",x:550,y:260},
   ],
-  edges:[["client","api"],["api","jobdb"],["jobdb","worker"],["scheduler","jobdb"],["scheduler","queue"],["queue","worker"],["coordinator","scheduler"],["worker","deadletter"]],
+  edges:[["client","api","submit"],["api","jobdb","persist"],["jobdb","worker","claim"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"],["coordinator","scheduler","elect"],["worker","deadletter","on fail"]],
   core:["client","api","jobdb","worker"],
   basic:["client","api","jobdb","worker"],
   dbDoc:{

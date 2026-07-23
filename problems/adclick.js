@@ -15,7 +15,7 @@ window.DATA['adclick'] = {
     {id:"batch",name:"Batch recompute",sub:"reconciliation",x:380,y:260},
     {id:"query",name:"Query API",sub:"advertiser reads",x:720,y:150},
   ],
-  edges:[["client","gw"],["gw","stream"],["stream","agg"],["agg","olap"],["stream","dedup"],["agg","batch"],["olap","query"]],
+  edges:[["client","gw","click"],["gw","stream","ingest"],["stream","agg","consume"],["agg","olap","rollup"],["stream","dedup","dedup"],["agg","batch","reconcile"],["olap","query","read"]],
   core:["client","gw","stream","agg"],
   basic:["client","gw","stream","agg"],
   dbDoc:{
