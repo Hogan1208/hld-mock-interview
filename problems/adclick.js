@@ -314,6 +314,88 @@ window.DATA['adclick'] = {
       {node:"olap",requires:["olap"],text:"It idempotently overwrites the affected <code>(adId, minute)</code> aggregates with a higher batch version."},
     ]},
   ],
+  deepFlows:[
+    {id:"ingest-rollup-e2e",name:"Click to rollup",summary:"**Click beacon** → gateway validates/enriches → Kafka append keyed by <code>ad_id</code> with **RF=3 / acks=all** → dedup by <code>click_id</code> → event-time 1-minute count → idempotent rollup write to **aggregates** → dashboard reads provisional data.",steps:[
+      {node:"client",title:"Browser fires the click beacon",narrate:"The ad SDK creates one stable <code>click_id</code> for this user action and reuses it on every retry. The payload is tiny (~100B) because the system must absorb ~1M clicks/s steady and ~10M/s peak without making navigation wait.",details:[
+        {k:"wire",label:"Beacon payload",lang:"http",code:"POST /v1/clicks\nContent-Type: application/json\n\n{\n  \"click_id\": \"c-8f3a\",\n  \"ad_id\": 42,\n  \"user_id\": \"u-19d2\",\n  \"ts\": \"2026-07-22T12:00:59Z\",\n  \"ip\": \"203.0.113.7\"\n}"},
+        {k:"note",label:"The invariant",text:"The <code>click_id</code> is minted once per click, not once per HTTP attempt. If a flaky client retries with a fresh id, downstream dedup cannot collapse the copies and the advertiser is over-counted."},
+      ]},
+      {node:"gw",title:"Gateway validates and enriches",narrate:"A stateless gateway checks required fields, authenticates the source, adds receive-time/geo/campaign metadata from a cache, then batches and compresses Kafka produces. At peak, ~200 gateway instances at ~50K events/s each cover the 10M/s firehose with headroom.",details:[
+        {k:"wire",label:"Enriched event sent downstream",lang:"json",code:"{\n  \"click_id\": \"c-8f3a\",\n  \"ad_id\": 42,\n  \"user_id\": \"u-19d2\",\n  \"ts\": \"2026-07-22T12:00:59Z\",\n  \"ip\": \"203.0.113.7\",\n  \"geo\": \"US\",\n  \"received_at\": \"2026-07-22T12:01:00.120Z\"\n}"},
+        {k:"gotcha",label:"Ack timing",text:"For billable clicks, the gateway should not tell the SDK \"delivered\" until Kafka durably accepts the record. Analytics-only beacons can be fire-and-forget, but money needs ack-after-durable plus retry with the same <code>click_id</code>."},
+      ]},
+      {node:"stream",title:"Append to Kafka keyed by ad_id",narrate:"The gateway produces to the durable click log with key <code>ad_id=42</code>. That routes all events for an ad to one ordered partition, letting one consumer maintain the ad's local window state without a per-event shuffle.",details:[
+        {k:"route",label:"Partition decision",lang:"python",code:"NUM_PARTITIONS = 120\npartition = hash(ad_id) % NUM_PARTITIONS\n# ad_id=42 -> partition 17\nproducer.send(\"raw-clicks\", key=42, value=event)"},
+        {k:"route",label:"Why ad_id wins",text:"Aggregation is per ad, so <code>ad_id</code> locality makes <code>(ad_id, minute_bucket)</code> counts cheap. The trade-off is skew: a viral ad can pin one partition, so hot ads are dynamically salted as <code>42#0..42#K-1</code> and later recombined."},
+        {k:"repl",label:"Durable log write",text:"Use Kafka RF=3, <code>acks=all</code>, and <code>min.insync.replicas=2</code>. A broker can die after the ack and an in-sync replica is promoted without losing acknowledged clicks; the 7-day hot log is ~180TB including RF3."},
+      ]},
+      {node:"dedup",title:"Dedup before counting",narrate:"The dedup stage performs a local check-and-set on <code>click_id</code>. Duplicates from SDK retries, gateway re-produce, or consumer replay are dropped before they affect the billable count.",details:[
+        {k:"query",label:"Seen-set operation",lang:"sql",code:"-- conceptual table; implemented as RocksDB + changelog, not a remote SQL call\nINSERT INTO dedup_keys (click_id, seen_at, ttl_expires_at)\nVALUES ('c-8f3a', now(), now() + interval '24 hours')\nON CONFLICT (click_id) DO NOTHING;\n\n-- inserted 1 row => first copy, forward to aggregation\n-- inserted 0 rows => duplicate, drop"},
+        {k:"note",label:"State size",text:"A 24h TTL covers retry/lateness duplicates: 86B ids/day × ~40B ≈ 3.4TB total, or ~29GB per Kafka partition across ~120 partitions. Keep the recent hot window exact; use a bloom/cuckoo filter only for the older tail."},
+      ]},
+      {node:"agg",title:"Aggregate by event-time minute",narrate:"The stream processor uses <code>ts</code>, not arrival time, to update a tumbling 1-minute window keyed by <code>(ad_id, minute_bucket)</code>. It keeps windows open for a ~15 minute grace period so p99 late clicks can still correct the live count.",details:[
+        {k:"query",label:"Window update",lang:"sql",code:"minute_bucket = date_trunc('minute', ts)\nstate[(ad_id, minute_bucket)].count += 1\n\n-- example\n(42, '2026-07-22 12:00:00') -> 18432"},
+        {k:"repl",label:"Checkpoint state + offset together",text:"RocksDB window state is checkpointed with the consumed Kafka offset. If a task crashes at 12:00:30 after a 12:00:20 checkpoint, it restores state at 12:00:20 and replays from that offset, so the ten seconds are neither lost nor double-counted."},
+      ]},
+      {node:"olap",title:"Write the rollup row",narrate:"On window close (or correction within grace), the aggregator emits an upsert for the aggregate store. Writes scale with active ads per minute (~17K/s steady for ~1M active ads/min), not with the raw 10M/s click rate.",details:[
+        {k:"query",label:"Speed-layer upsert",lang:"sql",code:"INSERT INTO aggregates (ad_id, minute_bucket, count, batch_version)\nVALUES (42, '2026-07-22 12:00:00Z', 18432, 0)\nON CONFLICT (ad_id, minute_bucket) DO UPDATE\nSET count = EXCLUDED.count,\n    batch_version = GREATEST(aggregates.batch_version, EXCLUDED.batch_version);"},
+        {k:"note",label:"Why set, not increment",text:"The write carries the current window total and overwrites by key. If replay re-emits the same window, it replaces the value instead of adding 18,432 twice."},
+      ]},
+      {node:"query",title:"Dashboard reads provisional rollup",narrate:"Advertisers read the pre-aggregated speed layer through the query API. The last few buckets are labelled provisional because late events and batch reconciliation can still settle them before billing.",details:[
+        {k:"wire",label:"Dashboard response",lang:"json",code:"{\n  \"ad_id\": 42,\n  \"from\": \"2026-07-22T12:00:00Z\",\n  \"to\": \"2026-07-22T12:02:00Z\",\n  \"buckets\": [\n    { \"minute_bucket\": \"2026-07-22T12:00:00Z\", \"count\": 18432, \"status\": \"provisional\" },\n    { \"minute_bucket\": \"2026-07-22T12:01:00Z\", \"count\": 17190, \"status\": \"provisional\" }\n  ]\n}"},
+      ]},
+    ]},
+
+    {id:"dashboard-query-e2e",name:"Advertiser query",summary:"**GET /metrics** → cache key by query/time bucket → Druid broker scans only time-partitioned aggregate segments for <code>ad_id</code> → replicas must provide full coverage → return stale-labelled or provisional data, never partial sums.",steps:[
+      {node:"query",title:"Advertiser asks for last-24h metrics",narrate:"The query API is stateless: authenticate the advertiser, normalize the range/granularity, check a short-TTL result cache, then fan out to OLAP only on a miss. Peak read load is ~50K dashboard QPS, but a 15-30s cache should collapse ~90% of repeated scans.",details:[
+        {k:"wire",label:"Request",lang:"http",code:"GET /v1/metrics?ad_id=42&from=2026-07-21T12:00:00Z&to=2026-07-22T12:00:00Z&granularity=minute\nAuthorization: Bearer advertiser-token"},
+        {k:"route",label:"Cache key",lang:"text",code:"cache_key = sha256(ad_id=42|from=2026-07-21T12:00Z|to=2026-07-22T12:00Z|granularity=minute)\nTTL = 15-30s for live dashboard buckets"},
+      ]},
+      {node:"olap",title:"Planner scans aggregate segments",narrate:"The OLAP store is laid out for range + group-by over pre-aggregated rows. A last-24h ad query touches ~1,440 minute buckets for <code>ad_id=42</code>, not the 86B/day raw events.",details:[
+        {k:"query",label:"Concrete rollup scan",lang:"sql",code:"SELECT minute_bucket, SUM(count) AS clicks\nFROM aggregates\nWHERE ad_id = 42\n  AND minute_bucket >= '2026-07-21 12:00:00Z'\n  AND minute_bucket <  '2026-07-22 12:00:00Z'\nGROUP BY minute_bucket\nORDER BY minute_bucket;"},
+        {k:"route",label:"Segment routing",text:"Segments are partitioned by time and sorted/indexed by <code>ad_id</code>. The broker fans out only to segments in the requested window and reads mostly the <code>count</code> column, so p99 stays under ~1s."},
+      ]},
+      {node:"olap",title:"Require complete replica coverage",narrate:"The broker must not silently return a partial sum if a data node is down. Druid-style historical replicas (RF≥2) should cover the same segments; if coverage is incomplete, the API serves last-good cached data with an as-of timestamp or fails clearly.",details:[
+        {k:"repl",label:"Read availability rule",text:"Handed-off immutable segments live in deep storage and are replicated across historical nodes. Recent real-time segments are covered by replicated tasks, and Kafka replay can reconstruct them if both replicas disappear."},
+        {k:"gotcha",label:"Partial is worse than stale",text:"A confidently low click count can make an advertiser pause a good campaign. Stale-but-labelled cached data is acceptable for dashboards; billing must wait for finalized batch numbers."},
+      ]},
+      {node:"query",title:"Return labelled results",narrate:"The API returns the time series and marks recent buckets provisional. Long ranges use coarser hour/day rollups where possible; a 30-day daily chart reads ~30 day rows instead of 43,200 minute rows.",details:[
+        {k:"wire",label:"Response",lang:"json",code:"200 OK\n{\n  \"ad_id\": 42,\n  \"fresh_as_of\": \"2026-07-22T12:01:30Z\",\n  \"source\": \"speed_layer\",\n  \"buckets\": [\n    { \"minute_bucket\": \"2026-07-22T12:00:00Z\", \"clicks\": 18432, \"status\": \"provisional\" }\n  ]\n}"},
+        {k:"note",label:"Dashboard vs invoice",text:"Dashboards optimize for freshness and may change as late data arrives. Invoices read finalized batch output, so money uses the eventually exact path rather than the speed-layer estimate."},
+      ]},
+    ]},
+
+    {id:"correctness-replay-e2e",name:"Correctness replay",summary:"Duplicate/late clicks flow through **at-least-once Kafka** → co-partitioned dedup → atomic state+offset checkpoints → watermark/grace handling → batch recompute from raw truth → higher <code>batch_version</code> atomically supersedes speed-layer rows.",steps:[
+      {node:"client",title:"A retry sends the same click again",narrate:"The common correctness case starts with an ordinary timeout: the SDK never sees a durable ack, so it retries. This is good for durability only if every attempt carries the same <code>click_id</code>.",details:[
+        {k:"wire",label:"Two attempts, same id",lang:"json",code:"// attempt 1 and retry are byte-for-byte identical for identity fields\n{ \"click_id\": \"c-8f3a\", \"ad_id\": 42, \"user_id\": \"u-19d2\", \"ts\": \"2026-07-22T12:00:59Z\", \"ip\": \"203.0.113.7\" }\n{ \"click_id\": \"c-8f3a\", \"ad_id\": 42, \"user_id\": \"u-19d2\", \"ts\": \"2026-07-22T12:00:59Z\", \"ip\": \"203.0.113.7\" }"},
+        {k:"gotcha",label:"New id per retry breaks billing",text:"If the second attempt is <code>c-new</code>, no downstream system can prove it is the same human click. The SDK's click-id lifecycle is therefore a billing-critical contract."},
+      ]},
+      {node:"stream",from:"gw",title:"At-least-once append is durable, not unique",narrate:"Kafka may contain both copies because the gateway retries after an ambiguous produce result. That is acceptable: the log's job is durable replay, not business-level uniqueness.",details:[
+        {k:"repl",label:"No acknowledged loss",text:"With RF=3, <code>acks=all</code>, and <code>min.insync.replicas=2</code>, a leader loss does not lose acknowledged events. Consumers resume from committed offsets after failover."},
+        {k:"gotcha",label:"Exactly-once is layered",text:"Kafka idempotent producers reduce producer duplicates, but billable correctness still needs <code>click_id</code> dedup and idempotent aggregate writes. Do not claim the broker alone makes ad billing exactly once."},
+      ]},
+      {node:"dedup",title:"Check-and-set collapses duplicates",narrate:"Both copies route to the same local dedup task because duplicates share <code>ad_id</code> and <code>click_id</code>. The first copy inserts <code>dedup_keys.click_id</code>; the retry sees the key and is dropped.",details:[
+        {k:"query",label:"Dedup key state",lang:"sql",code:"SELECT click_id, seen_at, ttl_expires_at\nFROM dedup_keys\nWHERE click_id = 'c-8f3a';\n\n-- absent -> insert and forward\n-- present until ~2026-07-23 12:00:59 -> duplicate, drop"},
+        {k:"repl",label:"Crash recovery for seen-set",text:"The embedded RocksDB seen-set is backed by a compacted changelog/checkpoint. A restarted task restores <code>dedup_keys</code> for the 24h TTL window instead of forgetting already-seen clicks."},
+      ]},
+      {node:"agg",title:"Replay-safe window state",narrate:"After dedup, the aggregator updates event-time windows. If it crashes after writing state but before committing offsets, recovery restores state and offset together; if the OLAP write is external, the emitted aggregate must still be idempotent.",details:[
+        {k:"query",label:"Idempotent aggregate emission",lang:"sql",code:"-- emit the whole value for the key, not an increment delta\nkey = (ad_id=42, minute_bucket='2026-07-22 12:00:00Z')\nvalue = { count: 18432, batch_version: 0, source: 'speed' }"},
+        {k:"repl",label:"Atomic boundary",text:"Prefer writing aggregates to an output Kafka topic transactionally with the input offsets, then let OLAP ingest that topic. If writing OLAP directly, use upsert-by-key with a monotonic version so replay overwrites rather than double-adds."},
+      ]},
+      {node:"agg",title:"Late events hit watermark logic",narrate:"A click with <code>ts=12:00:59</code> arriving at 12:10 is still within the ~15 minute grace and updates the 12:00 window. The same event arriving at 12:20 is beyond grace: the speed layer records a correction marker and sends it to reconciliation rather than mutating a finalized live window.",details:[
+        {k:"route",label:"Grace decision",lang:"python",code:"minute_bucket = floor_to_minute(ts)\nwatermark = max_event_time_seen - timedelta(minutes=15)\n\nif ts >= watermark:\n    update_live_window(ad_id, minute_bucket)\nelse:\n    write_correction_marker(ad_id, minute_bucket, click_id)"},
+        {k:"gotcha",label:"Accuracy vs latency",text:"Longer grace catches more stragglers live but delays finalization and increases RocksDB state. Shorter grace makes dashboards settle faster but pushes more corrections to batch. The problem's design picks ~15 minutes to cover p99 lateness."},
+      ]},
+      {node:"batch",title:"Recompute truth from raw events",narrate:"For a late tail, fraud adjustment, or deploy bug from 12:00-13:00, reconciliation reads immutable raw clicks from Kafka hot retention or object storage and recomputes exact counts with authoritative dedup.",details:[
+        {k:"query",label:"Authoritative recompute",lang:"sql",code:"INSERT INTO batch_recompute_runs\n  (run_id, window_start, window_end, status)\nVALUES\n  ('r-4403', '2026-07-22 12:00:00Z', '2026-07-22 13:00:00Z', 'running');\n\nSELECT ad_id,\n       date_trunc('minute', ts) AS minute_bucket,\n       COUNT(DISTINCT click_id) AS count\nFROM raw_click_events\nWHERE ts >= '2026-07-22 12:00:00Z'\n  AND ts <  '2026-07-22 13:00:00Z'\nGROUP BY ad_id, date_trunc('minute', ts);"},
+        {k:"note",label:"Scale the recompute",text:"A full day is 86B events, so steady-state batch reads only correction-marked windows; large fixes are parallelized by hour and <code>ad_id</code> range over columnar raw data in object storage retained for the billing-dispute horizon (~90d)."},
+      ]},
+      {node:"olap",title:"Batch version supersedes speed",narrate:"Batch writes set the corrected aggregate value with a higher <code>batch_version</code>. Readers prefer finalized higher versions, and immutable segment/version swaps keep partial recomputes invisible.",details:[
+        {k:"query",label:"Final overwrite",lang:"sql",code:"INSERT INTO aggregates (ad_id, minute_bucket, count, batch_version)\nVALUES (42, '2026-07-22 12:00:00Z', 18390, 2)\nON CONFLICT (ad_id, minute_bucket) DO UPDATE\nSET count = EXCLUDED.count,\n    batch_version = EXCLUDED.batch_version\nWHERE aggregates.batch_version < EXCLUDED.batch_version;"},
+        {k:"repl",label:"Atomic visibility",text:"Batch writes a new immutable segment/version and flips the serving pointer only after the whole range succeeds. If the job dies 60% through, rerun safely; advertisers never see a mixed half-corrected hour."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Ingest a firehose of ad-click events at very high throughput without dropping clicks",

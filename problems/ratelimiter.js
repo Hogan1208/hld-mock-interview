@@ -278,6 +278,90 @@ window.DATA['ratelimiter'] = {
       {node:"client",text:"Client honors <code>Retry-After</code> and backs off for 30 seconds."},
     ]},
   ],
+  deepFlows:[
+    {id:"strict-central-e2e",name:"Strict allow/deny",summary:"**API request** → gateway extracts <code>k_free_42</code> → cached rule <code>free-default</code> (<code>1000/60s sliding_window</code>) → **Redis Cluster slot by api-key** → one atomic Lua decision → <code>200</code> with remaining quota or <code>429</code> with retry guidance.",steps:[
+      {node:"client",title:"Client sends an API call",narrate:"The caller does not call the limiter directly; it sends the normal API request with an API key. The limit is enforced before the request reaches the protected backend, so a rejected request is cheap.",details:[
+        {k:"wire",label:"Request on the wire",lang:"http",code:"GET /v1/reports?date=2026-07-25 HTTP/1.1\nHost: api.example.com\nX-API-Key: k_free_42\nX-Request-Id: req_7f3a"},
+      ]},
+      {node:"gw",title:"Gateway authenticates and gates",narrate:"The gateway terminates TLS, authenticates <code>k_free_42</code>, and checks its in-process deny cache first. If the key is not already known-over-limit, it asks the limiter for a decision with a very tight timeout so the rate limiter cannot stall all traffic.",details:[
+        {k:"wire",label:"Decision RPC",lang:"json",code:"{\n  \"key\": \"k_free_42\",\n  \"scope\": \"api-key\",\n  \"cost\": 1,\n  \"request_id\": \"req_7f3a\",\n  \"now_ms\": 1718000487320\n}"},
+        {k:"note",label:"Cheap reject path",text:"If <code>k_free_42</code> is in the gateway's short-lived over-limit cache, the gateway returns <code>429</code> locally and skips the limiter/store hop. A denied request must cost far less than an allowed one."},
+      ]},
+      {node:"config",title:"Resolve the rule from cache",narrate:"The limiter keeps the small versioned rule set in memory, so rule lookup is a microsecond hash lookup, not a per-request config-store read. For this key the cached tier maps to <code>free-default</code>.",details:[
+        {k:"query",label:"Rule row used",lang:"sql",code:"SELECT rule_id, scope, tier, limit, window_seconds, algorithm\nFROM rate_limit_rules\nWHERE rule_id = 'free-default';\n-- free-default | api-key | free | 1000 | 60 | sliding_window"},
+        {k:"note",label:"Why config is off path",text:"The full rule set is only ~1MB and fans out to ~80 nodes in ~1-2s. Keeping it cached preserves the p99 &lt; 5ms decision budget and avoids making config availability part of every request."},
+      ]},
+      {node:"algo",title:"Compute the sliding-window keys",narrate:"The algorithm engine turns <code>1000/min sliding_window</code> into two Redis counters: current minute and previous minute. It estimates the trailing 60s by weighting the previous bucket by the fraction of the window still overlapping.",details:[
+        {k:"route",label:"Window math",lang:"text",code:"window_start = floor(now_ms / 60000) * 60000\nelapsed      = now_ms - window_start\nweight_prev  = (60000 - elapsed) / 60000\nestimated    = current_count + previous_count * weight_prev"},
+        {k:"gotcha",label:"Why not fixed window",text:"A fixed minute bucket would allow <code>1000</code> at 12:00:59 and another <code>1000</code> at 12:01:00. The sliding-window counter keeps O(1) state but removes most of that boundary burst."},
+      ]},
+      {node:"store",title:"Route to one Redis shard and run Lua",narrate:"All counters for <code>k_free_42</code> use the same Redis hash tag, so every limiter instance routes this key to the same cluster slot and the same primary shard. Redis executes the script atomically on that owner: increment, set TTL, read previous bucket, compute estimate, and return the decision.",details:[
+        {k:"route",label:"Key and shard scheme",lang:"text",code:"current = rl:api-key:{k_free_42}:1718000460\nprev    = rl:api-key:{k_free_42}:1718000400\nslot    = CRC16('k_free_42') % 16384\nshard   = slot -> one of ~12 Redis primaries"},
+        {k:"query",label:"Atomic sliding-window script",lang:"lua",code:"-- KEYS[1]=current, KEYS[2]=previous\n-- ARGV[1]=limit, ARGV[2]=ttl_seconds, ARGV[3]=prev_weight\nlocal current = redis.call('INCR', KEYS[1])\nif current == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end\nlocal previous = tonumber(redis.call('GET', KEYS[2]) or '0')\nlocal estimate = current + previous * tonumber(ARGV[3])\nlocal allowed = estimate <= tonumber(ARGV[1])\nlocal remaining = math.max(0, tonumber(ARGV[1]) - math.floor(estimate))\nreturn { allowed and 1 or 0, remaining, current, previous }"},
+        {k:"repl",label:"Replication behavior",text:"The primary returns only after the Lua script completes locally, then streams the mutation to its replica(s) asynchronously for failover. Counters are ephemeral and TTL'd, so the design prioritizes sub-ms atomicity over disk/quorum durability; a promoted replica may miss only the last few increments, not durable business data."},
+      ]},
+      {node:"limiter",title:"Interpret the result",narrate:"The limiter converts the script output into an allow/deny response. Under the cap it returns remaining tokens; over the cap it computes how long until the weighted estimate can fall under 1000 again.",details:[
+        {k:"wire",label:"Allow decision",lang:"json",code:"{\n  \"allowed\": true,\n  \"limit\": 1000,\n  \"remaining\": 24,\n  \"reset_ms\": 1718000520000,\n  \"rule_id\": \"free-default\"\n}"},
+        {k:"wire",label:"Deny decision",lang:"json",code:"{\n  \"allowed\": false,\n  \"limit\": 1000,\n  \"remaining\": 0,\n  \"retry_after_seconds\": 30,\n  \"rule_id\": \"free-default\"\n}"},
+      ]},
+      {node:"gw",title:"Return headers to the caller",narrate:"The gateway either forwards the request upstream or rejects it immediately. It always sends limit headers so cooperative clients can slow down before they hit zero.",details:[
+        {k:"wire",label:"Allowed response headers",lang:"http",code:"200 OK\nX-RateLimit-Limit: 1000\nX-RateLimit-Remaining: 24\nX-RateLimit-Reset: 1718000520"},
+        {k:"wire",label:"Over-limit response",lang:"http",code:"429 Too Many Requests\nRetry-After: 30\nX-RateLimit-Limit: 1000\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 1718000520"},
+      ]},
+    ]},
+
+    {id:"local-budget-e2e",name:"Local budget sync",summary:"For high-volume tiers, **config picks token_bucket + local counting** → sync allocates per-node budgets every ~500ms → limiter spends locally in microseconds → deltas reconcile back to Redis; latency drops while overshoot is bounded and explicit.",steps:[
+      {node:"config",title:"Pick the high-volume rule",narrate:"Not every tier needs the same accuracy/latency trade. The enterprise key <code>k_ent_3</code> uses <code>5000000/min token_bucket</code>, where a few-percent soft overshoot is acceptable compared with paying a Redis round-trip for every request.",details:[
+        {k:"query",label:"Enterprise rule",lang:"sql",code:"SELECT rule_id, limit, window_seconds, algorithm\nFROM rate_limit_rules\nWHERE rule_id = 'ent-k_ent_3';\n-- ent-k_ent_3 | 5000000 | 60 | token_bucket"},
+        {k:"gotcha",label:"Per-tier, not universal",text:"Free tier <code>1000/min</code> can stay strict-central because volume is low and accuracy matters. High-volume enterprise traffic can use local budgets because the limit is large enough to divide across nodes without rounding the caller down to nothing."},
+      ]},
+      {node:"sync",title:"Sync allocates node budgets",narrate:"Cluster sync tracks recent deltas from the ~50 limiter nodes and hands each node a slice of the remaining global budget, weighted by recent traffic. Allocations expire quickly so a partition cannot spend stale credit forever.",details:[
+        {k:"route",label:"Budget formula",lang:"text",code:"global_limit = 5_000_000 per 60s\nused_global = Redis/token bucket view + reported deltas\nremaining   = global_limit - used_global\nnode_i_share = remaining * recent_rps_i / sum(recent_rps_all)\nlease_ttl_ms = 2000"},
+        {k:"wire",label:"Budget pushed to limiter-17",lang:"json",code:"{\n  \"key\": \"k_ent_3\",\n  \"rule_id\": \"ent-k_ent_3\",\n  \"budget\": 82000,\n  \"valid_until_ms\": 1718000489000,\n  \"epoch\": 44\n}"},
+        {k:"note",label:"Why proportional",text:"Static <code>global/N</code> wastes quota on idle nodes and starves busy ones. Proportional allocation moves budget toward where traffic is actually landing while keeping the sum of all leases bounded by the global remaining budget."},
+      ]},
+      {node:"limiter",title:"Spend budget locally",narrate:"For a request hitting limiter-17, the hot-path decision is now an in-memory decrement guarded by the allocation epoch. That moves per-instance throughput from ~25K/s strict-central toward ~200K/s local decisions.",details:[
+        {k:"query",label:"In-process check",lang:"python",code:"b = budgets['k_ent_3']\nif now_ms <= b.valid_until_ms and b.remaining >= 1:\n    b.remaining -= 1\n    local_delta['k_ent_3'] += 1\n    return ALLOW\nreturn strict_central_or_deny()"},
+        {k:"note",label:"Latency trade",text:"This avoids the Redis round-trip on most enterprise requests and keeps decision overhead comfortably below 5ms. The price is that the global count is exact only at reconcile boundaries, not every microsecond."},
+      ]},
+      {node:"sync",title:"Report deltas every ~500ms",narrate:"Limiter nodes periodically flush compact per-key deltas to sync. The report rate is small — around 50 nodes times two reports per second — but each report can batch many active keys.",details:[
+        {k:"wire",label:"Delta report",lang:"json",code:"{\n  \"node\": \"limiter-17\",\n  \"epoch\": 44,\n  \"interval_ms\": 500,\n  \"deltas\": { \"k_ent_3\": 7231, \"k_pro_9\": 188 }\n}"},
+        {k:"note",label:"Bounded loss on crash",text:"If limiter-17 is SIGKILLed 400ms into the interval, only that node's unflushed volatile delta is lost. The error is bounded to one sync interval and self-heals when the next window/refill establishes a new budget."},
+      ]},
+      {node:"store",title:"Reconcile to the authoritative store",narrate:"Sync folds node deltas into the Redis token-bucket state for the key. The store remains the source of truth; sync's budgets are derived and reconstructable.",details:[
+        {k:"query",label:"Token-bucket reconcile",lang:"lua",code:"-- KEYS[1]=tb:k_ent_3, ARGV[1]=delta, ARGV[2]=now_ms\nlocal bucket = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill_ts')\nlocal tokens = tonumber(bucket[1] or '5000000')\nlocal last = tonumber(bucket[2] or ARGV[2])\nlocal refill = math.max(0, (tonumber(ARGV[2]) - last) * (5000000 / 60000))\ntokens = math.min(5000000, tokens + refill) - tonumber(ARGV[1])\nredis.call('HMSET', KEYS[1], 'tokens', tokens, 'last_refill_ts', ARGV[2])\nredis.call('EXPIRE', KEYS[1], 120)\nreturn tokens"},
+        {k:"route",label:"Same key locality",text:"The token bucket key <code>tb:k_ent_3</code> is hash-slotted by the API key, just like fixed counters, so one Redis owner serializes the authoritative updates for that key."},
+      ]},
+      {node:"algo",title:"State the accuracy bound",narrate:"This flow is intentionally approximate. The design is acceptable only because it names the maximum drift and falls back to strict-central for hard tiers.",details:[
+        {k:"gotcha",label:"Overshoot bound",text:"Worst case is the sum of unspent valid leases plus one report interval of unflushed deltas. Keep leases small, expire them after ~2s, report every ~500ms, and decay toward a conservative floor on sync loss."},
+        {k:"note",label:"When not to use it",text:"Billing-grade or contractual limits should not buffer volatile counts. They pay the strict-central Redis Lua cost so every allowed request is counted before admission."},
+      ]},
+    ]},
+
+    {id:"redis-failover-e2e",name:"Redis shard failure",summary:"A key's counter is **single-owner on one Redis primary** with async replicas; if that primary fails, a replica promotes while limiters apply the explicit fail direction — usually **fail-open with a local cap**, never unlimited.",steps:[
+      {node:"store",title:"One key has one owning primary",narrate:"The cluster has roughly 10-12 Redis primaries for ~1M ops/s, each with a replica for failover. Sharding by API key makes all windows for <code>k_free_42</code> converge on one owner, which is why atomic increments work across ~50 limiter instances.",details:[
+        {k:"route",label:"Cluster placement",lang:"text",code:"CRC16('k_free_42') -> slot 8123\nslot 8123 -> shard-7 primary redis-7a\nreplica redis-7b tails redis-7a's replication stream"},
+        {k:"repl",label:"Async replica, ephemeral counters",text:"Redis replication is asynchronous here. A primary crash can lose a few very recent counter increments, but counters have ~2-window TTLs and are not billing records, so the system accepts tiny under-counting instead of putting disk/quorum latency on every request."},
+      ]},
+      {node:"store",title:"Primary shard disappears",narrate:"If <code>redis-7a</code> crashes, all keys in its slots see connection errors or Redis Cluster redirections during promotion. Without replication those ~1M active keys would reset to zero; with a replica they keep almost all in-window counts.",details:[
+        {k:"wire",label:"Limiter sees shard error",lang:"text",code:"EVALSHA ... rl:api-key:{k_free_42}:1718000460\n-> timeout / CLUSTERDOWN / TRYAGAIN while shard-7 promotes"},
+        {k:"gotcha",label:"What would be bad",text:"Treating the missing shard as a fresh empty counter silently gives every affected key a full new quota. Treating it as global fail-closed can turn one Redis node loss into an API outage for a twelfth of users."},
+      ]},
+      {node:"limiter",title:"Apply the fail-direction policy",narrate:"The limiter handles shard unavailability with the same explicit policy as full-store-down, but scoped to the affected keys. The default for abuse-prevention is fail-open with a weaker local guard; hard/costly tiers can be configured fail-closed.",details:[
+        {k:"query",label:"Degraded local cap",lang:"python",code:"if redis_shard_unavailable(key):\n    if rule.fail_direction == 'closed':\n        return DENY(retry_after=2)\n    cap = min(rule.limit / 50, rule.degraded_static_cap)\n    return local_token_bucket(key, cap, window=rule.window_seconds)"},
+        {k:"note",label:"Fail open, not unlimited",text:"For free <code>1000/min</code>, a per-node fallback around <code>1000/50 = 20/min</code> plus a conservative static ceiling bounds abuse while keeping legitimate traffic alive during a seconds-long failover."},
+        {k:"gotcha",label:"Accuracy cost",text:"A caller sprayed evenly across all ~50 nodes can overshoot the local fallback sum until Redis returns. That is an explicit availability trade-off, not a hidden correctness guarantee."},
+      ]},
+      {node:"gw",title:"Gateway sheds repeat offenders locally",narrate:"While the shard is degraded, the gateway's deny cache becomes more important. Keys that clearly exceed the local fallback are rejected in-process, keeping retries from hammering the recovering Redis shard.",details:[
+        {k:"wire",label:"Degraded 429",lang:"http",code:"429 Too Many Requests\nRetry-After: 2\nX-RateLimit-Policy: degraded-local\nX-RateLimit-Remaining: 0"},
+        {k:"note",label:"Protect the recovery path",text:"The gateway also applies jittered <code>Retry-After</code> and circuit breaking so thousands of clients do not stampede the shard the instant it is promoted."},
+      ]},
+      {node:"sync",title:"Promotion completes and counters converge",narrate:"Redis Cluster promotes the replica and clients refresh their slot map. Strict-central keys resume Lua decisions on the new primary; local-budget keys report their degraded-mode deltas back through sync so budgets are recalculated.",details:[
+        {k:"repl",label:"Failover guarantee",text:"The promoted replica has the primary's replication stream except possibly the last milliseconds of writes. The resulting under-count is bounded and disappears as TTL'd counters expire or token buckets refill."},
+        {k:"route",label:"Client routing after promotion",lang:"text",code:"old: slot 8123 -> redis-7a primary\nfailover: redis-7b promoted\nnew: slot 8123 -> redis-7b primary\nlimiter refreshes slot map and resumes EVALSHA"},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Enforce a request limit per API key / user, by tier (free / pro / enterprise)",

@@ -302,6 +302,76 @@ window.DATA['proximity'] = {
       {node:"db",text:"On accept, atomically claims the trip on the <code>rides</code> row (compare-and-set on driver_id)."},
     ]},
   ],
+  deepFlows:[
+    {id:"nearby-search-e2e",name:"Find nearby drivers",summary:"**GET /nearby** → gateway → match computes an **H3 ring** → geo-index reads exact <code>cell_id</code> buckets → fetch <code>driver_locations</code> + <code>drivers</code> → haversine filter/rank → short-TTL cache → return candidates under the <200ms p99 budget.",steps:[
+      {node:"client",title:"Rider asks for nearby supply",narrate:"The rider app sends the query point and radius. The example uses the same SF coordinates and H3 cells already present in the schema; for a Yelp-style places endpoint the object type changes, but the proximity path is identical.",details:[
+        {k:"wire",label:"Request on the wire",lang:"http",code:"GET /v1/nearby?lat=37.7749&lng=-122.4194&radius_m=2000&limit=12\nAuthorization: Bearer rider-55012"},
+        {k:"note",label:"SLO and scale this path must hit",text:"Normal load is ~20K nearby queries/s, peak ~80K/s, with p99 < 200ms. The query can never scan 1M live drivers; it must jump straight to a small spatial candidate set."},
+      ]},
+      {node:"gw",title:"Gateway authenticates and routes the read",narrate:"The API gateway validates the rider token, rate-limits abusive clients, and sends only latency-sensitive nearby reads to the match service. Driver write traffic stays isolated on the location-ingest path.",details:[
+        {k:"route",label:"Read/write split",text:"Rider reads route <code>client → gw → match</code>; driver updates route <code>client → gw → location</code>. This isolation keeps the ~250K writes/s firehose from starving the ~80K/s peak read path."},
+      ]},
+      {node:"match",title:"Compute the H3 cells to query",narrate:"The match service maps the query point to its H3 cell and chooses the neighbor ring covering the radius. Dense cities use finer cells (H3 res ~10, ~65m); sparse areas can use coarser cells (res ~7, ~1km).",details:[
+        {k:"route",label:"Cell covering for this point",lang:"python",code:"origin = h3.latlng_to_cell(37.7749, -122.4194, res=10)\n# schema examples around downtown SF\ncells = [\n  '8a2830828047fff',   # origin cell: rider + drivers 8821/8830\n  '8a283082807ffff',   # neighbor cell: driver 8822\n  # ...H3 grid_disk(origin, k) until radius_m is covered\n]\ncache_key = f'nearby:{origin}:r2000:available:v1'"},
+        {k:"gotcha",label:"Why neighbor cells are mandatory",text:"A rider near a cell edge can have the closest driver just across the boundary. Querying only <code>origin</code> silently misses that driver, so the ring is part of correctness, not an optimization."},
+      ]},
+      {node:"match",title:"Check the hot-cell read cache first",narrate:"Many riders in the same downtown block ask almost the same question during surge. The match tier can reuse a candidate-id set for a sub-second TTL, then still compute exact distance against each rider's actual lat/lng.",details:[
+        {k:"query",label:"Candidate-set cache",lang:"text",code:"GET cache nearby:8a2830828047fff:r2000:available:v1\nHIT -> [8821, 8830, 8845, 8822] with age_ms < 1000\nMISS -> read geo_index cells, then SETEX key 1s"},
+        {k:"note",label:"Freshness trade-off",text:"A driver moves ~10-15m in one second, well inside a 2km radius. A ~1s cached membership set is acceptable; stale positions still expire at the <code>driver_locations</code> TTL (~15s)."},
+      ]},
+      {node:"index",title:"Read the geo-index buckets",narrate:"On a cache miss, the match service asks the geo-index for each cell's driver id set. The index key is <code>cell_id</code>, so every lookup is a point read against a small Redis set, not a distance scan.",details:[
+        {k:"query",label:"Geo-index lookups by exact cell_id",lang:"redis",code:"SMEMBERS geo_index:8a2830828047fff  # -> 8821 8830 8845\nSMEMBERS geo_index:8a283082807ffff  # -> 8822\nSUNION geo_index:8a2830828047fff geo_index:8a283082807ffff"},
+        {k:"route",label:"Shard key and hotspot trade-off",text:"Route <code>geo_index:{cell_id}</code> by a density-aware region/cell shard: SF downtown cells get split across more shards; rural cells are merged. The trade-off is uneven land-area ownership, but it keeps hot city cells from pinning one node."},
+        {k:"repl",label:"Replication and consistency",text:"The index is derived and rebuildable, but highly available: each hot region is a primary + AZ replica. Reads can use replicas; a miss or failover returns a smaller/staler set from cache instead of failing the query."},
+      ]},
+      {node:"db",title:"Hydrate live positions and availability",narrate:"Candidate ids are not enough; the match service fetches the current coordinates from <code>driver_locations</code> and joins availability from <code>drivers</code>. TTL and status filtering remove stale/offline entries before ranking.",details:[
+        {k:"query",label:"Fetch current position rows",lang:"sql",code:"SELECT driver_id, h3_cell, lat, lng, ts\nFROM driver_locations\nWHERE driver_id IN (8821, 8830, 8845, 8822)\n  AND ts > now() - interval '15 seconds';\n\nSELECT driver_id, status\nFROM drivers\nWHERE driver_id IN (8821, 8830, 8845, 8822)\n  AND status = 'available';"},
+        {k:"note",label:"Why two stores are okay",text:"<code>driver_locations</code> is the hot in-memory latest-wins record; <code>drivers</code> carries durable-ish driver metadata/status. The response only needs entries present and fresh in both."},
+      ]},
+      {node:"match",title:"Exact filter, rank, and cap",narrate:"The index returns a superset. Match computes haversine distance from the rider point, drops candidates outside 2km, ranks by distance/ETA, and caps the result so one crowded cell cannot explode per-query CPU.",details:[
+        {k:"query",label:"Exact filtering logic",lang:"python",code:"rows = [r for r in candidate_rows if r.status == 'available']\ninside = [r for r in rows if haversine_m(37.7749, -122.4194, r.lat, r.lng) <= 2000]\nranked = sorted(inside, key=lambda r: (eta_seconds(r), distance_m(r)))[:12]"},
+        {k:"gotcha",label:"Cap candidates deliberately",text:"In Times Square, even fine cells can overflow. Gather nearest-first and cap the working set; a rider needs the best 12, not every one of 100K nearby drivers."},
+      ]},
+      {node:"client",title:"Return ranked nearby candidates",narrate:"The client receives a bounded list with freshness metadata so downstream dispatch can decide whether to offer immediately or refresh before assignment.",details:[
+        {k:"wire",label:"Response",lang:"json",code:"{\n  \"query\": { \"lat\": 37.7749, \"lng\": -122.4194, \"radius_m\": 2000 },\n  \"freshness_ms\": 850,\n  \"candidates\": [\n    { \"driver_id\": 8821, \"distance_m\": 0,   \"eta_s\": 55, \"h3_cell\": \"8a2830828047fff\" },\n    { \"driver_id\": 8830, \"distance_m\": 70,  \"eta_s\": 65, \"h3_cell\": \"8a2830828047fff\" },\n    { \"driver_id\": 8822, \"distance_m\": 980, \"eta_s\": 180, \"h3_cell\": \"8a283082807ffff\" }\n  ]\n}"},
+      ]},
+    ]},
+
+    {id:"location-index-write-e2e",name:"Update a driver's location",summary:"Driver frame → gateway rate limit → ingest batches latest-per-driver → compute <code>h3_cell</code> → upsert <code>driver_locations</code> with TTL → conditional move in <code>geo_index</code> only on cell change → replicate in-memory shards and fork durable history off-path.",steps:[
+      {node:"client",title:"Driver streams a new GPS sample",narrate:"A moving driver sends tiny fire-and-forget frames every ~4s. The client does not wait for durable storage because the next sample supersedes this one almost immediately.",details:[
+        {k:"wire",label:"Location frame",lang:"json",code:"{\n  \"driver_id\": 8821,\n  \"lat\": 37.7752,\n  \"lng\": -122.4188,\n  \"ts\": \"2026-07-22T10:05:07Z\",\n  \"status\": \"available\",\n  \"seq\": 918273\n}"},
+        {k:"note",label:"Write load",text:"~1M active drivers / ~4s report interval = ~250K location writes/s sustained. Each write is latest-wins and tiny, so throughput and freshness dominate durability."},
+      ]},
+      {node:"gw",title:"Gateway protects the ingest path",narrate:"The gateway authenticates the driver connection and applies a per-driver token bucket. If a buggy app sends 50 updates/s, the edge keeps the newest frame and drops intermediates.",details:[
+        {k:"route",label:"Routing key into ingest",text:"Route frames by <code>hash(driver_id)</code> so all samples for driver 8821 land on the same ingest partition. That lets the partition collapse duplicates without cross-node coordination."},
+        {k:"gotcha",label:"Why dropping is correct",text:"For current position, old samples are actively harmful. If ingest is overloaded, shed stale updates and keep the newest per driver rather than buffering a 30s-old trail."},
+      ]},
+      {node:"location",title:"Batch and collapse to latest per driver",narrate:"Location ingest batches over ~50-100ms, normalizes the point, and retains only the highest-sequence sample for each driver in the batch. It also forks a durable event to Kafka for analytics/history outside the hot path.",details:[
+        {k:"query",label:"Batch collapse",lang:"python",code:"batch = read_frames(window_ms=100)\nlatest = {}\nfor frame in batch:\n    if frame.seq > latest.get(frame.driver_id, {}).get('seq', -1):\n        latest[frame.driver_id] = frame\n# write only latest[8821], not every intermediate GPS point"},
+        {k:"repl",label:"Durable fork is off the hot path",text:"The matching path is at-most-once/ephemeral. A separate Kafka publish stores trip trails, analytics, and billing history; slowing live matching for a WAL on disposable samples would waste the 250K/s budget."},
+      ]},
+      {node:"location",title:"Compute the target H3 cell",narrate:"The ingest service computes the cell before writing. If the cell did not change, it skips the expensive index move and only refreshes the live position TTL.",details:[
+        {k:"route",label:"Cell calculation",lang:"python",code:"new_cell = h3.latlng_to_cell(37.7752, -122.4188, res=10)\n# new_cell == '8a2830828047fff' for the schema example\nold = GET driver_locations:8821  # old.h3_cell may be '8a283082807ffff'\ncell_changed = old.h3_cell != new_cell"},
+        {k:"note",label:"Write amplification control",text:"Only ~1 in 15 driver updates crosses a cell boundary, so conditional index moves cut index writes from ~250K/s to roughly ~17K/s."},
+      ]},
+      {node:"db",title:"Upsert the latest live position",narrate:"The hot location store overwrites one row keyed by <code>driver_id</code>. The entry has a ~15s TTL so an offline driver automatically disappears after 2-3 missed reports.",details:[
+        {k:"query",label:"Latest-wins upsert",lang:"sql",code:"UPSERT INTO driver_locations\n  (driver_id, h3_cell, lat, lng, ts)\nVALUES\n  (8821, '8a2830828047fff', 37.7752, -122.4188, '2026-07-22 10:05:07Z')\nTTL 15 SECONDS;"},
+        {k:"route",label:"Shard key for live positions",text:"Point writes route by <code>driver_id</code> for even ingest distribution; geo reads use the separate <code>geo_index</code> by <code>cell_id</code>. Splitting the keys avoids making every driver write hammer a dense city cell."},
+      ]},
+      {node:"index",title:"Move between geo-index buckets if needed",narrate:"If the computed H3 cell changed, ingest removes the driver id from the old cell's set and adds it to the new cell's set. This is derived state, but the move should be atomic enough that a driver is not missing from both cells.",details:[
+        {k:"query",label:"Conditional bucket move",lang:"redis",code:"# only when old_cell != new_cell\nMULTI\n  SREM geo_index:8a283082807ffff 8821\n  SADD geo_index:8a2830828047fff 8821\n  HINCRBY geo_index_meta:8a283082807ffff driver_count -1\n  HINCRBY geo_index_meta:8a2830828047fff driver_count 1\n  HSET geo_index_meta:8a2830828047fff updated_at '2026-07-22T10:05:07Z'\nEXEC"},
+        {k:"route",label:"Index shard key and dense-city trade-off",text:"Shard index buckets by <code>cell_id</code>/<code>region</code>, then split hot metros by density. This makes SF/Times Square own more shards than rural areas; the trade-off is operational complexity for hotspot isolation."},
+      ]},
+      {node:"index",title:"Replicate, expire, and rebuild if necessary",narrate:"The hot stores run primary + AZ replica groups because availability matters during surge, but the data is still rebuildable from current locations or the next driver reports.",details:[
+        {k:"repl",label:"Consistency choice",text:"Use asynchronous or semi-sync replica updates for the in-memory hot path: a replica may lag milliseconds, and queries tolerate a slightly stale/smaller candidate set. Strong consistency is reserved for ride assignment, not live location."},
+        {k:"note",label:"Failure behavior",text:"If a cell shard dies, fail over to its replica. If both are lost, cached candidate sets and fresh driver re-reports rebuild the bucket within seconds; entries older than ~15s expire rather than linger."},
+      ]},
+      {node:"location",title:"Acknowledge only receipt, not durability",narrate:"The driver can receive a lightweight ack (or no per-frame ack) once ingest accepted the newest sample. The correctness contract is freshness, not historical completeness.",details:[
+        {k:"wire",label:"Optional stream ack",lang:"json",code:"{ \"driver_id\": 8821, \"accepted_seq\": 918273, \"ttl_s\": 15 }"},
+        {k:"note",label:"What this guarantees",text:"Queries will see driver 8821 in <code>geo_index:8a2830828047fff</code> with a fresh <code>driver_locations</code> row, unless a newer sample supersedes it or the TTL expires."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Find all drivers (or places) within a radius of a rider's location, ranked by distance / ETA",

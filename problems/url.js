@@ -314,6 +314,109 @@ window.DATA['url'] = {
       {node:"client",text:"Returns <code>302 Location: long_url</code>; browser follows it."},
     ]},
   ],
+  deepFlows:[
+    {id:"shorten-e2e",name:"Shorten URL",summary:"**POST /shorten** → gateway throttle → validate → **lease/base62 key** → **conditional INSERT into <code>urls</code> by <code>short_key</code>** → quorum replication → warm Redis → return the short link.",steps:[
+      {node:"client",title:"Client submits a long URL",narrate:"The create path is small but correctness-sensitive: a flaky mobile client may retry, and two users may race for the same custom alias. The client sends the destination, optional alias/expiry, and an idempotency key so a timed-out request can be replayed safely.",details:[
+        {k:"wire",label:"Request on the wire",lang:"http",code:"POST /v1/shorten\nIdempotency-Key: c8f1-owner42-docs-0722\nContent-Type: application/json\n\n{\n  \"long_url\": \"https://example.com/very/long/path?ref=x\",\n  \"user_id\": 42,\n  \"custom_alias\": null,\n  \"expires_at\": null\n}"},
+        {k:"note",label:"Scale this path for writes",text:"The service expects about **100M new URLs/day**: ~<code>1,160</code> writes/s steady and ~<code>5K</code>/s at peak. That is not the hot path compared with redirects, but every successful ack must mean the mapping is durable."},
+      ]},
+      {node:"lb",title:"Gateway gates the create",narrate:"The LB terminates TLS and routes to any healthy shortener instance. The gateway treats creates differently from redirects: authenticated, validated early, and rate-limited because create spam burns keys and storage.",details:[
+        {k:"wire",label:"Gateway checks",lang:"text",code:"route: POST /v1/shorten -> shortener-create pool\nauth: API key / user session required\nlimit: per_user_create_rps + global abuse budget\nreject: malformed URL, blocked domain, payload too large"},
+        {k:"gotcha",label:"Why rate-limit here",text:"Stopping abuse at the edge is cheaper than letting random clients force key allocation and quorum writes. Redirects are anonymous and cacheable; creates are user-scoped and expensive enough to throttle hard."},
+      ]},
+      {node:"svc",title:"Service validates and dedups",narrate:"The shortener service is stateless. It validates the URL and expiry, then uses the idempotency key only to make client retries return the same <code>short_key</code>; it does **not** globally dedupe long URLs by default because a reverse index would double write cost on a 180B-row store.",details:[
+        {k:"query",label:"Retry dedupe lookup",lang:"sql",code:"-- Optional API idempotency table keyed by caller intent\nSELECT short_key\nFROM create_requests\nWHERE user_id = 42\n  AND idempotency_key = 'c8f1-owner42-docs-0722';\n-- hit  -> return the original short URL\n-- miss -> allocate a new key and persist it"},
+        {k:"note",label:"No long_url secondary index",text:"The core <code>urls</code> table is keyed by <code>short_key</code>. Adding <code>hash(long_url)</code> for dedupe would be another replicated global index and another write per create, so skip it unless dedupe is a product requirement."},
+      ]},
+      {node:"key",title:"Mint the short key",narrate:"For generated links, the service burns the next integer from a locally leased block and base62-encodes it. The integer is already unique, so base62 is collision-free by construction; no hash-collision retry loop is needed.",details:[
+        {k:"query",label:"Lease an ID block",lang:"sql",code:"-- One allocator write per large block, not per URL\nINSERT INTO id_ranges (range_start, range_end, instance_id, assigned_at)\nVALUES (1000000000, 1000999999, 'svc-7f3a', now());"},
+        {k:"route",label:"Local key generation",lang:"python",code:"id = next_local_id()        # e.g. 1000000007 from svc-7f3a's block\nshort_key = base62(id)      # \"15ftgG\" (~6 chars)\n# 62^7 ≈ 3.5T keys; 62^6 ≈ 56B, too tight for 180B mappings"},
+        {k:"gotcha",label:"What if the instance dies?",text:"Unused IDs in its block are skipped. Gaps are harmless because keys carry no ordering promise, and leaking even a million IDs is tiny versus the **3.5T** 7-character keyspace."},
+      ]},
+      {node:"db",title:"Insert the mapping on its shard",narrate:"The mapping store is a hash-partitioned KV/wide-column store. The sharding key is <code>short_key</code>, so every create/read is a single-partition point operation; custom aliases use the same path but require a conditional put.",details:[
+        {k:"route",label:"Shard routing",lang:"python",code:"partition = hash(short_key) % NUM_PARTITIONS\n# short_key=\"15ftgG\" routes to exactly one Dynamo/Cassandra partition\n# Hashing avoids a monotonic-key hotspot even if IDs are counter-derived."},
+        {k:"query",label:"Generated-key insert",lang:"sql",code:"INSERT INTO urls\n  (short_key, long_url, user_id, created_at, expires_at, is_custom)\nVALUES\n  ('15ftgG', 'https://example.com/very/long/path?ref=x',\n   42, now(), NULL, false)\nIF NOT EXISTS;"},
+        {k:"query",label:"Custom alias race",lang:"sql",code:"INSERT INTO urls\n  (short_key, long_url, user_id, created_at, expires_at, is_custom)\nVALUES\n  ('my-sale', 'https://shop.example.com/summer-sale',\n   7, now(), '2026-08-01 00:00:00Z', true)\nIF NOT EXISTS;\n-- success -> alias claimed\n-- conflict -> 409 alias already taken"},
+      ]},
+      {node:"replica",from:"db",title:"Replicate before ack",narrate:"Each shard is a replica group of at least three nodes across AZs. A create is acknowledged after a quorum, typically 2/3, has persisted the row; create latency can pay a few milliseconds because reads dominate the product.",details:[
+        {k:"repl",label:"Quorum write",lang:"text",code:"write '15ftgG'\n  -> primary partition appends + fsyncs\n  -> replica A persists and ACKs\n  -> replica B may lag briefly\nACK only after 2 of 3 replicas are durable"},
+        {k:"repl",label:"Why not async-only",text:"Async replication could lose a just-created link if the primary dies after acking but before followers receive it. That would break links already handed to users, so we choose quorum durability for writes and cheap eventual reads for redirects."},
+      ]},
+      {node:"cache",title:"Warm Redis best-effort",narrate:"After the durable write, the service warms Redis with the immutable mapping. Cache warming is an optimization, not the source of truth; if the service crashes here, the first redirect simply misses and populates read-through.",details:[
+        {k:"query",label:"Cache write",lang:"redis",code:"SET url:15ftgG '{\"long_url\":\"https://example.com/very/long/path?ref=x\",\"expires_at\":null,\"redirect_code\":302}' EX 2592000\n# long TTL + jitter is safe because mappings are immutable"},
+        {k:"gotcha",label:"DB before cache",text:"Never cache first and then write DB. A crash in that order creates a link that works only until eviction; DB-first makes every failure mode recoverable by a cache miss."},
+      ]},
+      {node:"client",from:"svc",title:"Return the short URL",narrate:"Now the API can respond: the key is unique, the <code>urls</code> row is quorum-durable, and the cache is likely warm. A retry with the same idempotency key should return this same response.",details:[
+        {k:"wire",label:"Response",lang:"http",code:"201 Created\nContent-Type: application/json\n\n{\n  \"short_key\": \"15ftgG\",\n  \"short_url\": \"https://sho.rt/15ftgG\",\n  \"expires_at\": null\n}"},
+      ]},
+    ]},
+
+    {id:"redirect-e2e",name:"Redirect click",summary:"**GET /{short_key}** → edge/service route → Redis hit or read-replica miss fill → expiry check → **302 vs 301 decision** → async click event → browser follows <code>Location</code>.",steps:[
+      {node:"client",title:"Browser follows the short link",narrate:"Redirects are the hot path: ~<code>116K</code> reads/s sustained, with 3-5x peaks and viral skew. The request is anonymous and must finish under 100ms p99, so every downstream choice tries to avoid origin work.",details:[
+        {k:"wire",label:"Request",lang:"http",code:"GET /15ftgG HTTP/1.1\nHost: sho.rt\nUser-Agent: Mozilla/5.0\nReferer: https://twitter.com/\nAccept: text/html,*/*"},
+        {k:"note",label:"Read:write pressure",text:"At **100:1**, reads dominate: ~<code>116K</code> redirects/s versus ~<code>1,160</code> creates/s. The DB is sized mostly by storage (~90TB raw, ~270TB replicated), while cache/edge absorb read QPS."},
+      ]},
+      {node:"lb",title:"Edge routes a cheap anonymous read",narrate:"The gateway can answer an edge-cached immutable redirect immediately, or route a miss to the shortener service. Unlike creates, this path avoids auth and heavy validation; rate limits focus on abusive high-miss clients.",details:[
+        {k:"route",label:"Create vs redirect routing",lang:"text",code:"GET /:short_key\n  -> edge cache lookup\n  -> origin shortener-read pool only on miss\nPOST /shorten\n  -> authenticated create pool + strict rate limits"},
+        {k:"gotcha",label:"Don't over-cache what must be revocable",text:"Browser/CDN caching is powerful but hard to recall. Links with expiry, revocation, malware flags, or analytics requirements should keep controlled TTLs and usually return <code>302</code>."},
+      ]},
+      {node:"svc",title:"Service parses the key",narrate:"The service extracts <code>short_key</code>, rejects invalid base62/alias shapes, and starts the read-through lookup. The service remains stateless: any instance can serve any key because routing is by <code>short_key</code> in cache/DB, not by session.",details:[
+        {k:"note",label:"Per-request work",text:"The target steady-state read work is one Redis <code>GET</code> and one HTTP redirect. No joins, no synchronous analytics write, and no dependency on the instance that created the key."},
+      ]},
+      {node:"cache",title:"Check Redis first",narrate:"A hot key should be served from Redis or the edge. With a ~95% hit ratio, the DB read load drops from ~116K/s to ~5.8K/s; for a viral key, local/edge caches prevent one Redis shard from becoming the bottleneck.",details:[
+        {k:"query",label:"Redis lookup",lang:"redis",code:"GET url:15ftgG\n# hit -> { long_url, expires_at, redirect_code }\n# miss -> single-flight DB lookup; concurrent misses wait for the same fill"},
+        {k:"route",label:"Hot-key strategy",text:"Consistent hashing balances keys, not per-key traffic. When one link is 60% of reads, promote it to edge/local cache or replicate <code>url:15ftgG#1..#N</code> across Redis shards and choose a replica at random."},
+        {k:"gotcha",label:"Cold-cache containment",text:"If Redis restarts empty, the DB would see 100% of reads instead of ~5%. Single-flight misses, jittered TTLs, negative caching for 404 scans, replicas, and pre-warming the top-N hot links prevent a thundering herd."},
+      ]},
+      {node:"replica",title:"On miss, read a replica",narrate:"Cache misses read from a DB replica to spare the write primary. Because mappings are immutable, a slightly stale replica is safe except for a brand-new key; on a miss for a fresh-looking key, fall back to the primary before returning 404.",details:[
+        {k:"query",label:"Mapping read",lang:"sql",code:"SELECT short_key, long_url, expires_at, is_custom\nFROM urls\nWHERE short_key = '15ftgG';"},
+        {k:"route",label:"Read routing",lang:"python",code:"partition = hash('15ftgG') % NUM_PARTITIONS\nreplica = choose_local_healthy_replica(partition)\n# miss on recent key -> retry primary / writer region before 404"},
+        {k:"repl",label:"Consistency trade-off",text:"Replica reads scale the 100:1 workload and are safe because <code>urls</code> mappings do not change. Read-your-writes is handled by cache warm on create, short-term primary fallback, or a fresh-key miss retry."},
+      ]},
+      {node:"db",title:"Source of truth and expiry check",narrate:"If the replica has the row, the service checks <code>expires_at</code>. Expiry is a TTL/lazy-reclaim field in the store, not a scan; an expired row returns 410/404 and may be negative-cached briefly.",details:[
+        {k:"query",label:"Expired-link check",lang:"sql",code:"-- Application check after the point read\nif row.expires_at is not null and row.expires_at <= now():\n    return 410 Gone\nelse:\n    cache_set('url:15ftgG', row, ttl_with_jitter)"},
+        {k:"note",label:"No scans for expiry",text:"The schema carries <code>expires_at</code>; the KV store's TTL/lazy reclamation eventually frees space. Redirect correctness comes from checking the field on lookup, not from a background job scanning 180B rows."},
+      ]},
+      {node:"analytics",title:"Emit click event asynchronously",narrate:"The redirect must not wait for analytics. The service creates a click event and hands it to Kafka with a bounded async producer; if the analytics path is slow, redirect latency wins and the event may be dropped/spilled depending on product accuracy needs.",details:[
+        {k:"wire",label:"Click event",lang:"json",code:"{\n  \"event_id\": \"a1b2-...\",\n  \"short_key\": \"15ftgG\",\n  \"ts\": \"2026-07-22T10:05:11Z\",\n  \"country\": \"US\",\n  \"referrer\": \"https://twitter.com/\"\n}"},
+        {k:"query",label:"Kafka publish",lang:"text",code:"topic: click-events\nkey: short_key = 15ftgG\npartition: hash(short_key) % 32\nproducer: async, bounded buffer, no redirect blocking"},
+        {k:"gotcha",label:"301 hides analytics",text:"If the browser has cached a <code>301</code>, this event is never emitted because the click never reaches you. Accurate click analytics generally implies <code>302</code> or controlled edge logging."},
+      ]},
+      {node:"client",from:"svc",title:"Return 302 or 301",narrate:"Finally the service returns the redirect. The default for a shortener with analytics, expiry, and revocation is <code>302 Found</code>; <code>301 Moved Permanently</code> is reserved for truly immutable links where maximum cacheability matters more than observability/control.",details:[
+        {k:"wire",label:"Default redirect response",lang:"http",code:"302 Found\nLocation: https://example.com/very/long/path?ref=x\nCache-Control: no-store"},
+        {k:"wire",label:"Permanent-link variant",lang:"http",code:"301 Moved Permanently\nLocation: https://example.com/very/long/path?ref=x\nCache-Control: public, max-age=31536000"},
+        {k:"gotcha",label:"The interview trade-off",text:"**301**: fastest and cheapest after the first hit, but browser caches are outside your control and clicks are undercounted. **302**: every click returns to origin/edge, so analytics/revocation work, but your read path must absorb the load."},
+      ]},
+    ]},
+
+    {id:"analytics-e2e",name:"Aggregate clicks",summary:"Redirects enqueue click events off-path → Kafka partitions by <code>short_key</code> → consumers dedupe by <code>event_id</code> → shard hot counters/windowed aggregates → dashboards read eventually-consistent counts.",steps:[
+      {node:"svc",title:"Redirect produces an event",narrate:"On each origin-visible redirect, the service constructs a click event from request metadata. This is deliberately after the mapping lookup but outside the user-visible critical path: analytics can lag or drop, redirects cannot.",details:[
+        {k:"wire",label:"Event payload",lang:"json",code:"{\n  \"event_id\": \"c3d4-...\",\n  \"short_key\": \"15ftgG\",\n  \"ts\": \"2026-07-22T10:05:12Z\",\n  \"country\": \"IN\",\n  \"referrer\": \"(direct)\"\n}"},
+        {k:"note",label:"Schema grounding",text:"Raw events use the <code>click_events</code> fields: <code>event_id</code>, <code>short_key</code>, <code>ts</code>, <code>country</code>, and <code>referrer</code>. The event id is the dedup key for at-least-once delivery."},
+      ]},
+      {node:"analytics",title:"Publish to the click stream",narrate:"Kafka/Kinesis absorbs spikes such as a marketing blast at ~500K clicks/s. Partition by <code>short_key</code> when per-link windows need local aggregation; for a single viral key, add a salt to avoid one partition taking 300K clicks/s.",details:[
+        {k:"route",label:"Normal partitioning",lang:"python",code:"partition = hash(short_key) % 32\nsend(topic='click-events', key=short_key, value=event)"},
+        {k:"route",label:"Hot-key salted variant",lang:"python",code:"salt = hash(event_id) % 64\npartition = hash(short_key + ':' + salt) % NUM_PARTITIONS\n# consumers aggregate 64 partial counters, dashboard sums them"},
+        {k:"note",label:"Partition math",text:"At ~500K events/s and ~20K events/s per consumer, peak aggregation needs about **25 consumers**; round Kafka partitions to **32+** so consumer parallelism is not capped."},
+      ]},
+      {node:"analytics",title:"Deduplicate before counting",narrate:"The pipeline is at-least-once: producer retries and consumer rebalances can replay an event. For dashboard counts that may be approximate, but for paid analytics or billing-grade reports, consumers dedupe on <code>event_id</code> within the aggregation window.",details:[
+        {k:"query",label:"Dedup guard",lang:"sql",code:"INSERT INTO click_events (event_id, short_key, ts, country, referrer)\nVALUES ('c3d4-...', '15ftgG', '2026-07-22 10:05:12Z', 'IN', '(direct)')\nON CONFLICT (event_id) DO NOTHING;"},
+        {k:"repl",label:"Delivery semantics",text:"At-least-once + idempotent aggregation is the pragmatic default. True exactly-once consume→aggregate→sink uses Kafka transactions or sink upserts and is reserved for billing-grade counts because it adds coordination and latency."},
+      ]},
+      {node:"analytics",title:"Aggregate into time windows",narrate:"Consumers do 1-minute tumbling windows keyed by <code>short_key</code>, country, and referrer. They write rollups, not one dashboard row per click; this turns a 500K/s firehose into a much smaller stream of aggregate updates.",details:[
+        {k:"query",label:"Windowed upsert",lang:"sql",code:"-- Example aggregate table, not the hot urls mapping table\nUPSERT INTO click_counts_minute\n  (short_key, window_start, country, referrer, shard, clicks)\nVALUES\n  ('15ftgG', '2026-07-22 10:05:00Z', 'IN', '(direct)', 17, 348)\nON CONFLICT (short_key, window_start, country, referrer, shard)\nDO UPDATE SET clicks = click_counts_minute.clicks + EXCLUDED.clicks;"},
+        {k:"route",label:"Hot counter sharding",text:"A viral link at **300K clicks/s** must not update one counter row. Maintain N sub-counters per <code>short_key</code>/<code>window_start</code> and sum on read; stream pre-aggregation emits one partial per consumer/window instead of one write per click."},
+      ]},
+      {node:"db",title:"Keep analytics off the mapping store",narrate:"The <code>urls</code> table remains a write-once point-lookup mapping store. Analytics raw events and rollups belong in a log/OLAP path; mixing per-click writes into the mapping shard would turn the read-optimized redirect DB into a hot counter database.",details:[
+        {k:"gotcha",label:"Do not update urls per click",text:"Incrementing a <code>click_count</code> column on <code>urls</code> for every redirect would hotspot the row for viral links and put analytics latency on the redirect path. Use async rollups instead."},
+        {k:"note",label:"Storage split",text:"The mapping store holds ~**180B** URL rows (~90TB raw). Click data can be much larger and time-series shaped, so archive raw events to object storage and keep queryable rollups in OLAP."},
+      ]},
+      {node:"client",from:"analytics",title:"Dashboard reads eventual counts",narrate:"Users see near-real-time analytics with a clear consistency contract: counts may lag by consumer delay and can be approximate unless the product explicitly runs a slower deduplicated reconciliation path.",details:[
+        {k:"wire",label:"Analytics API response",lang:"json",code:"{\n  \"short_key\": \"15ftgG\",\n  \"window_start\": \"2026-07-22T10:05:00Z\",\n  \"clicks\": 7214,\n  \"top_countries\": [{ \"country\": \"IN\", \"clicks\": 3480 }],\n  \"freshness_seconds\": 12\n}"},
+        {k:"gotcha",label:"301 bias",text:"A 301-cached click never reaches the analytics pipeline, so counts are systematically low. If analytics is the product, choose 302/edge-logged redirects and say that trade-off explicitly."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Create a short URL from a long one, with optional custom alias and expiry",

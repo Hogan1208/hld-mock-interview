@@ -294,6 +294,77 @@ window.DATA['feed'] = {
       {node:"media",requires:["media"],text:"On view, the <strong>CDN edge</strong> serves the right rendition close to the user via adaptive bitrate streaming."},
     ]},
   ],
+  deepFlows:[
+    {id:"post-fanout-e2e",name:"Post fan-out",summary:"**POST /post** → gateway write limits → durable <code>posts</code> insert by <code>post_id</code> → outbox to fan-out → normal authors push <code>post_id</code> into follower timelines by <code>user_id</code>; celebrities skip fan-out and are merged at read time.",steps:[
+      {node:"client",title:"Client sends POST /post",narrate:"The app sends the post body plus optional media references and a client-generated idempotency key. The key is what makes a subway retry safe: the user may lose the response, but the system must not create a duplicate visible post.",details:[
+        {k:"wire",label:"Request on the wire",lang:"http",code:"POST /v1/post\nX-Session: user-42-session\nIdempotency-Key: compose-42-20260722-1000\nContent-Type: application/json\n\n{\n  \"author_id\": 42,\n  \"text\": \"just shipped the new release\",\n  \"media_ids\": [\"med_9f2a\"]\n}"},
+        {k:"note",label:"Scale context",text:"Base post writes are only **~3,500/s**, but average fan-out is **~300 followers**, so this one durable write can become part of the **~1M feed-list writes/s** async path."},
+      ]},
+      {node:"lb",title:"Gateway authenticates and rate-limits",narrate:"The gateway terminates TLS, authenticates the session, validates the payload size, and applies much stricter limits to writes than reads. A write is dangerous because it amplifies into downstream fan-out work; a read is mostly cache-absorbed.",details:[
+        {k:"route",label:"Where this request is sent",text:"Region affinity routes user <code>42</code> to the region holding their feed cache and graph replicas. Within the region, the LB sends the request to any healthy feed-service instance because the service is stateless."},
+        {k:"gotcha",label:"Why writes are throttled first",text:"One spammy account posting in a loop can multiply into millions of <code>timeline:userId</code> writes. The gateway protects the fan-out tier before the write reaches the app fleet."},
+      ]},
+      {node:"feed",title:"Feed service allocates the post id",narrate:"The feed service deduplicates the idempotency key, mints a globally unique Snowflake-style <code>post_id</code>, and prepares a canonical post row. For read-your-own-writes it will also synchronously add this id to the author's own timeline before returning.",details:[
+        {k:"query",label:"Idempotency check",lang:"sql",code:"-- unique(author_id, idempotency_key) returns the same post_id on replay\nSELECT post_id\nFROM post_idempotency\nWHERE author_id = 42\n  AND idempotency_key = 'compose-42-20260722-1000';"},
+        {k:"route",label:"Routing key for canonical post",lang:"text",code:"post_shard = hash(post_id) % NUM_POST_SHARDS\npost_id 1487200000001 -> post shard 317\n\nWhy post_id? Hydration is point lookup by post_id, and Snowflake ids distribute writes without a central counter."},
+      ]},
+      {node:"db",title:"Persist canonical post and outbox",narrate:"The post row is committed to the wide-column post store and an outbox event is committed in the same write transaction or batch. The API never acknowledges a post that exists only in memory or only in a queue.",details:[
+        {k:"query",label:"Canonical write",lang:"sql",code:"INSERT INTO posts\n  (post_id, author_id, text, media_ids, created_at)\nVALUES\n  (1487200000001, 42, 'just shipped the new release',\n   '[\"med_9f2a\"]', '2026-07-22 10:00:00Z');\n\nINSERT INTO post_outbox\n  (event_id, post_id, author_id, created_at)\nVALUES\n  ('evt_1487200000001', 1487200000001, 42,\n   '2026-07-22 10:00:00Z');"},
+        {k:"repl",label:"Durability choice",text:"Each post shard is replicated across AZs. Use quorum writes for <code>posts</code> and the outbox so a single replica loss cannot lose an acknowledged post; follower timelines are derived views and can be rebuilt."},
+        {k:"note",label:"Source of truth",text:"Only <code>posts</code> is canonical for the post body. Timeline/cache entries hold ids, so edits/deletes touch one canonical row instead of millions of copied bodies."},
+      ]},
+      {node:"fanout",title:"Fan-out consumes the outbox event",narrate:"Fan-out workers read the committed event and decide whether this author is a normal account or a celebrity. Normal accounts fan out on write; celebrities above the threshold do not, because a 50M-follower post would otherwise become 50M immediate writes.",details:[
+        {k:"query",label:"Popularity and followers",lang:"sql",code:"SELECT follower_count, is_celebrity\nFROM users\nWHERE user_id = 42;\n\nSELECT follower_id\nFROM follows\nWHERE followee_id = 42;\n-- for a hot author, the followers index is sub-partitioned by hash(follower_id)\n-- so one 50M-row list is scanned in parallel, not from one shard."},
+        {k:"route",label:"Hybrid threshold",text:"If <code>users.is_celebrity=true</code> (for example @popstar with <code>follower_count=51000000</code>), fan-out writes are skipped. The post stays queryable by <code>(author_id, created_at)</code> and followers merge that small celebrity set at read time."},
+        {k:"gotcha",label:"At-least-once fan-out",text:"The event queue is at-least-once. A worker may crash after writing some followers, so downstream timeline writes must be idempotent and chunked; replay should waste some work, not duplicate posts in feeds."},
+      ]},
+      {node:"cache",title:"Append ids to follower timelines",narrate:"For each non-celebrity follower, fan-out writes the <code>post_id</code> into that user's bounded Redis sorted set and trims it to the hot window. The shard key is the destination <code>user_id</code> because reads fetch one user's home timeline.",details:[
+        {k:"query",label:"Redis timeline write",lang:"redis",code:"ZADD timeline:7  1487200800 1487200000001\nZREMRANGEBYRANK timeline:7 0 -801     # keep newest ~800 ids\n\n# author read-your-own-writes is synchronous before 200 OK:\nZADD timeline:42 1487200800 1487200000001"},
+        {k:"query",label:"Durable list equivalent",lang:"sql",code:"UPDATE timelines\nSET post_ids = [1487200000001] + post_ids,\n    updated_at = '2026-07-22 10:00:00Z'\nWHERE user_id = 7;"},
+        {k:"route",label:"Cache shard key",text:"<code>cache_shard = hash(user_id)</code>. This colocates all of user 7's feed entries, making <code>GET /timeline</code> a single range read. The trade-off is fan-out writes scatter across many shards, which is exactly what gives the ~1M/s write path horizontal scale."},
+      ]},
+      {node:"client",title:"Return after durable post + self insert",narrate:"The client gets a response after the canonical post is durable and the author's own timeline contains the id. Followers see it seconds later as async fan-out drains; celebrity followers see it when their read path merges recent celebrity posts.",details:[
+        {k:"wire",label:"Response",lang:"http",code:"201 Created\n{\n  \"post_id\": 1487200000001,\n  \"author_id\": 42,\n  \"created_at\": \"2026-07-22T10:00:00Z\",\n  \"fanout\": \"queued\"\n}"},
+        {k:"gotcha",label:"Consistency contract",text:"The system promises **read-your-own-writes** for the author, not instant delivery to every follower. Follower timelines are eventually consistent within seconds, and backlog controls can lower the celebrity threshold or prioritize active users."},
+      ]},
+    ]},
+
+    {id:"timeline-read-e2e",name:"Read timeline",summary:"**GET /timeline** → route to the user's home region → read <code>timeline:userId</code> by <code>user_id</code> → merge recent celebrity posts by <code>(author_id, created_at)</code> → hydrate <code>posts</code> by <code>post_id</code> → return a cursor under the 200ms p99 target.",steps:[
+      {node:"client",title:"Client asks for a page",narrate:"Opening the app is the hot path: ~6B reads/day, ~70K/s average and up to ~300K/s peak. The request carries an opaque cursor, not an offset, so new posts at the head do not shift every page boundary.",details:[
+        {k:"wire",label:"Request on the wire",lang:"http",code:"GET /v1/timeline?limit=25&cursor=eyJzY29yZSI6MTQ4NzIwMDgwMH0\nX-Session: user-42-session"},
+        {k:"note",label:"Why cursor pagination",text:"<code>OFFSET</code> gets slower and inconsistent as new posts arrive. A cursor is a seek into the already-ranked candidate set, so the next page is stable even while the head of the feed changes."},
+      ]},
+      {node:"lb",title:"Gateway routes the read cheaply",narrate:"The gateway authenticates and routes to the nearest healthy feed-service instance in the user's home region. Personalized timelines are not CDN-cacheable, so the edge's job is fast routing and shedding optional work, not serving the feed body itself.",details:[
+        {k:"route",label:"Regional routing",text:"User <code>42</code> is pinned to a home region so <code>timeline:42</code>, graph replicas, and warm post caches are local. If the region fails, GeoDNS/anycast moves reads to a replicated region and accepts extra latency over a blank feed."},
+        {k:"gotcha",label:"Overload behaviour",text:"Under a live-event spike, protect <code>GET /timeline</code> and serve slightly stale cached feeds; shed exact new-post counts and recommendation embellishments first."},
+      ]},
+      {node:"feed",title:"Feed service starts a bounded build",narrate:"The stateless feed service fans out only to bounded, known stores: one timeline range read, a small celebrity merge, and parallel hydration of the page ids. It never queries all 300 followees' posts on the hot path.",details:[
+        {k:"note",label:"Per-request budget",text:"At ~300K reads/s peak and ~5K req/s per instance, the fleet needs roughly **80 instances** with headroom. The budget works only because reads are one cache list read plus bounded multi-get hydration, not a live fan-in over the graph."},
+      ]},
+      {node:"cache",title:"Read the precomputed ids",narrate:"For normal followees, the feed already exists as an ordered set of post ids. The key is the reader's <code>user_id</code>, so the read touches one Redis shard and returns ids, not 1KB post bodies.",details:[
+        {k:"query",label:"Redis range read",lang:"redis",code:"ZREVRANGEBYSCORE timeline:42 1487200800 -inf LIMIT 0 25\n# returns: 1487200000002, 1487200000001, ..."},
+        {k:"route",label:"Why shard by user_id",text:"A home timeline read is always for one user, so <code>hash(user_id)</code> makes the hot read a single-shard operation. Storing by author would make every feed open scatter across ~300 authors."},
+        {k:"repl",label:"Cache consistency",text:"The feed cache is replicated for availability but is **derived**, not authoritative. A replica can be slightly stale; a miss triggers lazy rebuild from <code>posts</code> + <code>follows</code> instead of returning a permanently blank feed."},
+      ]},
+      {node:"db",title:"Pull recent celebrity posts",narrate:"For followed celebrities, there was no write-time fan-out. The feed service reads the user's followed celebrity ids and range-scans only their recent posts using the per-author <code>(author_id, created_at)</code> index, then merges those candidates with the cached list.",details:[
+        {k:"query",label:"Find followed celebrities",lang:"sql",code:"SELECT f.followee_id\nFROM follows f\nJOIN users u ON u.user_id = f.followee_id\nWHERE f.follower_id = 42\n  AND u.is_celebrity = true;"},
+        {k:"query",label:"Read-time merge candidates",lang:"sql",code:"SELECT post_id, created_at\nFROM posts\nWHERE author_id = 901\n  AND created_at > '2026-07-22 09:00:00Z'\nORDER BY created_at DESC\nLIMIT 50;"},
+        {k:"gotcha",label:"Bound the hybrid cost",text:"The merge is intentionally small: most users follow only a handful of celebrities. For pathological users following thousands, cache the celebrity-merge result briefly and cap candidates so one reader cannot blow the 200ms p99."},
+      ]},
+      {node:"db",title:"Hydrate post ids from canonical storage",narrate:"The merged list contains ids only. Hydration scatter-gathers those <code>post_id</code>s to the hash-partitioned post store and fetches author metadata in parallel, with a tight deadline so one cold shard does not stall the whole feed.",details:[
+        {k:"query",label:"Point lookups by post_id",lang:"sql",code:"SELECT post_id, author_id, text, media_ids, created_at\nFROM posts\nWHERE post_id IN (1487200000002, 1487200000001, 1487199999990);"},
+        {k:"route",label:"Post shard routing",lang:"text",code:"for each post_id:\n  shard = hash(post_id) % NUM_POST_SHARDS\n\nScatter-gather all shards in parallel; hedge or drop slow responses at the page deadline."},
+        {k:"repl",label:"Leader vs replica read",text:"Normal timeline hydration can read from local replicas and tolerate small lag. Immediately after the author posts, their own read is pinned to the freshest source / self-inserted timeline entry to satisfy read-your-own-writes."},
+      ]},
+      {node:"media",title:"Return media references, not bytes",narrate:"The feed response includes <code>media_ids</code> and CDN URLs or rendition metadata; the heavy image/video bytes are fetched by the client from the CDN in parallel with text rendering.",details:[
+        {k:"wire",label:"Response payload",lang:"json",code:"{\n  \"items\": [\n    {\n      \"post_id\": 1487200000001,\n      \"author_id\": 42,\n      \"text\": \"just shipped the new release\",\n      \"media_ids\": [\"med_9f2a\"],\n      \"created_at\": \"2026-07-22T10:00:00Z\"\n    }\n  ],\n  \"next_cursor\": \"eyJzY29yZSI6MTQ4NzIwMDAwMH0\"\n}"},
+        {k:"note",label:"Why media is separate",text:"A timeline page stays a few KB of JSON. The CDN absorbs viral media demand (~95% hit ratio in the problem notes), so a popular video does not add load to the feed-service hot path."},
+      ]},
+      {node:"client",title:"Client renders and keeps the cursor",narrate:"The client renders whatever arrived before the deadline and stores the cursor for the next page. If a few hydrated posts were deleted or slow, the service can drop them and backfill later; a fast slightly-imperfect feed beats a perfect feed that misses p99.",details:[
+        {k:"gotcha",label:"Staleness trade-off",text:"A follower may not see a normal author's just-created post until fan-out reaches their <code>timeline:userId</code>, and a replica may lag by milliseconds. The product accepts that eventual consistency; it does not accept blank feeds or broken read-your-own-writes."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Create a post — text plus an optional photo or video",

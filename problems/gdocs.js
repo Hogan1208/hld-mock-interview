@@ -304,6 +304,112 @@ window.DATA['gdocs'] = {
       {node:"client",text:"Renders the materialized document and starts streaming subsequent ops."},
     ]},
   ],
+  deepFlows:[
+    {id:"edit-e2e",name:"Commit and broadcast an edit",summary:"Client applies locally → sends a **WebSocket edit op** with <code>doc_id</code>, <code>baseVersion</code>, and client seq → gateway routes by <code>doc_id</code> → the doc's **single authoritative owner** transforms/merges → assigns the next <code>seq</code> → appends to <code>operations(doc_id, seq)</code> with quorum replication → acks + broadcasts the ordered op so every replica converges.",steps:[
+      {node:"client",title:"Client turns a keystroke into an op",narrate:"Typing must feel instant, so the browser applies the character to its local replica before the network round-trip. It also records the op in its unacknowledged queue, tagged with the server version it was based on and a client sequence number for retry dedupe.",details:[
+        {k:"wire",label:"WebSocket message",lang:"json",code:"{\n  \"type\": \"edit.op\",\n  \"doc_id\": \"d-1a2b\",\n  \"client_id\": \"tab-42-a7f\",\n  \"client_seq\": 187,\n  \"baseVersion\": 10432,\n  \"op\": { \"kind\": \"insert\", \"pos\": 120, \"text\": \"h\" }\n}"},
+        {k:"note",label:"Why local-first",text:"Waiting for a server ack per key would show each character ~100-200ms late. Local-first keeps typing instant; the cost is that the local op may be rebased when concurrent ops arrive from the authoritative stream."},
+      ]},
+      {node:"gw",title:"Gateway routes by document id",narrate:"The WebSocket gateway owns the socket and auth state, but not the document order. It uses <code>doc_id</code> to forward the op to exactly the collab owner for this live document session.",details:[
+        {k:"route",label:"Owner lookup",lang:"python",code:"# consistent hash / placement service returns one live owner\nowner = placement.owner_for_doc(\"d-1a2b\")   # e.g. collab-17, epoch 91\nsend(owner, ws_message)"},
+        {k:"route",label:"Why route by doc_id",text:"Ordering is per document, so every op for <code>d-1a2b</code> must reach the same live sequencer. Routing by user or gateway would split one doc across processes and create competing orders."},
+      ]},
+      {node:"collab",title:"One authoritative owner sequences the doc",narrate:"The collab process holds the valid lease/fencing epoch for <code>d-1a2b</code>. It checks the user can edit, dedupes a retry using the client sequence, and rejects stale-owner writes with the fencing epoch so there is never split-brain for one document.",details:[
+        {k:"query",label:"ACL check uses the actual ACL table",lang:"sql",code:"SELECT role\nFROM acl\nWHERE doc_id = 'd-1a2b' AND user_id = 42;\n-- role must be 'editor' before accepting edit.op"},
+        {k:"repl",label:"Single writer invariant",text:"Exactly one owner holds the current lease for <code>doc_id='d-1a2b'</code>. If a new owner is elected it writes under a higher epoch; stale owners are fenced off before they can append divergent ops."},
+      ]},
+      {node:"engine",title:"Transform or merge against concurrent ops",narrate:"The incoming op was authored at <code>baseVersion=10432</code>. If the owner has already committed ops 10433..10440, the engine rewrites the position (OT) or merges element ids (CRDT) so the user's intent lands on the current document.",details:[
+        {k:"note",label:"OT example",text:"If another editor inserted one character before position 120 at seq 10433, this insert's position shifts from 120 to 121 before commit. Every client later applies the same ordered result, so replicas converge."},
+        {k:"gotcha",label:"OT vs CRDT trade-off",text:"With this central server, OT keeps ops tiny (<code>pos + text</code>) and transforms against a bounded ordered prefix. CRDTs tolerate decentralized/offline-heavy merging better, but pay per-character ids, tombstones, and garbage-collection overhead."},
+      ]},
+      {node:"collab",title:"Assign the next document sequence",narrate:"After conflict resolution, the owner stamps the op with the next total-order sequence for this document. For the sample doc, <code>documents.current_version</code> is 10432, so the next committed op is seq 10433.",details:[
+        {k:"query",label:"Current version row",lang:"sql",code:"SELECT current_version\nFROM documents\nWHERE doc_id = 'd-1a2b';\n-- 10432 -> owner assigns next_seq = 10433"},
+        {k:"note",label:"Why one seq per doc",text:"The <code>seq</code> is meaningful only inside a document. That is enough: convergence requires all editors of <code>d-1a2b</code> apply ops 1,2,3... in the same order, not a global order across all 50M docs."},
+      ]},
+      {node:"doc",title:"Append to the op log keyed (doc_id, seq)",narrate:"The ordered op is persisted as an immutable row in <code>operations</code>. The partition key is <code>doc_id</code> and the clustering key is <code>seq</code>, so all ops for this document are contiguous and replayable by a single ordered range scan.",details:[
+        {k:"query",label:"Append row using gdocs schema columns",lang:"sql",code:"INSERT INTO operations\n  (doc_id, seq, author_id, op_json, created_at)\nVALUES\n  ('d-1a2b', 10433, 42,\n   '{\"client_id\":\"tab-42-a7f\",\"client_seq\":187,\n     \"kind\":\"insert\",\"pos\":121,\"text\":\"h\"}',\n   now());\n\nUPDATE documents\nSET current_version = 10433\nWHERE doc_id = 'd-1a2b' AND current_version = 10432;"},
+        {k:"route",label:"Storage partition",text:"In the wide-column store, <code>doc_id='d-1a2b'</code> chooses the partition/replica group; <code>seq=10433</code> sorts inside that partition. A single hot doc is intentionally pinned to one partition/owner to preserve ordering."},
+      ]},
+      {node:"persist",title:"Quorum replication makes acked edits durable",narrate:"The append is acknowledged only after the replicated log commits to a quorum, e.g. W=2 of 3 replicas across AZs. That closes the dangerous window where users see an edit that exists on only one failed node.",details:[
+        {k:"repl",label:"Commit rule",lang:"text",code:"append operations(d-1a2b,10433)\n   │\n   ▼\n[replica A / leader] fsync ✔\n   ├────────────► [replica B] fsync ✔  (quorum reached)\n   └────────────► [replica C] async catch-up\n\nACK only after A+B have the row"},
+        {k:"repl",label:"Guarantee",text:"Acked implies present on a majority, so losing any one node or one AZ does not roll the document back below a version that editors already saw as saved."},
+      ]},
+      {node:"collab",title:"Ack author and broadcast to collaborators",narrate:"Only after durable append does the owner ack the author and publish the accepted, transformed op once to the doc's pub/sub channel. Gateways subscribed for this doc fan it out to their local sockets.",details:[
+        {k:"wire",label:"Ack + broadcast payload",lang:"json",code:"{\n  \"type\": \"edit.accepted\",\n  \"doc_id\": \"d-1a2b\",\n  \"seq\": 10433,\n  \"author_id\": 42,\n  \"op\": { \"kind\": \"insert\", \"pos\": 121, \"text\": \"h\" },\n  \"current_version\": 10433\n}"},
+        {k:"gotcha",label:"Why not broadcast first",text:"Broadcast-first can show 500 editors text that vanishes if the owner crashes before persistence. Durable-first adds a few ms, batched across ~1-2.5K ops/s on a hot doc, and preserves the saved-edit invariant."},
+      ]},
+      {node:"client",title:"Other clients apply the ordered op",narrate:"Every collaborator receives seq 10433 and applies it after 10432. If they have local unacked ops, they transform those local ops against the remote op; if they reconnect later, they request the missing seq range.",details:[
+        {k:"note",label:"Convergence",text:"The central owner plus OT/CRDT means all clients eventually fold the same ordered op set for <code>d-1a2b</code>. Arrival order can differ at the network edge; committed sequence order cannot."},
+      ]},
+    ]},
+
+    {id:"open-e2e",name:"Open and catch up a document",summary:"Client opens <code>d-1a2b</code> → gateway authenticates → route to the doc's current owner → owner verifies <code>acl</code> → read newest <code>snapshots(doc_id, version)</code> pointer → range-scan <code>operations</code> after that version → fold snapshot + tail → subscribe the socket to live ops from the same sequencer.",steps:[
+      {node:"client",title:"Client opens a document",narrate:"Opening a large doc must not replay a multi-million-op history. The client asks for the latest materialized state plus whatever tail is needed after that snapshot.",details:[
+        {k:"wire",label:"Open request",lang:"http",code:"GET /v1/docs/d-1a2b/open\nX-User-Id: 55\n\n# or the same request as the first WebSocket message:\n# {\"type\":\"doc.open\",\"doc_id\":\"d-1a2b\",\"last_seen_seq\":10420}"},
+        {k:"note",label:"Back-of-envelope pressure",text:"A 500-page doc can have 2M historical ops, but the hot open path should read the latest snapshot plus a short tail — O(recent), not O(history)."},
+      ]},
+      {node:"gw",title:"Authenticate and route to the doc owner",narrate:"The gateway validates the user token and establishes the socket, then routes the open to the collab process currently owning <code>d-1a2b</code>.",details:[
+        {k:"route",label:"Same routing as edits",lang:"python",code:"doc_id = \"d-1a2b\"\nowner = placement.owner_for_doc(doc_id)\nsubscribe_socket_to_doc(connection_id, doc_id)\nforward(owner, {\"type\":\"doc.open\", \"doc_id\": doc_id})"},
+        {k:"route",label:"Why pin open and edit together",text:"The process that serves the snapshot tail also owns subsequent sequencing, so the client never races between an old snapshot source and a different live writer."},
+      ]},
+      {node:"collab",title:"Check access before joining the live session",narrate:"The collab owner verifies the user has at least viewer access before it sends content or subscribes them to broadcasts. Editors are later allowed to submit ops; viewers can only receive.",details:[
+        {k:"query",label:"ACL read",lang:"sql",code:"SELECT role\nFROM acl\nWHERE doc_id = 'd-1a2b' AND user_id = 55;\n-- 'viewer' can open and receive ops; only 'editor' can send edit.op"},
+        {k:"gotcha",label:"Revocation",text:"ACL is not a one-time page-load check. A revoke event causes the owner to drop/downgrade the socket, and every later edit op is authorized again server-side."},
+      ]},
+      {node:"doc",title:"Read the latest snapshot pointer",narrate:"Snapshots are indexed by <code>(doc_id, version)</code>. The owner point-reads the highest version for the doc; the sample data has a snapshot at version 10000 for <code>d-1a2b</code>.",details:[
+        {k:"query",label:"Snapshot lookup",lang:"sql",code:"SELECT version, content_blob_url\nFROM snapshots\nWHERE doc_id = 'd-1a2b'\nORDER BY version DESC\nLIMIT 1;\n-- version=10000, content_blob_url='s3://docs/d-1a2b/v10000.blob'"},
+        {k:"route",label:"Why snapshots are separate",text:"The wide-column log stays lean with tiny ordered rows; the folded document blob lives in object storage and the hot store keeps only <code>content_blob_url</code> plus the fold version."},
+      ]},
+      {node:"persist",title:"Fetch the folded blob from object storage",narrate:"The folded snapshot is a large immutable blob, read whole and rarely. Object storage is the right tier for it; it is not in the hot op-log rows.",details:[
+        {k:"wire",label:"Blob read",lang:"text",code:"GET s3://docs/d-1a2b/v10000.blob\n-> materialized document content at seq 10000"},
+        {k:"note",label:"Latency trade-off",text:"A cold blob read may be slower than a DB row, but it replaces replaying 10,000+ historical ops. Active docs keep the materialized state in the collab owner, so most opens are warm."},
+      ]},
+      {node:"doc",title:"Range-scan the op tail after the snapshot",narrate:"The owner reads only ops with <code>seq &gt; 10000</code>, already sorted because <code>seq</code> is the clustering key under the <code>doc_id</code> partition.",details:[
+        {k:"query",label:"Tail read",lang:"sql",code:"SELECT seq, author_id, op_json, created_at\nFROM operations\nWHERE doc_id = 'd-1a2b' AND seq > 10000\nORDER BY seq ASC;\n-- returns 10001..10432 for the sample current_version"},
+        {k:"route",label:"Single-partition range scan",text:"This is the critical data-model win: no global scan, no secondary index, no cross-shard merge. One doc's ordered log lives under one <code>doc_id</code> partition."},
+      ]},
+      {node:"engine",title:"Fold snapshot + tail into current state",narrate:"The engine applies ops 10001..10432 to the snapshot blob and reconstructs the exact current document at <code>documents.current_version=10432</code>. This state is cached while the doc remains live.",details:[
+        {k:"query",label:"Metadata sanity check",lang:"sql",code:"SELECT title, current_version\nFROM documents\nWHERE doc_id = 'd-1a2b';\n-- title='Q3 Planning Notes', current_version=10432"},
+        {k:"note",label:"Recovery symmetry",text:"Owner crash recovery uses the same path: latest snapshot + op tail deterministically rebuilds materialized doc and recent transform context."},
+      ]},
+      {node:"presence",title:"Join live presence separately",narrate:"Presence is loaded as current ephemeral state, not from the op log. The new client receives a coalesced cursor snapshot and starts publishing its own cursor updates on the presence path.",details:[
+        {k:"note",label:"Different guarantees",text:"Cursor state is a LWW value keyed by <code>(docId,userId)</code> with TTL. It can be dropped or coalesced; edit ops cannot."},
+      ]},
+      {node:"client",title:"Render and subscribe to live ops",narrate:"The client renders the materialized doc, sets its last seen server version to 10432, and then applies subsequent ordered broadcasts from the same doc owner.",details:[
+        {k:"wire",label:"Open response",lang:"json",code:"{\n  \"doc_id\": \"d-1a2b\",\n  \"title\": \"Q3 Planning Notes\",\n  \"version\": 10432,\n  \"snapshotVersion\": 10000,\n  \"content\": \"<folded document content>\",\n  \"tailApplied\": 432\n}"},
+        {k:"gotcha",label:"Laggard catch-up",text:"If the client reconnects with <code>last_seen_seq=10420</code>, the owner can send only 10421..10432. If that base was compacted away, it sends a fresh snapshot + short tail instead."},
+      ]},
+    ]},
+
+    {id:"snapshot-e2e",name:"Snapshot and compact history",summary:"Background persistence watches <code>documents.current_version</code> → every ~1,000 ops or 60s folds a stable prefix of <code>operations(doc_id, seq)</code> → writes immutable snapshot blob → inserts <code>snapshots(doc_id, version, content_blob_url)</code> → only after durable snapshot/archive trims hot log segments before that version.",steps:[
+      {node:"persist",title:"Pick a safe snapshot boundary",narrate:"Snapshotting is off the hot edit path. A background worker chooses a stable sequence already committed to the quorum log — for an active doc, roughly every 1,000 ops or 60 seconds, plus when the doc goes idle.",details:[
+        {k:"query",label:"Find current committed version",lang:"sql",code:"SELECT current_version\nFROM documents\nWHERE doc_id = 'd-1a2b';\n-- current_version = 10432; choose snapshot_version = 10432"},
+        {k:"note",label:"Cadence",text:"Every ~1,000 ops or 60s bounds open/recovery replay while keeping snapshot cost background-only. A 500-editor doc at ~1-2.5K ops/s may snapshot often; most docs are far quieter."},
+      ]},
+      {node:"doc",title:"Read the previous snapshot and committed tail",narrate:"The snapshotter folds from the latest existing snapshot (10000 in the sample) through a committed target version (10432). It reads exactly one doc partition and never scans other documents.",details:[
+        {k:"query",label:"Rows to fold",lang:"sql",code:"SELECT version, content_blob_url\nFROM snapshots\nWHERE doc_id = 'd-1a2b'\nORDER BY version DESC\nLIMIT 1;\n\nSELECT seq, author_id, op_json, created_at\nFROM operations\nWHERE doc_id = 'd-1a2b'\n  AND seq > 10000 AND seq <= 10432\nORDER BY seq ASC;"},
+        {k:"route",label:"Why shard by document_id",text:"Snapshotting needs an ordered prefix for one document. With <code>doc_id</code> as the partition key, fold work is local and sequential; sharding by time would scatter one doc's history and make snapshots expensive."},
+      ]},
+      {node:"engine",title:"Fold ops deterministically",narrate:"The same deterministic apply logic used for open/recovery folds ops 10001..10432 onto the version-10000 blob. Because those ops are already transformed and committed in seq order, this is not conflict resolution again — just replay.",details:[
+        {k:"note",label:"Determinism matters",text:"If any replica folds the same snapshot plus the same ordered op range, it must produce byte-equivalent content. That makes snapshot verification and owner recovery straightforward."},
+      ]},
+      {node:"persist",title:"Write the immutable snapshot blob",narrate:"The folded document is written to object storage under a versioned key. The blob write must complete durably before the snapshot pointer is advertised in the hot store.",details:[
+        {k:"wire",label:"Object-store write",lang:"text",code:"PUT s3://docs/d-1a2b/v10432.blob\nBody: <folded document content through seq 10432>\n\n# object store returns durable version/etag"},
+        {k:"repl",label:"Durability tiering",text:"The hot log gives low-latency quorum durability for live edits; object storage gives cheap 11-nines-style durability for large cold blobs and archived log segments."},
+      ]},
+      {node:"doc",title:"Insert the snapshot pointer",narrate:"After the blob is durable, the snapshotter records a small pointer row using the real <code>snapshots</code> schema. Future opens can now start at 10432 instead of 10000.",details:[
+        {k:"query",label:"Snapshot pointer row",lang:"sql",code:"INSERT INTO snapshots\n  (doc_id, version, content_blob_url, created_at)\nVALUES\n  ('d-1a2b', 10432,\n   's3://docs/d-1a2b/v10432.blob', now());"},
+        {k:"gotcha",label:"Pointer after blob, not before",text:"Publishing the pointer first could make an opener fetch a missing or partial blob. Blob first, pointer second keeps snapshot lookup safe."},
+      ]},
+      {node:"persist",title:"Archive then compact old hot-log segments",narrate:"Only after the covering snapshot and any required archived segments are durable can the system remove pre-10432 rows from the hot tier. Compaction archives; it does not destroy version history.",details:[
+        {k:"query",label:"Hot-tier compaction sketch",lang:"sql",code:"-- after snapshot d-1a2b@10432 and archived segments are durable:\n-- hot store may drop rows older than the retained window\nDELETE FROM operations\nWHERE doc_id = 'd-1a2b' AND seq <= 10000;\n-- keep a recent window as policy requires; old history remains in cold archive"},
+        {k:"gotcha",label:"Never truncate before durability",text:"If object storage is down, editing continues on the quorum hot log, but compaction pauses. A segment is never deleted while it exists only in an unconfirmed snapshot/archive."},
+      ]},
+      {node:"client",title:"What users gain",narrate:"The next open or failover loads <code>v10432.blob</code> and maybe a tiny tail instead of replaying thousands or millions of ops. Version history still works by loading older archived snapshots and deltas on the cold path.",details:[
+        {k:"note",label:"Trade-off",text:"Snapshots trade background write/storage work for bounded open and recovery time. Retention can coarsen old history (fine recent ops, then hourly/daily snapshots) without affecting live convergence."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Multiple users edit one document concurrently, with changes propagating live to every editor",

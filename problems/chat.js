@@ -288,6 +288,103 @@ window.DATA['chat'] = {
       {node:"client",text:"B reconnects and pulls all messages with <code>seq &gt; last_delivered_seq</code>, then advances its cursor."},
     ]},
   ],
+  deepFlows:[
+    {id:"send-1-1-e2e",name:"Send 1:1 message",summary:"**Client WebSocket frame** → gateway forwards → chat dedupes and assigns a **per-conversation <code>seq</code>** → Scylla write on **<code>conversation_id</code>** with **QUORUM (W=2/RF=3)** → lookup <code>connection_registry</code> → recipient gateway pushes → receipt advances <code>user_inbox</code>.",steps:[
+      {node:"client",title:"Client sends a durable outbox frame",narrate:"A's phone first writes the ciphertext to its local outbox, mints <code>client_msg_id</code>, renders optimistically, then sends a WebSocket frame. If the network drops, the same <code>client_msg_id</code> is retried so the server can collapse duplicates.",details:[
+        {k:"wire",label:"WebSocket frame",lang:"json",code:"{\n  \"op\": \"message.send\",\n  \"conversation_id\": \"c-9f2a\",\n  \"client_msg_id\": \"b3f1-bc\",\n  \"sender_id\": 42,\n  \"ciphertext\": \"0xa5d91c...\",\n  \"client_ts\": \"2026-07-22T10:05:04Z\"\n}"},
+        {k:"note",label:"Why the client id matters",text:"The phone may never receive the ack even after the store committed. Retrying the same <code>client_msg_id</code> lets chat return the already-assigned <code>seq</code> instead of creating a second message."},
+      ]},
+      {node:"gw",title:"Gateway forwards without owning truth",narrate:"The gateway only owns the socket. It authenticates the session, adds connection metadata, and forwards the frame to any chat service instance; no durable message state is kept on the gateway.",details:[
+        {k:"wire",label:"Gateway → chat RPC",lang:"json",code:"{\n  \"method\": \"SendMessage\",\n  \"from_gateway\": \"gw-07\",\n  \"conn_id\": \"ab12\",\n  \"user_id\": 42,\n  \"conversation_id\": \"c-9f2a\",\n  \"client_msg_id\": \"b3f1-bc\",\n  \"ciphertext\": \"0xa5d91c...\"\n}"},
+        {k:"gotcha",label:"Do not ack here",text:"An ack from the gateway would only mean bytes reached one process. The sender's sent tick waits for the chat service to persist the row durably."},
+      ]},
+      {node:"chat",title:"Dedupe and allocate the next seq",narrate:"Chat scopes ordering to one conversation. It checks the partition-local dedupe key, then advances <code>conversations.last_seq</code> from 4471 to 4472; different conversations do this independently, so there is no global counter.",details:[
+        {k:"query",label:"Per-conversation seq allocation",lang:"text",code:"-- partition-scoped dedupe entry, colocated with conversation_id = c-9f2a\nGET dedupe:c-9f2a:b3f1-bc\n-- hit => { seq: 4472, message_id: 'm-04' }, return it\n\n-- miss: advance the conversation row atomically\nUPDATE conversations\nSET last_seq = 4472\nWHERE conversation_id = 'c-9f2a'\nIF last_seq = 4471;"},
+        {k:"route",label:"Routing key",text:"Both the dedupe probe and seq update route by <code>hash(conversation_id)</code>. That co-locates ordering state with the message rows, and it is why reads such as <code>seq &gt; cursor</code> are one-partition scans."},
+        {k:"gotcha",label:"Hot conversation trade-off",text:"A 50K msg/s broadcast conversation can still hotspot one partition. The existing design mitigates with <code>conversation_id + bucket</code> for giant conversations and relies on server-assigned <code>seq</code> for display order."},
+      ]},
+      {node:"store",title:"Persist ciphertext before ack",narrate:"The message row is inserted into the <code>messages</code> wide row for <code>c-9f2a</code>, clustered by <code>seq</code>. This is the source of truth for live delivery, reconnect sync, and every device's history.",details:[
+        {k:"query",label:"Message write",lang:"sql",code:"CONSISTENCY QUORUM;\nINSERT INTO messages\n  (conversation_id, seq, message_id, client_msg_id,\n   sender_id, ciphertext, created_at)\nVALUES\n  ('c-9f2a', 4472, 'm-04', 'b3f1-bc',\n   42, 0xa5d91c..., '2026-07-22 10:05:04');"},
+        {k:"route",label:"Why shard by conversation_id",text:"The dominant reads are <code>latest N</code> and <code>seq &gt; last_delivered_seq</code> within one conversation. Partitioning by <code>conversation_id</code> makes those reads contiguous and ordered; partitioning by sender or message id would scatter a chat history across many nodes."},
+        {k:"repl",label:"Durability",text:"Scylla/Cassandra stores RF=3 replicas across AZs and acks with <strong>QUORUM</strong> (W=2). An accepted message survives one replica loss because at least two commit logs have the row before chat acks the sender."},
+      ]},
+      {node:"presence",title:"Find B's live socket",narrate:"After the durable write, chat asks the connection registry for recipient 77. The registry is a Redis-like TTL map and is only a routing hint; a stale or missing entry falls through to the offline flow.",details:[
+        {k:"query",label:"Connected-server lookup",lang:"sql",code:"SELECT gateway_node, conn_id\nFROM connection_registry\nWHERE user_id = 77;\n-- returns gw-31 / cd34 while B is online"},
+        {k:"route",label:"Recorded, not computed",text:"The destination gateway is not <code>hash(user_id)</code>. Gateways write <code>user_id → gateway_node, conn_id</code> on connect because a user's socket can land on any of ~500-1000 gateway nodes."},
+      ]},
+      {node:"gw",title:"Recipient gateway pushes and gets device ack",narrate:"Chat forwards the persisted envelope to <code>gw-31</code>, which writes it to B's socket. Only B's device ack advances delivery; a successful server-to-gateway forward is not a delivered receipt.",details:[
+        {k:"wire",label:"Push frame to B",lang:"json",code:"{\n  \"op\": \"message.new\",\n  \"conversation_id\": \"c-9f2a\",\n  \"seq\": 4472,\n  \"message_id\": \"m-04\",\n  \"sender_id\": 42,\n  \"ciphertext\": \"0xa5d91c...\",\n  \"created_at\": \"2026-07-22T10:05:04Z\"\n}"},
+        {k:"wire",label:"Device delivery ack",lang:"json",code:"{\n  \"op\": \"receipt.delivered\",\n  \"conversation_id\": \"c-9f2a\",\n  \"user_id\": 77,\n  \"last_delivered_seq\": 4472\n}"},
+      ]},
+      {node:"store",title:"Advance B's cursor idempotently",narrate:"Delivery/read receipts are monotonic cursor updates in <code>user_inbox</code>. Redelivered frames, reconnect replays, and duplicated queue tasks can all repeat the same update safely.",details:[
+        {k:"query",label:"Receipt write",lang:"sql",code:"UPDATE user_inbox\nSET last_delivered_seq = 4472,\n    updated_at = '2026-07-22 10:05:05'\nWHERE user_id = 77\n  AND conversation_id = 'c-9f2a'\nIF last_delivered_seq < 4472;"},
+        {k:"note",label:"Ordering guarantee",text:"Clients render by server <code>seq</code>, not arrival order. If two frames arrive out of order, B buffers or sorts by <code>seq</code>; the cursor only moves forward when all prior seqs are present."},
+      ]},
+    ]},
+
+    {id:"offline-delivery-e2e",name:"Offline delivery",summary:"Recipient registry lookup misses → the message is already durable in <code>messages</code> and B's <code>user_inbox</code> cursor stays behind → push sends a **best-effort wake-up** → on reconnect the client pulls **<code>seq &gt; last_delivered_seq</code>** and advances the cursor.",steps:[
+      {node:"chat",title:"Online route fails after persist",narrate:"The send path has already written <code>messages(c-9f2a, 4472)</code>. Now chat tries to route to B, but the registry has no live socket or the gateway forward times out, so B is treated as offline.",details:[
+        {k:"query",label:"Registry miss",lang:"sql",code:"SELECT gateway_node, conn_id\nFROM connection_registry\nWHERE user_id = 77;\n-- no row, expired TTL, or gw-31 forward timed out"},
+        {k:"note",label:"No special offline copy",text:"The durable row in <code>messages</code> is the delivery backlog. Offline is represented by B's <code>user_inbox.last_delivered_seq</code> lagging behind the conversation's latest <code>seq</code>."},
+      ]},
+      {node:"store",title:"Leave B's cursor behind",narrate:"Because B did not ack the frame, <code>user_inbox</code> is not advanced. That single cursor value is enough to know exactly which messages B must pull later.",details:[
+        {k:"query",label:"Cursor state",lang:"sql",code:"SELECT last_delivered_seq, last_read_seq\nFROM user_inbox\nWHERE user_id = 77\n  AND conversation_id = 'c-9f2a';\n-- last_delivered_seq = 4471, latest message seq = 4472"},
+        {k:"repl",label:"Backlog durability",text:"The backlog is as durable as the message itself: RF=3, QUORUM write, commit-log on two replicas before ack. Push can fail for minutes without affecting message delivery correctness."},
+      ]},
+      {node:"push",title:"Send a wake-up, not the message",narrate:"Chat notifies the notification service to alert B. For E2EE, the payload carries only routing metadata; the device must wake and pull the ciphertext from the store-backed API.",details:[
+        {k:"wire",label:"Push task",lang:"json",code:"{\n  \"type\": \"new_message_alert\",\n  \"user_id\": 77,\n  \"conversation_id\": \"c-9f2a\",\n  \"max_seq\": 4472,\n  \"collapse_key\": \"c-9f2a\"\n}"},
+        {k:"gotcha",label:"Push is not delivery",text:"APNs/FCM is best-effort and rate-limited. The system can coalesce or drop stale pushes because the real message remains available by cursor sync."},
+      ]},
+      {node:"client",title:"B reconnects with its cursor",narrate:"When B opens the app or receives the push, it establishes a WebSocket and sends its per-conversation cursor. This is a delta sync, not a full history reload.",details:[
+        {k:"wire",label:"Resume frame",lang:"json",code:"{\n  \"op\": \"sync.resume\",\n  \"user_id\": 77,\n  \"cursors\": {\n    \"c-9f2a\": { \"last_delivered_seq\": 4471 }\n  }\n}"},
+        {k:"note",label:"Reconnect storm control",text:"Clients use exponential backoff plus jitter, so a gateway crash does not make millions of phones reconnect and pull at the same instant."},
+      ]},
+      {node:"gw",title:"Gateway refreshes the registry",narrate:"The new socket lands on some gateway and rewrites the connection registry. Future live messages for B can now route directly to this node again.",details:[
+        {k:"query",label:"Registry write",lang:"sql",code:"INSERT INTO connection_registry\n  (user_id, gateway_node, conn_id, connected_at)\nVALUES\n  (77, 'gw-12', 'ef56', '2026-07-22 10:08:10');\n-- TTL refreshed by gateway heartbeats"},
+        {k:"route",label:"Soft-state self-healing",text:"Old entries expire by TTL; the newest connect overwrites <code>gateway_node</code>/<code>conn_id</code>. The registry can be stale without losing messages because delivery is cursor based."},
+      ]},
+      {node:"store",title:"Pull missing messages by seq",narrate:"The sync read is a single-partition range scan: conversation <code>c-9f2a</code>, clustering key greater than B's cursor. Rows are returned already ordered by server <code>seq</code>.",details:[
+        {k:"query",label:"Catch-up read",lang:"sql",code:"CONSISTENCY QUORUM;\nSELECT seq, message_id, sender_id, ciphertext, created_at\nFROM messages\nWHERE conversation_id = 'c-9f2a'\n  AND seq > 4471\nORDER BY seq ASC\nLIMIT 100;"},
+        {k:"route",label:"Read routing",text:"The API hashes <code>conversation_id</code> to the replica set holding that conversation. Use QUORUM or leader/primary owner for read-your-writes; follower/LOCAL_ONE is cheaper for older scroll-back if slight staleness is acceptable."},
+      ]},
+      {node:"store",title:"Ack and advance the cursor",narrate:"After B durably stores/decrypts the messages locally, it sends a delivered receipt. The cursor update is monotonic, so duplicate pulls or repeated acks cannot move it backward.",details:[
+        {k:"query",label:"Advance delivered/read cursors",lang:"sql",code:"UPDATE user_inbox\nSET last_delivered_seq = 4472,\n    updated_at = '2026-07-22 10:08:11'\nWHERE user_id = 77\n  AND conversation_id = 'c-9f2a'\nIF last_delivered_seq < 4472;"},
+        {k:"note",label:"Dedup on reconnect",text:"If the same row is pulled twice, <code>message_id</code>/<code>seq</code> identifies it. The client renders one copy and the cursor write remains a no-op after the first success."},
+      ]},
+    ]},
+
+    {id:"group-fanout-e2e",name:"Group fan-out",summary:"Group send still **persists once** in <code>messages</code> with one conversation <code>seq</code>, then Kafka fan-out keyed by <code>conversation_id</code> delivers to online members or nudges offline members; huge groups switch to **fan-out-on-read** so 100K members do not sit on the sender's latency path.",steps:[
+      {node:"client",title:"Member posts to a group",narrate:"For a group, the wire frame looks like 1:1: one ciphertext envelope for conversation <code>c-1b30</code>. The sender still gets one server <code>seq</code>; delivery to members is not done synchronously on the send request.",details:[
+        {k:"wire",label:"Group send frame",lang:"json",code:"{\n  \"op\": \"message.send\",\n  \"conversation_id\": \"c-1b30\",\n  \"client_msg_id\": \"c7d2-02\",\n  \"sender_id\": 88,\n  \"ciphertext\": \"0x6e0a...\"\n}"},
+        {k:"note",label:"Sender-key friendly",text:"With E2EE group sender keys, the server still sees only routing metadata and one ciphertext blob; fan-out operates on the envelope, not plaintext."},
+      ]},
+      {node:"store",title:"Persist once for the whole group",narrate:"Chat allocates the next per-conversation sequence and inserts one row. A 100K-member group still creates one durable message row, not 100K message copies.",details:[
+        {k:"query",label:"Group message write",lang:"sql",code:"UPDATE conversations\nSET last_seq = 882\nWHERE conversation_id = 'c-1b30'\nIF last_seq = 881;\n\nCONSISTENCY QUORUM;\nINSERT INTO messages\n  (conversation_id, seq, message_id, client_msg_id,\n   sender_id, ciphertext, created_at)\nVALUES\n  ('c-1b30', 882, 'm-05', 'c7d2-02',\n   88, 0x6e0a..., '2026-07-22 10:06:00');"},
+        {k:"repl",label:"Same durability promise",text:"The sender is acked only after the RF=3 / QUORUM write succeeds. Fan-out can lag, replay, or fail independently without losing the accepted group message."},
+      ]},
+      {node:"queue",title:"Enqueue one fan-out task",narrate:"After persistence, chat publishes one durable fan-out event. Kafka is partitioned by <code>conversation_id</code> so events for the same group are consumed in order while different groups parallelize across ~2000 partitions.",details:[
+        {k:"route",label:"Kafka partition",lang:"python",code:"partition = hash('c-1b30') % 2000\nproducer.send(\n  topic='chat-fanout',\n  key='c-1b30',\n  value={ 'conversation_id': 'c-1b30', 'seq': 882 }\n)"},
+        {k:"repl",label:"Queue durability",text:"Kafka RF=3 with <code>acks=all</code> and <code>min.insync.replicas=2</code> means the fan-out task is not acknowledged until at least two brokers have it; consumers can replay from committed offsets."},
+        {k:"gotcha",label:"Hot group bucket",text:"For a truly hot broadcast conversation, use <code>conversation_id + bucket</code> to split queue load. Cross-bucket delivery arrival can vary, so clients still order by server <code>seq</code>."},
+      ]},
+      {node:"chat",title:"Choose write-fanout or read-fanout",narrate:"Fan-out workers inspect membership and policy. Small/active groups get per-recipient delivery tasks; huge groups keep the single stored row and let active members pull by cursor, with only coalesced push nudges.",details:[
+        {k:"query",label:"Membership and policy",lang:"sql",code:"SELECT type, member_ids, last_seq\nFROM conversations\nWHERE conversation_id = 'c-1b30';\n-- sample row: type='group', member_ids=[88,42,91,12], last_seq=882"},
+        {k:"route",label:"Hybrid fan-out",text:"Small groups: fan-out-on-write gives instant socket delivery. Very large groups (for example 100K members): fan-out-on-read prevents 100K registry lookups and pushes from sitting behind every send."},
+      ]},
+      {node:"presence",title:"Resolve online recipients",narrate:"For members selected for live delivery, workers batch lookup the connection registry. Online members get a gateway route; offline members keep their cursor behind and receive a coalesced push.",details:[
+        {k:"query",label:"Batch registry lookups",lang:"sql",code:"SELECT user_id, gateway_node, conn_id\nFROM connection_registry\nWHERE user_id IN (42, 91, 12);\n-- 42 => gw-07/ab12, 91 => null, 12 => maybe offline"},
+        {k:"note",label:"Registry is a hint",text:"A stale route just converts that member to the offline path. Delivered receipts are based on device acks, never on the worker successfully finding a gateway node."},
+      ]},
+      {node:"gw",title:"Push online members, retry safely",narrate:"Each online recipient receives the same message envelope with <code>conversation_id</code> and <code>seq</code>. Queue redelivery is expected, so gateway/client delivery is idempotent by <code>message_id</code> and cursor.",details:[
+        {k:"wire",label:"Group message frame",lang:"json",code:"{\n  \"op\": \"message.new\",\n  \"conversation_id\": \"c-1b30\",\n  \"seq\": 882,\n  \"message_id\": \"m-05\",\n  \"sender_id\": 88,\n  \"ciphertext\": \"0x6e0a...\"\n}"},
+        {k:"query",label:"Per-recipient cursor advance",lang:"sql",code:"UPDATE user_inbox\nSET last_delivered_seq = 882,\n    updated_at = '2026-07-22 10:06:01'\nWHERE user_id = 42\n  AND conversation_id = 'c-1b30'\nIF last_delivered_seq < 882;"},
+      ]},
+      {node:"push",title:"Nudge offline or lazy members",narrate:"Offline members and fan-out-on-read group members get a collapsed notification, not one push per message. When they open the group, they run the same <code>seq &gt; cursor</code> pull against <code>messages</code>.",details:[
+        {k:"wire",label:"Coalesced notification",lang:"json",code:"{\n  \"type\": \"group_new_messages\",\n  \"user_id\": 91,\n  \"conversation_id\": \"c-1b30\",\n  \"max_seq\": 882,\n  \"collapse_key\": \"c-1b30\"\n}"},
+        {k:"gotcha",label:"Why this survives 100K members",text:"The sender path is one persist plus one enqueue. The expensive per-member work is asynchronous, coalesced, and for huge groups often replaced by pull-on-open, so a fan-out storm degrades to delayed delivery rather than failed sends."},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Send and receive 1:1 and group messages in real time, with delivery and read receipts",

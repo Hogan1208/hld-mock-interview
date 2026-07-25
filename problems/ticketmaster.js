@@ -347,6 +347,81 @@ window.DATA['ticketmaster'] = {
       {node:"db",text:"The inventory DB serializes the single-row conditional write - exactly one buyer wins the seat."},
     ]},
   ],
+  deepFlows:[
+    {id:"reserve-checkout-e2e",name:"Reserve & checkout",summary:"**POST /reserve** → admitted token + idempotency → **atomic hold on <code>(event_id, seat_id)</code>** → 10-minute TTL → idempotent payment → **held→sold** quorum commit. The DB, not Redis or the client, decides who owns the seat.",steps:[
+      {node:"client",title:"Client chooses exact seats",narrate:"The seat map is only a **display hint**. The client sends the exact <code>event_id</code> and <code>seat_ids</code>, a reused idempotency key, and the admitted waiting-room token; the reserve response is the first authoritative fact.",details:[
+        {k:"wire",label:"Reserve request",lang:"http",code:"POST /v1/events/evt-501/reservations\nX-User-Id: user-9001\nX-Queue-Token: qtok_admitted_evt501_000482\nIdempotency-Key: rsv-user-9001-evt-501-s-103\nContent-Type: application/json\n\n{\n  \"event_id\": \"evt-501\",\n  \"seat_ids\": [\"s-103\"],\n  \"user_id\": \"user-9001\"\n}"},
+        {k:"note",label:"Retry contract",text:"If the mobile network times out, the client retries with the **same** idempotency key. Booking returns the existing pending order/hold if it already succeeded, instead of creating a second hold or turning a retry into a false <code>409</code>."},
+      ]},
+      {node:"gw",title:"Gateway admits only paced buyers",narrate:"The gateway validates auth, per-user limits, and the waiting-room token before the request can touch booking. This is what keeps the raw **~1M users in one second** from becoming ~1M DB writes.",details:[
+        {k:"wire",label:"Admission token shape",lang:"json",code:"{\n  \"event_id\": \"evt-501\",\n  \"user_id\": \"user-9001\",\n  \"status\": \"ADMITTED\",\n  \"active_slot\": 4217,\n  \"expires_at\": \"2026-07-22T10:08:00Z\",\n  \"sig\": \"ed25519:...\"\n}"},
+        {k:"route",label:"Admission ceiling",text:"The waiting room keeps about **~5K admitted checkouts** active because booking is sized for **~2–3K short ops/s** and inventory for **~5–10K conditional writes/s**. Everybody else stays in the cheap queue path."},
+      ]},
+      {node:"booking",title:"Booking routes the seat write",narrate:"Booking is stateless, so it recomputes the inventory partition from the seat identity. The natural top-level key is <code>event_id</code>, but one hot event would pin one shard, so the actual partition includes the seat id or seat block.",details:[
+        {k:"route",label:"Shard key and hot-event mitigation",lang:"python",code:"event = 'evt-501'\nseat  = 's-103'\n# Avoid shard = hash(event_id) only: one mega on-sale would pin one shard.\npartition = hash(event_id + ':' + seat_id) % NUM_INVENTORY_PARTITIONS\n# Or use seat blocks: hash(event_id + ':' + section) for multi-seat locality."},
+        {k:"gotcha",label:"Trade-off",text:"Pure <code>event_id</code> sharding makes rendering one event easy but concentrates the **entire Taylor Swift on-sale** on one shard. Sub-partitioning by <code>(event_id, seat_id)</code> spreads writes across the event's ~100K rows, but a full event seat-map read must fan out or use the derived cache."},
+      ]},
+      {node:"db",title:"Atomically place the hold",narrate:"The reserve is one short ACID transaction on the inventory leader. The conditional update treats an expired hold as claimable, so the hold is self-expiring even if booking or the reaper dies.",details:[
+        {k:"query",label:"Single-seat conditional hold",lang:"sql",code:"BEGIN;\n\nUPDATE seats\nSET status = 'held',\n    held_by = 'user-9001',\n    hold_expires_at = now() + interval '10 minutes'\nWHERE event_id = 'evt-501'\n  AND seat_id = 's-103'\n  AND (\n    status = 'available'\n    OR (status = 'held' AND hold_expires_at < now())\n  )\nRETURNING seat_id, hold_expires_at;\n\n-- 1 row => this user owns the hold\n-- 0 rows => already held/sold by someone else; return 409\n\nINSERT INTO orders (order_id, user_id, event_id, seat_ids, status, payment_id, created_at)\nVALUES ('ord-8003', 'user-9001', 'evt-501', '[\"s-103\"]', 'pending', NULL, now());\n\nCOMMIT;"},
+        {k:"query",label:"Multi-seat variant",text:"For 2–8 adjacent seats, lock rows in deterministic order so the group succeeds or fails atomically without deadlocks.",lang:"sql",code:"BEGIN;\nSELECT seat_id, status, hold_expires_at\nFROM seats\nWHERE event_id = 'evt-501'\n  AND seat_id IN ('s-103','s-104','s-105')\nORDER BY seat_id\nFOR UPDATE;\n-- Verify every row is available or expired-held, then UPDATE all + INSERT one pending order.\nCOMMIT;"},
+        {k:"gotcha",label:"Why this prevents double-booking",text:"The DB serializes writers on the <code>(event_id, seat_id)</code> row. Two users racing for <code>s-103</code> cannot both observe <code>status='available'</code> inside the conditional write: one update changes the row to <code>held</code>; the other affects **zero rows** and gets <code>409</code>."},
+      ]},
+      {node:"db",title:"Commit with strong consistency",narrate:"Inventory is the sacred write path: every reserve and confirmed order commits on the leader and is synchronously replicated to a quorum before the caller sees success. Reads can be stale; inventory writes cannot.",details:[
+        {k:"repl",label:"Replica group",lang:"text",code:"inventory partition P17 (evt-501:s-103)\n  leader AZ-a  -> append WAL + fsync\n  follower AZ-b -> quorum ack required\n  follower AZ-c -> catches up async if slow\n\nACK reserve only after leader + one follower are durable (W=2 of 3)."},
+        {k:"repl",label:"Consistency choice",text:"A few extra milliseconds are acceptable because the waiting room has already paced admission. Async replication would allow an acknowledged hold/order to vanish on leader loss; worse, split-brain could sell one seat twice. So reserve/confirm choose **consistency over availability**."},
+      ]},
+      {node:"booking",title:"Return the hold and countdown",narrate:"Booking returns a pending order and the server-generated expiry timestamp. The lock is not a long DB lock; it is durable seat state with a TTL field, so the user can spend minutes in checkout without holding a row lock.",details:[
+        {k:"wire",label:"Reserve response",lang:"http",code:"201 Created\n{\n  \"order_id\": \"ord-8003\",\n  \"event_id\": \"evt-501\",\n  \"seat_ids\": [\"s-103\"],\n  \"status\": \"pending\",\n  \"hold_expires_at\": \"2026-07-22T10:12:55Z\"\n}"},
+        {k:"note",label:"Hold expiry backstop",text:"If the user closes the tab or booking crashes after commit, <code>hold_expires_at</code> makes the seat claimable again after ~10 minutes. A reaper improves map freshness, but the reserve query itself is the correctness mechanism."},
+      ]},
+      {node:"payment",title:"Charge with payment idempotency",narrate:"Payment runs **outside** the inventory transaction. Booking sends the order id as the payment idempotency key so a timeout or retry cannot double-charge the buyer.",details:[
+        {k:"wire",label:"Charge request",lang:"http",code:"POST /payments/authorize\nIdempotency-Key: pay-ord-8003\nContent-Type: application/json\n\n{\n  \"order_id\": \"ord-8003\",\n  \"amount\": \"180.00\",\n  \"currency\": \"USD\",\n  \"payment_method\": \"pm_tok_visa\"\n}"},
+        {k:"note",label:"Timeout means unknown",text:"If the processor times out after 30s, booking must **query/retry by the same idempotency key**. It never assumes failure and never sends a new key, because that is how double charges happen."},
+      ]},
+      {node:"db",title:"Confirm only if the hold is still ours",narrate:"After payment succeeds, booking performs a second short transaction. It re-checks that <code>s-103</code> is still <code>held</code> by this user and not expired, then atomically marks the seat sold and confirms the order.",details:[
+        {k:"query",label:"held → sold commit",lang:"sql",code:"BEGIN;\n\nUPDATE payments\nSET status = 'captured'\nWHERE payment_id = 'pay-7002'\n  AND order_id = 'ord-8003';\n\nUPDATE seats\nSET status = 'sold',\n    held_by = NULL,\n    hold_expires_at = NULL\nWHERE event_id = 'evt-501'\n  AND seat_id = 's-103'\n  AND status = 'held'\n  AND held_by = 'user-9001'\n  AND hold_expires_at > now()\nRETURNING seat_id;\n\nUPDATE orders\nSET status = 'confirmed', payment_id = 'pay-7002'\nWHERE order_id = 'ord-8003'\n  AND status = 'pending';\n\nCOMMIT;"},
+        {k:"gotcha",label:"Payment success after expiry",text:"If the final <code>UPDATE seats</code> returns 0 rows, the hold expired or was reclaimed. Booking must **void/refund** the charge via the saga, not force-sell a seat that may now belong to another buyer."},
+      ]},
+      {node:"client",from:"db",title:"Client receives the ticket",narrate:"Only after the confirmed order is durably committed does the user see a ticket. The system has charged at most once, sold the seat at most once, and can recover the result from <code>orders</code>, <code>payments</code>, and <code>seats</code> after any crash.",details:[
+        {k:"wire",label:"Confirm response",lang:"json",code:"{\n  \"order_id\": \"ord-8003\",\n  \"status\": \"confirmed\",\n  \"payment_id\": \"pay-7002\",\n  \"tickets\": [\n    { \"event_id\": \"evt-501\", \"seat_id\": \"s-103\", \"section\": \"Floor A\", \"row\": \"1\", \"num\": 16 }\n  ]\n}"},
+      ]},
+    ]},
+
+    {id:"browse-onsale-e2e",name:"Browse at on-sale",summary:"**1M viewers** hit the event page → edge/waiting room absorbs the herd → search and seat-map reads stay eventually consistent → cache fan-out serves ~500K/s → only reserve writes use the strongly-consistent inventory leader.",steps:[
+      {node:"client",title:"A million clients open the event",narrate:"At 10:00:00, users mostly read: event details, queue position, and seat availability. These reads are **not** allowed to compete with the inventory write path that prevents double-selling.",details:[
+        {k:"wire",label:"Read requests",lang:"http",code:"GET /v1/search?q=Taylor%20Swift%20Boston\nGET /v1/events/evt-501\nGET /v1/events/evt-501/seatmap\nGET /v1/waiting-room/evt-501/position"},
+        {k:"note",label:"Peak read math",text:"From the problem: **~1M clients** polling the seat map every ~2s is **~500K seat-map reads/s**. The design intentionally lets those reads be stale by 1–2s, because exactness is enforced only at reserve."},
+      ]},
+      {node:"gw",title:"Edge separates reads from scarce writes",narrate:"The gateway/CDN answers cacheable browse and queue-position reads at the edge. Only admitted, authenticated reserve attempts flow toward booking.",details:[
+        {k:"route",label:"Read vs write routing",lang:"text",code:"GET /search, /events, /seatmap  -> CDN/edge -> search/cache on miss\nGET /waiting-room/position       -> cached 'admitted_through=N'\nPOST /reserve                    -> requires ADMITTED token -> booking"},
+        {k:"note",label:"Origin load after cache",text:"If the edge serves ~95% of ~330K queue polls/s, origin sees ~17K/s plus steady browse and admitted reserve (~32K/s total), matching the gateway sizing notes instead of the raw million."},
+      ]},
+      {node:"queue",title:"Waiting room makes demand bounded",narrate:"Unadmitted users do not call booking. They poll a cheap status value while the dispatcher emits admitted tokens at the backend's safe service rate.",details:[
+        {k:"query",label:"Queue state commands",lang:"redis",code:"ZADD queue:evt-501 1784704200000 user-9001\nGET admitted_through:evt-501          # cached at edge, e.g. 482000\nZPOPMIN queue:evt-501 500             # dispatcher admits next batch\nSETEX admitted:evt-501:user-9001 600 qtok_admitted_evt501_000482"},
+        {k:"route",label:"The number that matters",text:"Arrival can be **100K joins/s** or 5M total; downstream only sees the dispatcher emission rate. A backlog means a longer line, not a DB stampede."},
+      ]},
+      {node:"search",title:"Search is a stale read model",narrate:"Search/browse uses its own replicated index over event metadata. It is fed asynchronously from catalog/inventory changes, so a stale 'available' badge can happen, but it cannot sell a seat.",details:[
+        {k:"query",label:"Search query",lang:"json",code:"{\n  \"index\": \"events-v7\",\n  \"query\": {\n    \"artist\": \"Taylor Swift\",\n    \"city\": \"Boston\",\n    \"date_gte\": \"2026-09-01\"\n  },\n  \"facets\": [\"venue\", \"date\", \"price_band\"]\n}"},
+        {k:"repl",label:"CDC freshness",text:"Catalog and inventory changes are streamed asynchronously into search; lag is seconds. That is acceptable because clicking a stale result only leads to a seat map or a reserve <code>409</code>, never a double-book."},
+      ]},
+      {node:"booking",title:"Booking asks for the seat map",narrate:"The event page needs a 100K-seat availability snapshot. Booking reads the derived map from cache, not the inventory leader. On a miss, it uses coalescing so only one fill query runs.",details:[
+        {k:"query",label:"Cache read",lang:"redis",code:"GET seatmap:evt-501#7\n-- hot key replicated as seatmap:evt-501#0..#15\n-- client or gateway picks one replica at random\n-- TTL: 1-2 seconds with jitter"},
+        {k:"route",label:"Hot-key fan-out",text:"One event can be **~90% of read traffic** (~450K reads/s). Replicating <code>seatmap:evt-501</code> across N keys plus CDN caching spreads fan-out; consistent hashing alone would pin one Redis node."},
+      ]},
+      {node:"cache",title:"Cache stays eventually consistent",narrate:"Every reserve/release publishes a seat-state update, and the cache converges within about a second. It is deliberately biased to mark seats taken quickly and freed seats slightly later.",details:[
+        {k:"wire",label:"Seat-state event",lang:"json",code:"{\n  \"type\": \"seat_state_changed\",\n  \"event_id\": \"evt-501\",\n  \"seat_id\": \"s-103\",\n  \"status\": \"held\",\n  \"hold_expires_at\": \"2026-07-22T10:12:55Z\"\n}"},
+        {k:"gotcha",label:"Stale map is safe",text:"A stale map can show <code>s-103</code> as available after it was held; the next reserve hits the DB conditional update and returns <code>409</code>. A stale map is a UX miss, **not** a correctness violation."},
+      ]},
+      {node:"db",title:"Misses avoid the write primary",narrate:"If the cache misses or goes cold, the fill path reads from replicas/read-optimized snapshots and uses request coalescing. The write leader is reserved for holds and confirmations.",details:[
+        {k:"query",label:"Seat-map fill query",lang:"sql",code:"SELECT seat_id, section, row, num, status, hold_expires_at\nFROM seats\nWHERE event_id = 'evt-501'\n  AND (status != 'held' OR hold_expires_at > now());\n-- Run via one single-flight fill per event, from read replica if possible."},
+        {k:"repl",label:"Read consistency trade-off",text:"Seat-map reads may come from a follower and be milliseconds/seconds stale. Exact inventory decisions — <code>UPDATE seats ... WHERE status='available'</code> and <code>held→sold</code> — always go to the strongly-consistent leader/quorum path."},
+        {k:"gotcha",label:"Protect the core under cold cache",text:"If the cache restarts empty, shed or stale-serve seat-map reads before letting **~450K reads/s** hit the inventory DB. Reads degrade; reserve writes stay protected."},
+      ]},
+      {node:"client",from:"cache",title:"Client renders a live-ish map",narrate:"The user sees a near-real-time map and queue position. When they click a seat, the flow switches from cheap, stale reads to the strongly-consistent reserve path above.",details:[
+        {k:"wire",label:"Seat-map response",lang:"json",code:"{\n  \"event_id\": \"evt-501\",\n  \"as_of\": \"2026-07-22T10:02:56Z\",\n  \"ttl_ms\": 1500,\n  \"seats\": [\n    { \"seat_id\": \"s-101\", \"status\": \"sold\" },\n    { \"seat_id\": \"s-102\", \"status\": \"held\", \"hold_expires_at\": \"2026-07-22T10:03:00Z\" },\n    { \"seat_id\": \"s-103\", \"status\": \"available\" }\n  ]\n}"},
+      ]},
+    ]},
+  ],
   requirements:{
     functional:[
       "Browse and view events, venues, and live seat availability",
