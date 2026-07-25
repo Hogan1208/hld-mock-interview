@@ -5,7 +5,10 @@ both **interviewer** and **candidate**. 12 problems, each with a phased flow
 (Requirements → Functional HLD → System deep dives → Component deep dives), a
 diagram that grows and animates as the conversation progresses, per-component
 **study notes** (role, capacity, data/consistency, scaling levers, failure modes,
-trade-offs, and the probes an interviewer will push on), and a box to ask your own
+trade-offs, and the probes an interviewer will push on), an **end-to-end Request
+Walkthrough** that traces a request across the architecture step by step (real
+queries, shard/partition routing, sync-vs-async replication, and failure handling —
+with a focused diagram and a travelling request pulse), and a box to ask your own
 questions.
 
 ## What's in here
@@ -64,3 +67,6 @@ Tip: keeping the folder in a git repo makes syncing between laptops easy —
 - `python3` ships with macOS Command Line Tools; on other OSes install Python 3.
 - All content is pre-authored; resource links point to real references
   (System Design Primer, Hello Interview, engineering blogs, official docs).
+- **Finding the walkthrough:** open a problem, go to **Component deep dives** (phase 4);
+  the toolbar shows purple **"End-to-end walkthrough:"** buttons. Step with Prev/Next,
+  the arrow keys, or the step dots; **Auto-play** advances on its own; **Esc** closes.
