@@ -84,6 +84,8 @@
   .difftools button:hover:not(:disabled){border-color:var(--accent);background:#222c38}
   .difftools button:disabled{opacity:.5;cursor:not-allowed}
   .difftools button.flowbtn{border-color:rgba(124,92,255,.4);color:#c3b6ff}
+  .difftools button.wtbtn{border-color:var(--accent2);background:linear-gradient(180deg,#241d3d,#1a1530);color:#d8ccff;font-weight:600}
+  .difftools button.wtbtn:hover{background:linear-gradient(180deg,#2c2350,#221a3d);border-color:#8a6cff}
   .difftools button.on{border-color:var(--accent);background:#1c2836}
   .schemaBox{padding:6px 12px 12px}
   .schemaBox .tbl{margin-bottom:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
@@ -187,6 +189,65 @@
   .probe:first-child{border-top:none}
   .probe i{color:var(--cand);margin-top:2px;flex-shrink:0}
 
+  /* ---- request walkthrough overlay ---- */
+  .wt-ov{position:fixed;inset:0;background:rgba(6,9,14,.78);backdrop-filter:blur(3px);z-index:100;display:flex;align-items:center;justify-content:center;animation:fade .2s ease}
+  .wt-modal{width:min(1180px,95vw);height:min(90vh,860px);background:var(--panel);border:1px solid var(--line);border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+  .wt-head{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#1a2230,#141a24)}
+  .wt-head h3{margin:0;font-size:15px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
+  .wt-head h3 i{color:var(--accent2)}
+  .wt-head .sub{color:var(--muted);font-size:12px}
+  .wt-head .sp{flex:1}
+  .wt-head .stepn{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 11px}
+  .wt-x{background:var(--panel2);border:1px solid var(--line);color:var(--muted);width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:16px;line-height:1}
+  .wt-x:hover{color:#fff;border-color:var(--accent)}
+  .wt-body{flex:1;display:flex;min-height:0}
+  .wt-diag{width:46%;border-right:1px solid var(--line);background:radial-gradient(circle at 40% 30%,#141b26,#0d1119);display:flex;flex-direction:column;min-width:0}
+  .wt-diag .d{flex:1;display:flex;align-items:center;justify-content:center;padding:16px;min-height:0}
+  .wt-diag svg{width:100%;height:100%;max-height:100%}
+  .wt-diag .cap{padding:8px 14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);text-align:center}
+  .wt-diag .edge{stroke:var(--edge);stroke-width:1.6;fill:none;opacity:.4;marker-end:url(#arr)}
+  .wt-diag .edge.wt-hot{stroke:var(--accent2);stroke-width:2.6;opacity:1;marker-end:url(#arrhot)}
+  .wt-diag .elabel-bg{fill:#0d1119;opacity:.85}
+  .wt-diag .elabel{fill:#8aa0b6;font-size:9px;text-transform:uppercase;letter-spacing:.4px}
+  .wt-diag .node text{fill:#e7eef6;font-size:12px;font-weight:600;pointer-events:none}
+  .wt-diag .node .sub{fill:#7d8ea0;font-size:9.5px;font-weight:500}
+  .wt-diag .node .box{fill:url(#nodegrad);stroke:var(--line);stroke-width:1.2;filter:url(#nodeshadow)}
+  .wt-diag .node{opacity:.42;transition:opacity .3s}
+  .wt-diag .node.on{opacity:1}
+  .wt-diag .node.on .box{stroke:var(--accent2);stroke-width:2.2}
+  .wt-diag .node.done .box{stroke:#2f6f52}
+  .wt-pulse{fill:#c3b6ff;filter:drop-shadow(0 0 6px var(--accent2))}
+  .wt-side{flex:1;display:flex;flex-direction:column;min-width:0}
+  .wt-scroll{flex:1;overflow-y:auto;padding:18px 20px}
+  .wt-badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent2);background:#1e1a33;border:1px solid #2f2a4d;border-radius:20px;padding:3px 10px;margin-bottom:10px}
+  .wt-title{font-size:17px;font-weight:700;color:#fff;margin:0 0 8px}
+  .wt-narr{font-size:13.5px;line-height:1.62;color:#d3dde7;margin-bottom:16px}
+  .wt-narr code{background:#0e1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12px;color:#b8c7d6}
+  .wt-card{border:1px solid var(--line);border-left-width:3px;border-radius:9px;margin-bottom:12px;overflow:hidden;background:#10151d}
+  .wt-card>.h{display:flex;align-items:center;gap:7px;padding:8px 12px;font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+  .wt-card>.h i{font-size:14px}
+  .wt-card .tx{padding:0 12px 11px;font-size:12.5px;line-height:1.55;color:#c7d2dd}
+  .wt-card pre{margin:0;padding:11px 12px;background:#0b0e14;border-top:1px solid var(--line);overflow-x:auto;font-family:'SF Mono',ui-monospace,Menlo,monospace;font-size:11.7px;line-height:1.55;color:#cfe3d6;white-space:pre;tab-size:2}
+  .wt-card pre .kw{color:#7ca7ff;font-weight:600}.wt-card pre .st{color:#e0a86b}.wt-card pre .cm{color:#5f7183;font-style:italic}
+  .wt-card.wire{border-left-color:#6ea8ff}.wt-card.wire>.h{color:#6ea8ff}
+  .wt-card.query{border-left-color:#4fd1a1}.wt-card.query>.h{color:#4fd1a1}
+  .wt-card.route{border-left-color:#c08cff}.wt-card.route>.h{color:#c08cff}
+  .wt-card.repl{border-left-color:#f0a742}.wt-card.repl>.h{color:#f0a742}
+  .wt-card.note{border-left-color:#8aa0b6}.wt-card.note>.h{color:#8aa0b6}
+  .wt-card.gotcha{border-left-color:#ff8fb0}.wt-card.gotcha>.h{color:#ff8fb0}
+  .wt-card .pill{margin-left:auto;font-size:10px;font-weight:700;color:#fff;background:#2a3342;border-radius:20px;padding:2px 8px;letter-spacing:.3px}
+  .wt-nav{display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid var(--line);background:#121822}
+  .wt-nav button{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .wt-nav button:hover:not(:disabled){border-color:var(--accent)}
+  .wt-nav button:disabled{opacity:.4;cursor:not-allowed}
+  .wt-nav .prim{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  .wt-nav .prim:hover{background:#6a4ce0}
+  .wt-nav .sp{flex:1}
+  .wt-dots{display:flex;gap:6px;align-items:center}
+  .wt-dots .dot{width:9px;height:9px;border-radius:50%;background:#2a3342;border:none;cursor:pointer;padding:0}
+  .wt-dots .dot.on{background:var(--accent2);transform:scale(1.25)}
+  .wt-dots .dot.seen{background:#3f5169}
+
   .askbox{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#12161d}
   .askbox label{font-size:12px;color:var(--muted);display:block;margin-bottom:8px}.askbox label b{color:var(--accent2)}
   .askrow{display:flex;gap:8px}
@@ -277,7 +338,8 @@ const PHASE_META = [
 
 let state = {diff:null, prob:null, phase:1, activeNode:null, asked:{}, answeredCount:{},
   reqDone:{}, diveDone:{}, playing:false, revealed:new Set(), justRevealed:new Set(), filter:null,
-  flowNode:null, showSchema:false, showDbDoc:false, studyMode:true};
+  flowNode:null, showSchema:false, showDbDoc:false, studyMode:true,
+  wt:{open:false, flow:null, i:0, playing:false, timer:null, seen:new Set()}};
 
 const setupEl=document.getElementById('setup'), interviewEl=document.getElementById('interview'), subtitle=document.getElementById('subtitle');
 
@@ -369,11 +431,16 @@ function renderDifftools(){
     html+=`<span class="lab">Walk a flow:</span>`;
     p.flows.forEach(f=>{ html+=`<button class="flowbtn" data-flow="${f.id}" ${state.playing?'disabled':''}><i class="ti ti-player-play"></i> ${f.name}</button>`; });
   }
+  if(p.deepFlows&&p.deepFlows.length){
+    html+=`<span class="lab" style="color:var(--accent2)"><i class="ti ti-zoom-scan"></i> End-to-end walkthrough:</span>`;
+    p.deepFlows.forEach(f=>{ html+=`<button class="flowbtn wtbtn" data-wt="${f.id}"><i class="ti ti-route"></i> ${f.name}</button>`; });
+  }
   if(!html) html=`<span class="lab">Click a component below to drill in.</span>`;
   el.innerHTML=html;
   const sb=document.getElementById('schemaBtn'); if(sb) sb.onclick=toggleSchema;
   const db=document.getElementById('dbDocBtn'); if(db) db.onclick=toggleDbDoc;
-  el.querySelectorAll('.flowbtn').forEach(b=>b.onclick=()=>{ if(!state.playing) walkFlow(b.dataset.flow); });
+  el.querySelectorAll('.flowbtn[data-flow]').forEach(b=>b.onclick=()=>{ if(!state.playing) walkFlow(b.dataset.flow); });
+  el.querySelectorAll('.wtbtn').forEach(b=>b.onclick=()=>openWalk(b.dataset.wt));
 }
 function toggleSchema(){ state.showSchema=!state.showSchema; const box=document.getElementById('schemaBox');
   if(state.showSchema){ state.showDbDoc=false; const d=document.getElementById('dbDocBox'); if(d)d.style.display='none'; renderSchema(); box.style.display='block'; } else box.style.display='none';
@@ -440,26 +507,187 @@ function walkFlow(flowId){
   step();
 }
 // animate a glowing "request" dot travelling from one component to another along the wire
-function travelPulse(fromId,toId,ms,done){
-  const svg=document.querySelector('#diagram svg'), p=DATA[state.prob];
-  const A=(p.nodes||[]).find(n=>n.id===fromId), B=(p.nodes||[]).find(n=>n.id===toId);
+function pulseAlong(svg,sx,sy,ex,ey,ms,cls,done){
   const finish=()=>{ if(done) done(); };
-  if(!svg||!A||!B||!state.revealed.has(fromId)||!state.revealed.has(toId)){ finish(); return; }
-  const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
-  const ax=A.x+hw, ay=A.y+hh, bx=B.x+hw, by=B.y+hh;
-  const s=borderPt(ax,ay,bx,by,hw,hh,2), e=borderPt(bx,by,ax,ay,hw,hh,5);
+  if(!svg){ finish(); return; }
   const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
-  c.setAttribute('r','5'); c.setAttribute('class','pulse'); c.setAttribute('cx',s.x); c.setAttribute('cy',s.y);
+  c.setAttribute('r','5'); c.setAttribute('class',cls||'pulse'); c.setAttribute('cx',sx); c.setAttribute('cy',sy);
   svg.appendChild(c);
   const t0=performance.now();
   const tick=(now)=>{
     const k=Math.min(1,(now-t0)/ms), ease=k<.5?2*k*k:1-Math.pow(-2*k+2,2)/2;
-    c.setAttribute('cx', s.x+(e.x-s.x)*ease); c.setAttribute('cy', s.y+(e.y-s.y)*ease);
+    c.setAttribute('cx', sx+(ex-sx)*ease); c.setAttribute('cy', sy+(ey-sy)*ease);
     c.setAttribute('r', 4+2*Math.sin(k*Math.PI));
     if(k<1) requestAnimationFrame(tick); else { c.remove(); finish(); }
   };
   requestAnimationFrame(tick);
 }
+function travelPulse(fromId,toId,ms,done){
+  const svg=document.querySelector('#diagram svg'), p=DATA[state.prob];
+  const A=(p.nodes||[]).find(n=>n.id===fromId), B=(p.nodes||[]).find(n=>n.id===toId);
+  if(!svg||!A||!B||!state.revealed.has(fromId)||!state.revealed.has(toId)){ if(done)done(); return; }
+  const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
+  const ax=A.x+hw, ay=A.y+hh, bx=B.x+hw, by=B.y+hh;
+  const s=borderPt(ax,ay,bx,by,hw,hh,2), e=borderPt(bx,by,ax,ay,hw,hh,5);
+  pulseAlong(svg,s.x,s.y,e.x,e.y,ms,'pulse',done);
+}
+
+/* ---------------- request walkthrough (end-to-end) ---------------- */
+const WT_ICON={wire:'ti-arrow-bounce',query:'ti-database',route:'ti-route',repl:'ti-copy',note:'ti-info-circle',gotcha:'ti-alert-triangle'};
+const WT_KW=/\b(SELECT|INSERT|INTO|VALUES|UPDATE|SET|DELETE|FROM|WHERE|AND|OR|ORDER BY|GROUP BY|LIMIT|OFFSET|RETURNING|ON CONFLICT|DO NOTHING|DO UPDATE|LEFT JOIN|INNER JOIN|JOIN|HAVING|USING|BEGIN|COMMIT|ROLLBACK|WITH|CASE|WHEN|THEN|ELSE|END|NOT|NULL|IS|IN|ASC|DESC|FOR UPDATE|SKIP LOCKED|COALESCE|NOW|EXISTS|BETWEEN|DISTINCT|COUNT|EXPLAIN|ANALYZE)\b/g;
+function wtEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function wtHi(code){
+  let s=wtEsc(code);
+  s=s.replace(/(--[^\n]*)/g,'<span class="cm">$1</span>');
+  s=s.replace(/('[^'\n]*')/g,'<span class="st">$1</span>');
+  s=s.replace(WT_KW,'<span class="kw">$1</span>');
+  return s;
+}
+function wtInline(s){ return String(s||'').replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/`([^`]+?)`/g,'<code>$1</code>'); }
+
+function openWalk(flowId){
+  const p=DATA[state.prob], flow=(p.deepFlows||[]).find(f=>f.id===flowId); if(!flow)return;
+  state.wt={open:true, flow, i:0, playing:false, timer:null, seen:new Set([0])};
+  let ov=document.getElementById('wtov');
+  if(!ov){ ov=document.createElement('div'); ov.id='wtov'; ov.className='wt-ov'; document.body.appendChild(ov); }
+  ov.style.display='flex';
+  ov.onclick=(e)=>{ if(e.target===ov) closeWalk(); };
+  wtRender();
+}
+function closeWalk(){
+  if(state.wt.timer){ clearTimeout(state.wt.timer); }
+  state.wt.open=false; state.wt.playing=false; state.wt.timer=null;
+  const ov=document.getElementById('wtov'); if(ov) ov.style.display='none';
+}
+function wtGo(delta){
+  const f=state.wt.flow; if(!f)return;
+  const n=f.steps.length, ni=Math.min(n-1,Math.max(0,state.wt.i+delta));
+  if(ni===state.wt.i && delta>0){ wtStopPlay(); return; }
+  state.wt.i=ni; state.wt.seen.add(ni); wtRender();
+}
+function wtJump(i){ state.wt.i=i; state.wt.seen.add(i); wtRender(); }
+function wtStopPlay(){ state.wt.playing=false; if(state.wt.timer){clearTimeout(state.wt.timer);state.wt.timer=null;} const b=document.getElementById('wtplay'); if(b){b.innerHTML='<i class="ti ti-player-play"></i> Auto-play';} }
+function wtPlayToggle(){
+  state.wt.playing=!state.wt.playing;
+  const b=document.getElementById('wtplay');
+  if(state.wt.playing){ if(b)b.innerHTML='<i class="ti ti-player-pause"></i> Pause'; wtSchedule(); }
+  else wtStopPlay();
+}
+function wtSchedule(){
+  if(state.wt.timer) clearTimeout(state.wt.timer);
+  state.wt.timer=setTimeout(()=>{
+    if(!state.wt.playing) return;
+    if(state.wt.i>=state.wt.flow.steps.length-1){ wtStopPlay(); return; }
+    wtGo(1); if(state.wt.playing) wtSchedule();
+  }, 5200);
+}
+// glowing dot along a hop inside the overlay diagram
+function wtPulse(fromId,toId){
+  const svg=document.querySelector('#wtdiagram svg'), p=DATA[state.prob];
+  const A=(p.nodes||[]).find(n=>n.id===fromId), B=(p.nodes||[]).find(n=>n.id===toId);
+  if(!svg||!A||!B) return;
+  const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
+  const s=borderPt(A.x+hw,A.y+hh,B.x+hw,B.y+hh,hw,hh,2), e=borderPt(B.x+hw,B.y+hh,A.x+hw,A.y+hh,hw,hh,5);
+  const loop=()=>{ if(!state.wt.open) return; pulseAlong(svg,s.x,s.y,e.x,e.y,900,'wt-pulse',()=>{ state.wt._pt=setTimeout(loop,650); }); };
+  if(state.wt._pt) clearTimeout(state.wt._pt);
+  loop();
+}
+// focused diagram: all nodes shown, active node highlighted, active hop edge hot
+function flowDiagramSVG(p,activeId,fromId,doneSet){
+  const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
+  const maxX=Math.max(...p.nodes.map(n=>n.x))+cellW+40, maxY=Math.max(...p.nodes.map(n=>n.y))+cellH+30;
+  const pos={}; p.nodes.forEach(n=>pos[n.id]={x:n.x,y:n.y});
+  const isHot=(a,b)=>fromId&&activeId&&((a===fromId&&b===activeId)||(a===activeId&&b===fromId));
+  let edges='', elabels='', hotFound=false;
+  p.edges.forEach(e=>{ const [a,b,label]=e; const A=pos[a],B=pos[b]; if(!A||!B)return;
+    const s=borderPt(A.x+hw,A.y+hh,B.x+hw,B.y+hh,hw,hh,2), t=borderPt(B.x+hw,B.y+hh,A.x+hw,A.y+hh,hw,hh,5);
+    const hot=isHot(a,b); if(hot)hotFound=true;
+    edges+=`<line class="edge ${hot?'wt-hot':''}" x1="${s.x.toFixed(1)}" y1="${s.y.toFixed(1)}" x2="${t.x.toFixed(1)}" y2="${t.y.toFixed(1)}"></line>`;
+    if(label&&hot){ const mx=(s.x+t.x)/2, my=(s.y+t.y)/2, w=label.length*5.4+12;
+      elabels+=`<g><rect class="elabel-bg" x="${(mx-w/2).toFixed(1)}" y="${(my-8).toFixed(1)}" width="${w.toFixed(1)}" height="16" rx="5"></rect><text class="elabel" x="${mx.toFixed(1)}" y="${(my+3).toFixed(1)}" text-anchor="middle" style="fill:#c3b6ff">${label}</text></g>`; }
+  });
+  // if the hop isn't a declared edge, draw a dashed hot connector so the pulse has a track
+  if(fromId&&activeId&&fromId!==activeId&&!hotFound){ const A=pos[fromId],B=pos[activeId];
+    if(A&&B){ const s=borderPt(A.x+hw,A.y+hh,B.x+hw,B.y+hh,hw,hh,2), t=borderPt(B.x+hw,B.y+hh,A.x+hw,A.y+hh,hw,hh,5);
+      edges+=`<line class="edge wt-hot" stroke-dasharray="4 4" x1="${s.x.toFixed(1)}" y1="${s.y.toFixed(1)}" x2="${t.x.toFixed(1)}" y2="${t.y.toFixed(1)}"></line>`; } }
+  let nodes='';
+  p.nodes.forEach(n=>{ const kind=kindOf(n);
+    const cls=[(n.id===activeId?'on':''),(doneSet&&doneSet.has(n.id)&&n.id!==activeId?'done':'')].join(' ');
+    nodes+=`<g class="node ${cls}" data-node="${n.id}">`+
+      `<rect class="box" x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="11"></rect>`+
+      `<rect class="stripe" x="${n.x+2.5}" y="${n.y+9}" width="3.5" height="${cellH-18}" rx="1.75" fill="${kind.c}"></rect>`+
+      `<g class="ico" transform="translate(${n.x+12},${n.y+9}) scale(0.9)" fill="none" stroke="${kind.c}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${ICONS[kind.k]}</g>`+
+      `<text x="${n.x+34}" y="${n.y+21}">${n.name}</text>`+
+      `<text class="sub" x="${n.x+13}" y="${n.y+42}">${n.sub}</text></g>`; });
+  const defs=`<defs>`+
+    `<linearGradient id="nodegrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#232d3a"/><stop offset="1" stop-color="#171d27"/></linearGradient>`+
+    `<filter id="nodeshadow" x="-20%" y="-25%" width="140%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2.2" flood-color="#000" flood-opacity="0.4"/></filter>`+
+    `<marker id="arr" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 L3,5 Z" fill="var(--edge)"/></marker>`+
+    `<marker id="arrhot" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 L3,5 Z" fill="var(--accent2)"/></marker>`+
+    `</defs>`;
+  return `<svg viewBox="0 0 ${maxX} ${maxY}">${defs}${edges}${nodes}${elabels}</svg>`;
+}
+function wtRender(){
+  const p=DATA[state.prob], f=state.wt.flow; if(!f)return;
+  const i=state.wt.i, step=f.steps[i], n=f.steps.length;
+  const activeId=step.node||step.to||null;
+  const fromId=step.from||(i>0?(f.steps[i-1].node||f.steps[i-1].to):null)||null;
+  const doneSet=new Set(); for(let k=0;k<i;k++){ const st=f.steps[k]; if(st.node)doneSet.add(st.node); if(st.to)doneSet.add(st.to); }
+  const compName=activeId?((p.nodes.find(x=>x.id===activeId)||{}).name||''):'';
+  let cards='';
+  (step.details||[]).forEach(d=>{
+    const k=d.k||'note';
+    cards+=`<div class="wt-card ${k}"><div class="h"><i class="ti ${WT_ICON[k]||'ti-info-circle'}"></i>${d.label||k}${d.pill?`<span class="pill">${d.pill}</span>`:''}</div>`;
+    if(d.text) cards+=`<div class="tx">${wtInline(d.text)}</div>`;
+    if(d.code) cards+=`<pre><code>${wtHi(d.code)}</code></pre>`;
+    cards+=`</div>`;
+  });
+  const dots=f.steps.map((s,k)=>`<button class="dot ${k===i?'on':(state.wt.seen.has(k)?'seen':'')}" data-k="${k}" title="${(s.title||('Step '+(k+1))).replace(/"/g,'')}"></button>`).join('');
+  const html=`<div class="wt-modal" onclick="event.stopPropagation()">
+    <div class="wt-head">
+      <h3><i class="ti ti-route"></i>${f.name}</h3>
+      <span class="sub">${p.title||''}</span>
+      <span class="sp"></span>
+      <span class="stepn">Step ${i+1} / ${n}</span>
+      <button class="wt-x" id="wtclose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="wt-body">
+      <div class="wt-diag">
+        <div class="d" id="wtdiagram">${flowDiagramSVG(p,activeId,fromId,doneSet)}</div>
+        <div class="cap">${f.summary?wtInline(f.summary):'End-to-end request path — follow the glowing request as it moves between components.'}</div>
+      </div>
+      <div class="wt-side">
+        <div class="wt-scroll">
+          <span class="wt-badge"><i class="ti ti-friends"></i>${compName||'Flow'}</span>
+          <h2 class="wt-title">${step.title||''}</h2>
+          <div class="wt-narr">${wtInline(step.narrate||'')}</div>
+          ${cards}
+        </div>
+        <div class="wt-nav">
+          <button id="wtprev" ${i===0?'disabled':''}><i class="ti ti-chevron-left"></i> Prev</button>
+          <button id="wtplay">${state.wt.playing?'<i class="ti ti-player-pause"></i> Pause':'<i class="ti ti-player-play"></i> Auto-play'}</button>
+          <span class="sp"></span>
+          <div class="wt-dots">${dots}</div>
+          <span class="sp"></span>
+          <button id="wtnext" class="prim" ${i>=n-1?'disabled':''}>Next <i class="ti ti-chevron-right"></i></button>
+        </div>
+      </div>
+    </div>`;
+  const ov=document.getElementById('wtov'); ov.innerHTML=html;
+  document.getElementById('wtclose').onclick=closeWalk;
+  document.getElementById('wtprev').onclick=()=>{ wtStopPlay(); wtGo(-1); };
+  document.getElementById('wtnext').onclick=()=>{ wtStopPlay(); wtGo(1); };
+  document.getElementById('wtplay').onclick=wtPlayToggle;
+  ov.querySelectorAll('.wt-dots .dot').forEach(el=>el.onclick=()=>{ wtStopPlay(); wtJump(parseInt(el.dataset.k)); });
+  ov.querySelectorAll('#wtdiagram .node').forEach(el=>el.onclick=()=>{ const idx=f.steps.findIndex(s=>(s.node||s.to)===el.dataset.node); if(idx>=0){ wtStopPlay(); wtJump(idx);} });
+  if(fromId&&activeId&&fromId!==activeId) setTimeout(()=>wtPulse(fromId,activeId),260);
+}
+document.addEventListener('keydown',(e)=>{
+  if(!state.wt||!state.wt.open) return;
+  if(e.key==='Escape') closeWalk();
+  else if(e.key==='ArrowRight'||e.key===' '){ e.preventDefault(); wtStopPlay(); wtGo(1); }
+  else if(e.key==='ArrowLeft'){ e.preventDefault(); wtStopPlay(); wtGo(-1); }
+});
 
 /* ---------------- diagram ---------------- */
 // classify a component into a visual "tier" so the diagram is colour-coded like a Hello-Interview sketch
