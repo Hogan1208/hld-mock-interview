@@ -1,7 +1,7 @@
 # HLD Mock Interview — SDE-3 System Design
 
 A self-contained mock-interview trainer. You play the **interviewer**; the app plays
-both **interviewer** and **candidate**. 12 problems, each with a phased flow
+both **interviewer** and **candidate**. 13 problems, each with a phased flow
 (Requirements → Functional HLD → System deep dives → Component deep dives), a
 diagram that grows and animates as the conversation progresses, per-component
 **study notes** (role, capacity, data/consistency, scaling levers, failure modes,
@@ -15,9 +15,9 @@ questions.
 
 ```
 index.html          # the whole app (open this)
-problems/*.js        # 12 problems (URL shortener, feed, chat, rate limiter,
+problems/*.js        # 13 problems (URL shortener, feed, chat, rate limiter,
                      #   video, proximity, gdocs, filesync, ticketmaster,
-                     #   crawler, adclick, ...)
+                     #   crawler, adclick, scheduler, inventory)
 serve.py             # tiny local server (static + /ask + /poll for live answers)
 live.py              # question-watcher / answer helper for the live bridge
 live/                # runtime scratch for live answers (safe to be empty)
@@ -27,7 +27,7 @@ live/                # runtime scratch for live answers (safe to be empty)
 
 ### A) Quickest — just open it (no live AI answers)
 Double-click **`index.html`**, or open it in any browser.
-Everything works: all 12 problems, all 4 phases, progressive diagrams, deep-dive
+Everything works: all 13 problems, all 4 phases, progressive diagrams, deep-dive
 conversations, and resource links. The only thing that won't work is the
 "Ask your own question" box (it needs the server + an LLM — see C).
 
