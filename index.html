@@ -874,21 +874,71 @@ function addReveal(names){ const t=document.getElementById('transcript'); const 
 function addResources(list){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='res'; const links=list.map(r=>{let host='';try{host=new URL(r.url).hostname.replace('www.','');}catch(e){} return `<a href="${r.url}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:14px"></i><span>${r.title}<br><span class="d">${host}</span></span></a>`;}).join(''); d.innerHTML=`<div class="rh"><i class="ti ti-book"></i>Resources &amp; further reading</div>${links}`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
 
 /* ---------------- live ask (answered in-app by Claude in the background) ---------------- */
-function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered live, right here. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
+function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered instantly from the study notes. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
 function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(go){ go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); } const q=document.getElementById('quizGo'); if(q) q.onclick=()=>quizMe(scopeId); }
+/* ---------------- local answer engine (offline; synthesized from each problem's curated study data) ---------------- */
+const ASK_STOP=new Set("the a an and or of to in on for with is are be as at by from it its this that these those you your we our they their how what why when which who where do does did can could should would will if then else than so not no into over under about across via per vs versus use used using here there them then also more most much many few some any".split(" "));
+function askToks(s){ return String(s||"").toLowerCase().replace(/<[^>]+>/g," ").replace(/[^a-z0-9]+/g," ").split(" ").filter(function(w){return w.length>2 && !ASK_STOP.has(w);}); }
+function askScore(qt,text,boost){ var tt=askToks(text); if(!tt.length) return 0; var set={}; tt.forEach(function(t){set[t]=1;}); var s=0; qt.forEach(function(w){ if(set[w]) s+=2; else if(tt.some(function(t){return t.indexOf(w)>=0||w.indexOf(t)>=0;})) s+=1; }); return s*(boost||1); }
+function askBestBy(arr,fn,qt){ var b=null,bs=-1; (arr||[]).forEach(function(x){ var s=askScore(qt,fn(x),1); if(s>bs){bs=s;b=x;} }); return b; }
+function askRankBy(arr,fn,qt){ return (arr||[]).map(function(x){return {x:x,s:askScore(qt,fn(x),1)};}).sort(function(a,b){return b.s-a.s;}).map(function(o){return o.x;}); }
+function askIntent(q){ var s=" "+String(q).toLowerCase()+" "; function has(){for(var i=0;i<arguments.length;i++){if(s.indexOf(arguments[i])>=0)return true;}return false;} var it=[];
+  if(has("fail","crash","down","outage","lost","lose","recover","retry","poison","dead","timeout","duplicat","node loss","leak","corrupt")) it.push("failures");
+  if(has("scale","scaling","throughput","hot ","load","shard","qps","rps","bottleneck","burst","spike","partition","fan-out","fanout")) it.push("scaling");
+  if(has("consist","replicat","sync","async","quorum","transaction","acid","isolation","stale","durab","oversell","atomic","lock","idempot","conflict")) it.push("data");
+  if(has("trade","vs ","versus","why not","instead","choose","choice","compare","alternativ","pros","cons","better","rather")) it.push("tradeoffs");
+  if(has("how many","capacity","sizing","storage","bytes","memory","estimate","back-of","how much","number of","how big","throughput per")) it.push("capacity");
+  return it; }
+function askDDParts(dd,intents,qt){ var parts=[]; function wants(k){return intents.indexOf(k)>=0;}
+  if(!intents.length){ if(dd.role)parts.push(dd.role); if(dd.data)parts.push("<b>Data &amp; consistency:</b> "+dd.data); if(dd.scaling&&dd.scaling[0])parts.push("<b>Main scaling lever:</b> "+dd.scaling[0]); return parts; }
+  if(wants("failures")&&dd.failures&&dd.failures.length){ var f=askBestBy(dd.failures,function(x){return x.t+" "+x.b+" "+x.m;},qt)||dd.failures[0]; parts.push("<b>Failure &mdash; "+f.t+":</b> "+f.b+" <b>Mitigation:</b> "+f.m); }
+  if(wants("scaling")&&dd.scaling&&dd.scaling.length){ var top=askRankBy(dd.scaling,function(x){return x;},qt).slice(0,2); parts.push("<b>Scaling levers:</b><br>&bull; "+top.join("<br>&bull; ")); }
+  if(wants("data")&&dd.data){ parts.push("<b>Data &amp; consistency:</b> "+dd.data); }
+  if(wants("tradeoffs")&&dd.tradeoffs&&dd.tradeoffs.length){ var t=askBestBy(dd.tradeoffs,function(x){return x.a+" "+x.b+" "+x.pick;},qt)||dd.tradeoffs[0]; parts.push("<b>Trade-off &mdash; "+t.a+" vs "+t.b+":</b> "+t.pick); }
+  if(wants("capacity")&&dd.capacity&&dd.capacity.length){ parts.push("<b>Capacity:</b> "+dd.capacity.map(function(c){return c[0]+" &asymp; "+c[1]+(c[2]?" ("+c[2]+")":"");}).join("; ")); }
+  if(!parts.length){ if(dd.role)parts.push(dd.role); if(dd.data)parts.push("<b>Data &amp; consistency:</b> "+dd.data); }
+  return parts; }
+function localAnswer(scopeId,question){ var p=DATA[state.prob]; var qt=askToks(question); var intents=askIntent(question);
+  var nid = scopeId!=="system" ? scopeId : null;
+  var nodeName = nid ? ((p.nodes.find(function(n){return n.id===nid;})||{}).name||nid) : "the overall system";
+  var out=[]; var qmap=p.q||{}; var threads=[];
+  (nid?[nid]:Object.keys(qmap)).forEach(function(k){ (qmap[k]||[]).forEach(function(it){ threads.push({k:k,it:it}); }); });
+  (p.systemDives||[]).forEach(function(sd){ threads.push({k:null,it:{q:sd.title,turns:sd.turns}}); });
+  var best=null,bestScore=0;
+  threads.forEach(function(o){ var sc=askScore(qt,o.it.q,3)+askScore(qt,(o.it.turns||[]).map(function(t){return t.text;}).join(" "),1); if(sc>bestScore){bestScore=sc;best=o;} });
+  if(best&&bestScore>=4){ var cand=(best.it.turns||[]).filter(function(t){return t.who==="cand";}).map(function(t){return t.text;}); if(cand.length) out.push(cand.slice(0,2).join("<br><br>")); }
+  if(nid&&p.deepDive&&p.deepDive[nid]){ askDDParts(p.deepDive[nid],intents,qt).forEach(function(x){ var head=x.slice(0,44); if(!out.some(function(o){return o.indexOf(head)>=0;})) out.push(x); }); }
+  if(!nid&&!out.length){ var r=(p.requirements&&p.requirements.functional)||[]; if(r.length) out.push("<b>Core requirements:</b><br>&bull; "+r.slice(0,4).join("<br>&bull; ")); }
+  if(!out.length){ var dd=nid&&p.deepDive?p.deepDive[nid]:null; if(dd&&dd.role) out.push(dd.role); else out.push("Focus on "+nodeName+": its role, the data and consistency it owns, how it scales, and its main failure mode. Try this component&rsquo;s Q&amp;A threads, or ask something specific &mdash; e.g. how it handles failure, scaling, or consistency."); }
+  var tag=intents.length?" &middot; "+intents.join(", "):"";
+  var note="<div style=\"color:var(--muted);font-size:11px;margin-bottom:6px\"><i class=\"ti ti-book\"></i> On <b>"+nodeName+"</b> &mdash; from this problem&rsquo;s study notes"+tag+"</div>";
+  return note+out.join("<br><br>"); }
+function localGrade(model,user){ var mt=askToks(model); var uset={}; askToks(user).forEach(function(u){uset[u]=1;});
+  var freq={}; mt.forEach(function(w){freq[w]=(freq[w]||0)+1;}); var ranked=Object.keys(freq).sort(function(a,b){return freq[b]-freq[a];});
+  var key=ranked.slice(0,8); var uarr=Object.keys(uset);
+  function hitFn(w){ return !!uset[w] || uarr.some(function(u){return u.indexOf(w)>=0||w.indexOf(u)>=0;}); }
+  var hit=key.filter(hitFn); var miss=key.filter(function(w){return !hitFn(w);});
+  var cov=key.length?hit.length/key.length:0;
+  var verdict=cov>=0.5?"<strong>Correct</strong>":cov>=0.25?"<strong>Partially correct</strong>":"<strong>Needs work</strong>";
+  var msg=verdict+" &mdash; ";
+  msg+= hit.length? "you covered "+hit.slice(0,5).map(function(w){return "<code>"+w+"</code>";}).join(", ")+". " : "your answer missed the key ideas. ";
+  if(miss.length) msg+="Also address "+miss.slice(0,5).map(function(w){return "<code>"+w+"</code>";}).join(", ")+".";
+  msg+="<br><span style=\"color:var(--muted);font-size:11px\">heuristic self-check against the model answer above &mdash; compare directly for the full picture.</span>";
+  return msg; }
 function submitAsk(scopeId){
-  const ta=document.getElementById('askText'); const txt=(ta.value||'').trim(); if(!txt)return;
-  const p=DATA[state.prob];
-  const scopeName= scopeId==='system' ? 'the overall system' : (p.nodes.find(n=>n.id===scopeId)||{}).name || scopeId;
-  const revealed=p.nodes.filter(n=>state.revealed.has(n.id)).map(n=>n.name).join(', ');
-  const id='q_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
-  const ctx=`Mock interview problem: "${p.title}". Phase: ${PHASE_META[state.phase-1].lbl}. Focus: ${scopeName}. Components on the board: ${revealed}. Difficulty: ${state.diff}.`;
-  addBubble('you',`<span style="color:var(--muted);font-size:11px">[your question · ${scopeName}]</span><br>${txt}`);
-  const t=document.getElementById('transcript'); const live=document.createElement('div'); live.className='bubble cand live'; live.id='live-'+id;
-  live.innerHTML=`<div class="who"><span class="av">C</span>Candidate</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`;
-  t.appendChild(live); t.scrollTop=t.scrollHeight; ta.value='';
-  fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,q:txt,ctx})}).catch(()=>{});
-  pollAnswer(id,0);
+  var ta=document.getElementById("askText"); var txt=(ta.value||"").trim(); if(!txt)return;
+  var p=DATA[state.prob];
+  var scopeName= scopeId==="system" ? "the overall system" : ((p.nodes.find(function(n){return n.id===scopeId;})||{}).name||scopeId);
+  var id="q_"+Date.now()+"_"+Math.random().toString(36).slice(2,7);
+  addBubble("you","<span style=\"color:var(--muted);font-size:11px\">[your question &middot; "+scopeName+"]</span><br>"+txt);
+  var t=document.getElementById("transcript"); var live=document.createElement("div"); live.className="bubble cand live"; live.id="live-"+id;
+  live.innerHTML="<div class=\"who\"><span class=\"av\">C</span>Candidate</div><div class=\"body\"><div class=\"typing\"><span></span><span></span><span></span></div></div>";
+  t.appendChild(live); t.scrollTop=t.scrollHeight; ta.value="";
+  var revealed=p.nodes.filter(function(n){return state.revealed.has(n.id);}).map(function(n){return n.name;}).join(", ");
+  var ctx="Problem \""+p.title+"\". Focus "+scopeName+". Board: "+revealed+". Difficulty "+state.diff+".";
+  try{ fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id,q:txt,ctx:ctx})}).catch(function(){}); }catch(e){}
+  var ans=localAnswer(scopeId,txt);
+  setTimeout(function(){ var el=document.getElementById("live-"+id); if(el){ el.querySelector(".body").innerHTML=ans; el.classList.remove("live"); document.getElementById("transcript").scrollTop=1e9; } },500);
 }
 function pollAnswer(id,tries){
   if(tries>90){ const el=document.getElementById('live-'+id); if(el)el.querySelector('.body').innerHTML="<em>Still thinking — the answer will appear here shortly. (If it doesn't, Claude may not be actively watching this session.)</em>"; return; }
@@ -942,16 +992,18 @@ function showModelAnswer(a){
 function offerActions(item,userAns,withNext){
   const t=document.getElementById('transcript');
   const d=document.createElement('div'); d.className='quizprompt';
-  d.innerHTML=`<button class="g"><i class="ti ti-robot"></i> Ask AI to grade my answer ↳ <span style="color:var(--muted)">(uses tokens)</span></button>${withNext?` <button class="n">Next question ▶</button>`:''}`;
+  d.innerHTML=`<button class="g"><i class="ti ti-robot"></i> Grade my answer ↳ <span style="color:var(--muted)">(instant)</span></button>${withNext?` <button class="n">Next question ▶</button>`:''}`;
   t.appendChild(d);
   d.querySelector('.g').onclick=()=>{ const g=d.querySelector('.g'); g.remove(); gradeWithAI(item.q,item.a,userAns); };
   const n=d.querySelector('.n'); if(n) n.onclick=()=>{ d.remove(); state.mock.i++; askMockQuestion(); };
   t.scrollTop=1e9;
 }
 function gradeWithAI(q,a,v){
-  const p=DATA[state.prob];
-  liveExchange({who:'intv', question:v,
-    ctx:`ROLE: interviewer grading in an SDE-3 mock for "${p.title}". Question: "${q}". Model answer: "${a}". The candidate's answer is in their message. Reply with a bold verdict (<strong>Correct</strong>/<strong>Partially correct</strong>/<strong>Incorrect</strong>) and 1-3 sentences on what they nailed and what they missed vs the model answer. Address them as "you".`});
+  var t=document.getElementById("transcript");
+  var b=document.createElement("div"); b.className="bubble intv live";
+  b.innerHTML="<div class=\"who\"><span class=\"av\">I</span>Interviewer</div><div class=\"body\"><div class=\"typing\"><span></span><span></span><span></span></div></div>";
+  t.appendChild(b); t.scrollTop=1e9;
+  setTimeout(function(){ b.querySelector(".body").innerHTML=localGrade(a,v); b.classList.remove("live"); document.getElementById("transcript").scrollTop=1e9; },450);
 }
 function quizMe(scopeId){
   if(state.playing)return;

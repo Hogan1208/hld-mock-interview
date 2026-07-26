@@ -25,40 +25,38 @@ live/                # runtime scratch for live answers (safe to be empty)
 
 ## How to run it — three modes
 
-### A) Quickest — just open it (no live AI answers)
+### A) Quickest — just open it (works fully offline)
 Double-click **`index.html`**, or open it in any browser.
 Everything works: all 13 problems, all 4 phases, progressive diagrams, deep-dive
-conversations, and resource links. The only thing that won't work is the
-"Ask your own question" box (it needs the server + an LLM — see C).
+conversations, resource links, **and the "Ask your own question" box** — doubts are
+answered **instantly and offline**, synthesized from that problem's own study notes
+(role, data/consistency, scaling, failure modes, trade-offs, Q&A threads and system
+dives). The "Grade my answer" button on quizzes is also instant and offline.
 
 > Works fully offline. Nothing is uploaded anywhere.
 
-### B) Local server (adds the ask endpoints)
+### B) Local server (optional — logs your questions)
 ```
 cd hld-mock
 python3 serve.py
 ```
-Then open **http://127.0.0.1:4599**. Same as A, plus the `/ask` and `/poll`
-endpoints exist so the ask box can be answered (still needs C to actually answer).
+Then open **http://127.0.0.1:4599**. Identical to A, and additionally records each
+doubt to `live/questions.jsonl` via `/ask` (handy for review). Answers still appear
+instantly from the offline engine — no LLM required.
 
-### C) Live in-app answers (full experience)
-The "Ask your own question" box is answered by an **AI coding agent (Copilot CLI
-or Claude Code) running alongside the app**. To enable it:
-1. Start `python3 serve.py` (mode B).
-2. Open this folder in your agent and say:
-   *"Run the hld-mock live-answer watcher and answer my questions as the candidate."*
-   The agent uses `live.py` to see pending doubts and write answers:
-   - `python3 live.py watch` — blocks until a new question arrives, prints it.
-   - `python3 live.py list` — prints all unanswered questions.
-   - `python3 live.py answer <id> "..."` — writes the answer (the app polls and
-     shows it in the transcript, with `**bold**` support).
+### C) Live agent-authored answers (optional override)
+If you want a human/agent to hand-write richer answers instead of the offline ones,
+run the server (mode B) and have an AI coding agent (Copilot CLI or Claude Code)
+watch the queue with `live.py`:
+- `python3 live.py watch` — blocks until a new question arrives, prints it.
+- `python3 live.py list` — prints all unanswered questions.
+- `python3 live.py answer <id> "..."` — writes an answer (the app polls `/poll`).
 
-Without step C, the ask box will wait and then show a "not being watched" note —
-all the pre-authored content still works regardless.
+This is purely optional — the offline engine already answers every doubt on its own.
 
 ## Using it on another laptop
 Copy this whole folder (or `hld-mock.zip`) over, then use mode A or B above.
-For live answers (C), you need an AI coding agent (Copilot CLI or Claude Code) on that laptop too.
+Everything — including instant doubt answers — works offline with no agent needed.
 Tip: keeping the folder in a git repo makes syncing between laptops easy —
 `git init`, push to your own remote, and `git clone` on the other machine.
 
