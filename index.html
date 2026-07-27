@@ -235,6 +235,7 @@
   .wt-card.repl{border-left-color:#f0a742}.wt-card.repl>.h{color:#f0a742}
   .wt-card.note{border-left-color:#8aa0b6}.wt-card.note>.h{color:#8aa0b6}
   .wt-card.gotcha{border-left-color:#ff8fb0}.wt-card.gotcha>.h{color:#ff8fb0}
+  .wt-card.queue{border-left-color:#54c8d8}.wt-card.queue>.h{color:#54c8d8}
   .wt-card .pill{margin-left:auto;font-size:10px;font-weight:700;color:#fff;background:#2a3342;border-radius:20px;padding:2px 8px;letter-spacing:.3px}
   .wt-nav{display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid var(--line);background:#121822}
   .wt-nav button{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
@@ -247,6 +248,44 @@
   .wt-dots .dot{width:9px;height:9px;border-radius:50%;background:#2a3342;border:none;cursor:pointer;padding:0}
   .wt-dots .dot.on{background:var(--accent2);transform:scale(1.25)}
   .wt-dots .dot.seen{background:#3f5169}
+  /* per-step state snapshot (DB tables + queue partitions) */
+  .wt-state{margin-top:6px;border:1px solid var(--line);border-radius:10px;background:#0d121a;overflow:hidden}
+  .wt-state>.sh{display:flex;align-items:center;gap:7px;padding:8px 12px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:#9fb0c3;border-bottom:1px solid var(--line);background:#111722}
+  .wt-state>.sh i{color:#54c8d8;font-size:15px}
+  .wt-state .scap{font-size:11.5px;color:var(--muted);padding:9px 12px 0;line-height:1.5}
+  .wt-state .sbody{padding:11px 12px;display:flex;flex-direction:column;gap:14px}
+  .wt-tbl .tt{font-size:11px;color:#8aa0b6;font-weight:700;margin-bottom:5px;display:flex;align-items:center;gap:6px}
+  .wt-tbl .tt i{font-size:13px;color:#4fd1a1}
+  .wt-tbl table{width:100%;border-collapse:collapse;font-size:11.5px;font-family:ui-monospace,Menlo,monospace}
+  .wt-tbl th{text-align:left;color:#7d8ea0;font-weight:600;padding:3px 8px;border-bottom:1px solid var(--line);font-size:10px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap}
+  .wt-tbl td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.045);color:#c7d2dd;white-space:nowrap}
+  .wt-tbl tr.chg td{background:rgba(84,200,216,.10)}
+  .wt-tbl tr.chg td:first-child{box-shadow:inset 3px 0 0 #54c8d8}
+  .wt-tbl tr.gone td{opacity:.4;text-decoration:line-through}
+  .wt-tbl .rtag{display:inline-block;margin-left:7px;font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:#0e1116;background:#54c8d8;border-radius:10px;padding:1px 6px;vertical-align:middle}
+  .wt-tbl .rtag.del{background:#ff8fb0}
+  .wt-q .qh{font-size:11px;font-weight:700;color:#8aa0b6;margin-bottom:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .wt-q .kind{font-size:8.5px;font-weight:800;text-transform:uppercase;letter-spacing:.4px;padding:1px 7px;border-radius:10px}
+  .wt-q .kind.kafka{background:#3b2f14;color:#f0c46b;border:1px solid #6b551f}
+  .wt-q .kind.sqs{background:#14263b;color:#7fb6f0;border:1px solid #2f4d6b}
+  .wt-q .by{font-size:10.5px;color:var(--muted);font-weight:500}
+  .wt-parts{display:flex;gap:8px;flex-wrap:wrap}
+  .wt-part{flex:1;min-width:104px;border:1px solid var(--line);border-radius:8px;background:#0b0f16;padding:7px 8px}
+  .wt-part .pid{font-size:10px;color:#9fb0c3;font-weight:700;display:flex;justify-content:space-between;gap:6px}
+  .wt-part .pk{font-size:9px;color:#6b7b8d;margin:1px 0 6px}
+  .wt-part .msgs{display:flex;flex-direction:column;gap:4px;min-height:6px}
+  .wt-part .msg{font-size:10.5px;font-family:ui-monospace,Menlo,monospace;color:#c7d2dd;background:#161d28;border:1px solid var(--line);border-radius:5px;padding:3px 7px;line-height:1.3}
+  .wt-part .msg.on{border-color:#54c8d8;box-shadow:0 0 0 1px #54c8d8,0 0 10px rgba(84,200,216,.35);color:#eafcff}
+  .wt-part .msg.inflt{border-style:dashed;color:#f0c46b;border-color:#6b551f;background:#1c1810}
+  .wt-part .msg.done{opacity:.4;text-decoration:line-through}
+  .wt-part .msg .mtag{display:block;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:#8fd9e6;margin-top:2px}
+  .wt-part .off{margin-top:6px;font-size:9px;color:#7d8ea0;display:flex;align-items:center;gap:5px;border-top:1px dashed var(--line);padding-top:5px}
+  .wt-part .off i{font-size:11px;color:#f0c46b}
+  .wt-part .off b{color:#f0c46b;font-weight:700}
+  .wt-part .wt-empty{font-size:9.5px;color:#556575;font-style:italic}
+  .wt-legend{font-size:9.5px;color:#6b7b8d;display:flex;gap:12px;flex-wrap:wrap;margin-top:7px}
+  .wt-legend span{display:inline-flex;align-items:center;gap:4px}
+  .wt-legend i{width:9px;height:9px;border-radius:3px;display:inline-block}
 
   .askbox{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#12161d}
   .askbox label{font-size:12px;color:var(--muted);display:block;margin-bottom:8px}.askbox label b{color:var(--accent2)}
@@ -534,7 +573,7 @@ function travelPulse(fromId,toId,ms,done){
 }
 
 /* ---------------- request walkthrough (end-to-end) ---------------- */
-const WT_ICON={wire:'ti-arrow-bounce',query:'ti-database',route:'ti-route',repl:'ti-copy',note:'ti-info-circle',gotcha:'ti-alert-triangle'};
+const WT_ICON={wire:'ti-arrow-bounce',query:'ti-database',route:'ti-route',repl:'ti-copy',note:'ti-info-circle',gotcha:'ti-alert-triangle',queue:'ti-stack-2'};
 const WT_KW=/\b(SELECT|INSERT|INTO|VALUES|UPDATE|SET|DELETE|FROM|WHERE|AND|OR|ORDER BY|GROUP BY|LIMIT|OFFSET|RETURNING|ON CONFLICT|DO NOTHING|DO UPDATE|LEFT JOIN|INNER JOIN|JOIN|HAVING|USING|BEGIN|COMMIT|ROLLBACK|WITH|CASE|WHEN|THEN|ELSE|END|NOT|NULL|IS|IN|ASC|DESC|FOR UPDATE|SKIP LOCKED|COALESCE|NOW|EXISTS|BETWEEN|DISTINCT|COUNT|EXPLAIN|ANALYZE)\b/g;
 function wtEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function wtHi(code){
@@ -545,6 +584,41 @@ function wtHi(code){
   return s;
 }
 function wtInline(s){ return String(s||'').replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/`([^`]+?)`/g,'<code>$1</code>'); }
+// one queue message chip (Kafka log entry or SQS message)
+function wtQmsg(m,kind){
+  const st=(kind==='sqs')?({inflight:'inflt',visible:'',deleted:'done'}[m.s]||''):'';
+  const cls=['msg', m.hi?'on':'', st].filter(Boolean).join(' ');
+  return `<div class="${cls}">${wtEsc(String(m.v))}${m.tag?`<span class="mtag">${wtEsc(m.tag)}</span>`:''}</div>`;
+}
+// render a per-step state snapshot: DB tables (highlight changed rows) + queue partitions (offsets / visibility)
+function wtStateHTML(snap){
+  if(!snap) return '';
+  let body='';
+  (snap.tables||[]).forEach(tb=>{
+    const head=(tb.cols||[]).map(c=>`<th>${wtEsc(c)}</th>`).join('');
+    const rows=(tb.rows||[]).map(r=>{
+      const cells=(r.c||[]).map((v,idx)=>`<td>${wtInline(String(v))}${idx===0&&r.tag?`<span class="rtag ${r.tag==='deleted'||r.tag==='removed'?'del':''}">${wtEsc(r.tag)}</span>`:''}</td>`).join('');
+      const rc=[r.hi?'chg':'', r.gone?'gone':''].filter(Boolean).join(' ');
+      return `<tr class="${rc}">${cells}</tr>`;
+    }).join('');
+    body+=`<div class="wt-tbl"><div class="tt"><i class="ti ti-database"></i>${wtEsc(tb.name)}${tb.note?` · <span style='color:var(--muted);font-weight:400'>${wtInline(tb.note)}</span>`:''}</div><table><thead><tr>${head}</tr></thead><tbody>${rows||`<tr><td>&mdash;</td></tr>`}</tbody></table></div>`;
+  });
+  (snap.queues||[]).forEach(q=>{
+    const kind=q.kind||'kafka';
+    const parts=(q.parts||[]).map(pt=>{
+      const msgs=(pt.msgs&&pt.msgs.length)?pt.msgs.map(m=>wtQmsg(m,kind)).join(''):`<div class="wt-empty">empty</div>`;
+      const off=(kind==='kafka'&&(pt.commit!=null||pt.end!=null))?`<div class="off"><i class="ti ti-bookmark"></i>offset <b>${pt.commit!=null?pt.commit:'–'}</b> / end <b>${pt.end!=null?pt.end:'–'}</b></div>`:'';
+      return `<div class="wt-part"><div class="pid"><span>${wtEsc(pt.id)}</span></div>${pt.key?`<div class="pk">${wtInline(pt.key)}</div>`:''}<div class="msgs">${msgs}</div>${off}</div>`;
+    }).join('');
+    const legend=(kind==='kafka')
+      ? `<div class="wt-legend"><span>ordered head&rarr;tail · <b style='color:#f0c46b'>offset</b>=consumer group next-read · <b style='color:#f0c46b'>end</b>=latest appended</span></div>`
+      : `<div class="wt-legend"><span><i style="background:#161d28;border:1px solid var(--line)"></i>visible</span><span><i style="background:#1c1810;border:1px dashed #6b551f"></i>in-flight (invisible)</span><span><i style="background:#161d28;opacity:.4"></i>deleted</span></div>`;
+    body+=`<div class="wt-q"><div class="qh">${wtEsc(q.name)} <span class="kind ${kind}">${kind}</span>${q.by?`<span class="by">${wtInline(q.by)}</span>`:''}</div><div class="wt-parts">${parts}</div>${legend}</div>`;
+  });
+  if(!body) return '';
+  const cap=snap.cap?`<div class="scap">${wtInline(snap.cap)}</div>`:'';
+  return `<div class="wt-state"><div class="sh"><i class="ti ti-layout-grid"></i>State after this step</div>${cap}<div class="sbody">${body}</div></div>`;
+}
 
 function openWalk(flowId){
   const p=DATA[state.prob], flow=(p.deepFlows||[]).find(f=>f.id===flowId); if(!flow)return;
@@ -663,6 +737,7 @@ function wtRender(){
           <h2 class="wt-title">${step.title||''}</h2>
           <div class="wt-narr">${wtInline(step.narrate||'')}</div>
           ${cards}
+          ${step.snap?wtStateHTML(step.snap):''}
         </div>
         <div class="wt-nav">
           <button id="wtprev" ${i===0?'disabled':''}><i class="ti ti-chevron-left"></i> Prev</button>
