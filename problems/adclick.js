@@ -887,15 +887,17 @@ var scaling={id:"scaling",name:"From click log to billable analytics",kind:"scal
       edges:[["client","gw","click"],["gw","stream","ingest"],["stream","agg","consume"]],
       narrate:"Draw the smallest reliable speed layer: the browser sends a click beacon, stateless gateways validate and produce it to Kafka, and a stateful aggregator counts one-minute windows. This captures the firehose, but the counts have nowhere durable and query-optimized to land yet.",
       details:[
-        {k:"win",label:"Why start here",text:"The log is the shock absorber and replay source. It lets ingest survive bursts and lets a crashed aggregator restore state from checkpoints and replay offsets."},
-        {k:"scale",label:"Working numbers",text:"Average ~**1M clicks/s**, peak ~**10M/s**, about **86B events/day** or ~8.6TB/day raw before replication and retention."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **12:00**, the **ShopSphere Summer Sale** banner goes live across news and video apps. Normal traffic is **~1M clicks/s**; the first minute spikes to **10M/s** and one celebrity ad contributes **3M/s** by itself. If gateways try to increment counters directly, every retry, crash and hot key hits the same database row. The row lock melts immediately, the gateway starts dropping beacons, and there is no replay source for the **600M clicks** that arrived in that first minute."},
+        {k:"fix",label:"The fix — walk the same case through the log",text:"Send every click to **Kafka** first, keyed by `adId`, then let Flink count event-time one-minute windows. During the same ShopSphere spike, gateways batch and produce **10M events/s** durably; the celebrity ad is salted across **16 subkeys** so no single partition owns all **3M/s**. If a Flink task dies at 12:00:34, it restores RocksDB window state and replays from the checkpointed offset instead of losing or double-counting the minute."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Kafka**: 120 partitions, RF3, `acks=all`, `min.insync.replicas=2`, across ~18 brokers. Peak payload **10M/s × 100B ≈ 1GB/s** before compression; RF3 writes ~3GB/s cluster-wide, or **~170MB/s/broker**, within commodity NVMe. Per partition average **10M ÷ 120 ≈ 83K/s**, below the stated **~250K/s** ceiling; hot ads are salted when they exceed a partition. **Flink**: ~50 tasks at **~200K events/s** each, with RocksDB state checkpoints."},
         {k:"query",label:"Hot path",code:"click beacon -> gateway validate/enrich\nproducer.send(topic, key=adId, click)\naggregator.count(adId, event_minute)\ncheckpoint(window_state, kafka_offset)"}
       ],
       snap:{title:"Load & capacity — Stage 0",cap:"The stream can absorb the firehose, but the product still lacks a serving store and billing guardrails.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-          {c:["Peak ingest","~10M /s","Kafka fronted"]},
-          {c:["Partitions","~120","headroom + salting"]},
-          {c:["Raw retention","~180TB hot RF3","replayable"]},
+          {c:["Event log","Kafka · 120 partitions · RF3 on ~18 brokers","N+1 and replayable"],hi:1,tag:"sized"},
+          {c:["Peak ingest","~10M /s ≈ 1GB/s raw","fronted"]},
+          {c:["Per partition","10M ÷ 120 ≈ 83K/s","below ~250K/s ceiling"],hi:1},
+          {c:["Raw retention","~180TB hot RF3 for 7 days","replayable"]},
           {c:["Queryable counts","not yet","missing"],tag:"risk"}
         ]}]}},
     {node:"olap",stage:"Stage 1 · OLAP store",title:"Counters need serving &rarr; write minute rollups to OLAP",
@@ -903,16 +905,17 @@ var scaling={id:"scaling",name:"From click log to billable analytics",kind:"scal
       edges:[["gw","stream","ingest"],["stream","agg","consume"],["agg","olap","rollup"]],
       narrate:"Raw clicks are too large for dashboards, and in-memory window counts disappear as a product surface when the job restarts. The aggregator must emit compact, keyed minute rows into a store built for time-range scans.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Clicks arrive at up to **10M/s**, but aggregates collapse to roughly **17K upserts/s steady** for active ad-minute rows. Query systems should scan rollups, not raw beacons."},
-        {k:"pain",label:"What breaks without it",text:"Advertiser dashboards would either query Kafka/raw events or depend on volatile processor state. Both miss the ~1s p99 target and make recovery or backfill user-visible."},
-        {k:"fix",label:"The fix — time-partitioned rollups",text:"Write `(adId, minute)` rollups to a columnar OLAP store with immutable time segments, deep storage and idempotent versions. Old data rolls up to hour/day while recent minutes stay hot."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **12:02**, ShopSphere's marketing team opens a live dashboard asking, **how many clicks by ad, country and device since noon?** Without OLAP, the only data is Kafka plus volatile Flink state. Scanning raw clicks means reading **~600M events/minute**, about **60GB/minute raw**, just to answer a chart. A Flink restart also makes the visible count disappear until replay catches up, so the dashboard misses the **p99 &lt; 1s** promise and users cannot trust whether the campaign is healthy."},
+        {k:"fix",label:"The fix — walk the same case with time-partitioned rollups",text:"Flink emits compact `(adId, minute, dimensions)` rows into **Apache Druid**. ShopSphere's 10M clicks/s collapse to roughly **17K rollup upserts/s steady** for active ad-minute rows; dashboards scan minute segments instead of raw beacons. Recent segments stay hot, older data compacts to hour/day, and a reprocessed minute writes a higher version so readers atomically see the corrected segment."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Druid OLAP**: ~10 data nodes, RF2 for hot segments, deep storage in S3. Existing sizing says **~1.44B minute rows/day** and **~20TB for 90d RF2**; that is **~2TB/node**, storage-dominated. Write load **17K rows/s ÷ 10 ≈ 1.7K/s/node**, tiny for columnar ingestion. Keep two replicas so one historical node can die without making dashboards unavailable; Kafka aggregate topic buffers if Druid ingestion lags."},
         {k:"gotcha",label:"Buffer writes",text:"Let OLAP pull from an aggregate topic at its sustainable rate. A spike becomes ingestion lag, not dropped or partially-written advertiser data."}
       ],
       snap:{title:"Load & capacity — Stage 1",cap:"The serving path now scans minute rows instead of raw click events.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Write shape","10M raw events/s","~17K rollup upserts/s"],hi:1,tag:"fixed"},
+          {c:["OLAP store","none","Apache Druid · ~10 data nodes · RF2"],hi:1,tag:"fixed"},
+          {c:["Write shape","10M raw events/s","~17K rollup upserts/s"],hi:1},
           {c:["Rows/day","raw 86B","~1.44B minute rows"]},
-          {c:["Store size","not modeled","~20TB for 90d RF2"]},
+          {c:["Store size","raw replay only","~20TB for 90d RF2"]},
           {c:["Dashboard p99","raw scan impossible","sub-second target"]}
         ]}]}},
     {node:"dedup",stage:"Stage 2 · Dedup",title:"At-least-once retries over-count &rarr; add clickId seen-set",
@@ -920,14 +923,15 @@ var scaling={id:"scaling",name:"From click log to billable analytics",kind:"scal
       edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"]],
       narrate:"The pipeline is intentionally at-least-once: clients retry, gateways retry, Kafka replays, and processors restore from checkpoints. For analytics that is acceptable; for billing it can charge the same click twice unless a stable clickId is remembered.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"A 24h dedup window at **86B ids/day** is large but bounded: about **29GB per Kafka partition** with 120 partitions, plus a small exact recent set."},
-        {k:"pain",label:"What breaks without it",text:"A mobile retry or replay after a crash turns one real click into multiple counted clicks. Advertisers get over-billed, and replay becomes dangerous instead of a recovery tool."},
-        {k:"fix",label:"The fix — co-partitioned seen state",text:"Route each clickId to the same task, check-and-set in RocksDB, and checkpoint the seen-set with offsets. Keep the recent window exact; use a compact filter for the older TTL tail and let batch audit money."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **12:07**, a mobile carrier has packet loss during the ShopSphere sale. The SDK retries the same click beacon **4 times** with the same `clickId`, and one gateway pod is killed after producing but before responding. Without a seen-set, those retries look like distinct billable clicks; even a **0.5% duplicate rate** at **10M/s** is **50K fake clicks/s**. In ten minutes that is **30M over-counted clicks**, enough to trigger refunds and make replay after failure dangerous."},
+        {k:"fix",label:"The fix — walk the same case with co-partitioned seen state",text:"Route each click through a dedup task keyed by `clickId` or by the same salted ad partition, check-and-set in RocksDB, and checkpoint seen state with offsets. ShopSphere's four mobile retries now produce one accepted event and three drops. A replay from Kafka starts at the checkpointed offset with the same seen-set, so recovery does not re-bill already-counted clicks. Batch still audits money after the TTL horizon."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Flink dedup state**: RocksDB state colocated with the 120 Kafka partitions, RF through checkpoint storage in S3 plus local recovery. A 24h window holds **86B ids/day**; at about **29GB per partition** across 120 partitions, active state is **~3.5TB** before compression. Per partition event rate is **~83K/s** average, within RocksDB check-and-set with Bloom prefix filters on NVMe. Keep an exact recent set and compact older TTL buckets; batch reconciliation is the final billing arbiter."},
         {k:"key",label:"SDK contract",text:"The client must mint clickId once per user action and reuse it on retry. If retries create fresh ids, no downstream system can infer they were the same click."}
       ],
       snap:{title:"Load & capacity — Stage 2",cap:"Counting is now idempotent inside the live window.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Duplicate retries","counted again","dropped by clickId"],hi:1,tag:"fixed"},
+          {c:["Dedup store","none","Flink RocksDB · 120 partition-aligned shards · checkpointed"],hi:1,tag:"fixed"},
+          {c:["Duplicate retries","counted again","dropped by clickId"],hi:1},
           {c:["Dedup TTL","none","~24h"]},
           {c:["State per partition","none","~29GB tail + hot exact"]},
           {c:["Recovery replay","can over-count","state + offset aligned"]}
@@ -937,35 +941,37 @@ var scaling={id:"scaling",name:"From click log to billable analytics",kind:"scal
       edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"],["agg","batch","reconcile"]],
       narrate:"The speed layer is fast, but billing cannot rely only on code that was live at the time. Late events, bad deploys, and dedup filter choices need an authoritative recompute path from retained raw clicks.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Hot Kafka retention is about **7 days RF3**, and older raw events tier to object storage. That is enough to replay the exact minute windows that billing finalizes."},
-        {k:"pain",label:"What breaks without it",text:"A one-hour aggregator bug or late-arriving mobile batch leaves wrong OLAP rows. Without recompute, the only fix is manual adjustment and advertisers lose trust."},
-        {k:"fix",label:"The fix — lambda correction",text:"Batch reads raw events, applies authoritative dedup and windowing, then writes a higher batch_version for `(adId, minute)`. OLAP segment swap or idempotent upsert makes the correction atomic to readers."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **13:00**, ShopSphere notices iOS clicks from **12:10–12:40** arrived late after an SDK offline buffer flushed, and a deploy bug mis-bucketed tablet clicks as desktop for **18 minutes**. The live Druid rows are fast but wrong. Without raw replay, finance can only apply a manual spreadsheet adjustment, advertisers see numbers change without lineage, and billing either overcharges desktop or undercounts mobile."},
+        {k:"fix",label:"The fix — walk the same case with raw recompute",text:"Keep **7 days** of hot Kafka replay and tier older raw clicks to S3. A Spark or Flink batch job rereads the exact raw ShopSphere windows, applies authoritative dedup and event-time bucketing, then writes Druid rows with a higher `batch_version`. The 12:10–12:40 dashboard flips atomically from live estimate to batch-final, and billing reads only finalized versions after the lateness horizon."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Raw lake**: S3 object storage fed by Kafka tiered retention, **~8.6TB/day raw** before replication and **~180TB hot RF3** for 7 days in Kafka. **Batch compute**: Spark/Flink on ~200 executors can scan one day in a few hours; **8.6TB ÷ 200 ≈ 43GB/executor** before compression, feasible on local SSD. **Druid segment swap** is versioned, so corrections are atomic to readers."},
         {k:"note",label:"Live vs final",text:"Dashboards show near-real-time estimates within about a minute. Billing reads finalized batch-corrected windows after the lateness horizon."}
       ],
       snap:{title:"Load & capacity — Stage 3",cap:"The live layer can be fast because the batch layer can correct it.",
         tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
-          {c:["Late data","event-time replay","corrected windows"],hi:1},
+          {c:["Raw history","Kafka 7d RF3 + S3 objects","~8.6TB/day replayable"],hi:1},
+          {c:["Batch engine","Spark/Flink ~200 executors","~43GB/day per executor"],hi:1},
+          {c:["Late data","event-time replay","corrected windows"]},
           {c:["Bad live deploy","raw recompute","overwrite version"]},
-          {c:["Billing source","finalized batch","money-safe"],hi:1,tag:"fixed"},
-          {c:["Raw history","tiered objects","replayable"]}
+          {c:["Billing source","finalized batch","money-safe"],hi:1,tag:"fixed"}
         ]}]}},
     {node:"query",stage:"Stage 4 · Query API",title:"Advertisers need safe reads &rarr; add query brokers and cache",
       live:["client","gw","stream","agg","olap","dedup","batch","query"],
       edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"],["olap","query","read"],["agg","batch","reconcile"]],
       narrate:"The data is now durable and correctable, but exposing OLAP directly couples advertisers to shards, partial failures and expensive repeated dashboards. Put a query layer in front that knows coverage, caching and tenant limits.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Dashboard demand can be ~**50K QPS**, cut about **90%** by result caching to ~5K OLAP scans/s with p99 below 1s."},
-        {k:"pain",label:"What breaks without it",text:"A dashboard refresh storm fans directly into OLAP, one advertiser can monopolize brokers, and partial segment coverage can return a confidently wrong low number."},
-        {k:"fix",label:"The fix — query API",text:"Query brokers enforce auth, tenant limits, cached common ranges, coverage checks and freshness labels. If replicas cannot cover a range, fail or show last-good with a flag; never silently under-count."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **14:00**, ShopSphere's agency opens a war-room dashboard on 40 screens and their automation refreshes every second. Other advertisers do the same after seeing the sale trend. Direct-to-Druid traffic reaches **~50K dashboard QPS**; one tenant repeatedly asks the same 15-minute range while another asks for a segment whose replica is still loading. Without brokers, Druid spends CPU on duplicate scans and can return a confidently low number for partial coverage."},
+        {k:"fix",label:"The fix — walk the same case with query brokers and cache",text:"Put a Query API in front: auth, tenant limits, result cache, freshness labels and coverage checks. ShopSphere's repeated 15-minute charts hit Redis **~90%** of the time, so Druid sees **~5K scans/s** instead of 50K. If a segment is missing, the API returns last-good with a clear freshness flag or fails the range; it never silently under-counts. The agency still gets **p99 &lt; 1s** reads while OLAP remains protected."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Query tier**: ~40 stateless API/broker pods at **~1.25K QPS each** for 50K QPS, fronted by Redis Cluster. **Redis result cache**: 12 shards, each primary + replica; 90% hit rate cuts Druid to **~5K scans/s**, or **~500 scans/s per 10 Druid nodes**. Why replicas: a cache primary loss should not push the full 50K QPS into OLAP; failover keeps the hit rate warm enough to protect Druid."},
         {k:"gotcha",label:"Freshness label",text:"Expose whether a row is live, late-corrected, or batch-final. Users tolerate a minute of lag; they do not tolerate invisible correctness changes."}
       ],
       snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The complete design separates ingest, counting, correction and serving.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-          {c:["Dashboard QPS","~50K","~90% cache hit"],hi:1},
+          {c:["Query API","~40 stateless brokers","~1.25K QPS each"],hi:1},
+          {c:["Result cache","Redis Cluster · 12 shards · primary + replica","N+1 protects OLAP"],hi:1,tag:"fixed"},
+          {c:["Dashboard QPS","~50K","~90% cache hit"]},
           {c:["OLAP scan QPS","~5K","bounded"]},
-          {c:["Query p99","under 1s","target"]},
-          {c:["Partial data","coverage checked","no silent under-count"],hi:1,tag:"fixed"}
+          {c:["Partial data","coverage checked","no silent under-count"],hi:1}
         ]}]}},
-  ]};
+  ]}
 d.deepFlows=[scaling].concat(d.deepFlows);
 })();

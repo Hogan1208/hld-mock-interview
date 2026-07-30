@@ -932,32 +932,35 @@ var scaling={id:"scaling",name:"From seed loop to web-scale crawl",kind:"scale",
       edges:[["seed","frontier","seed URLs"],["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","frontier","new links"]],
       narrate:"Draw the honest MVP first: a scheduler seeds URLs, the frontier hands one to a fetcher, the parser extracts links, and those links go back into the frontier. It can crawl a demo slice correctly, but every external dependency is still hidden inside the fetcher and every new link is trusted.",
       details:[
-        {k:"win",label:"Why start here",text:"It proves the loop and keeps the interview legible: priority queue, async fetch, parse, enqueue. Do not pre-draw the entire web; earn each extra box from a measured failure."},
-        {k:"scale",label:"Working numbers",text:"Target is ~**30B pages** refreshed monthly, or ~**12K pages/s** sustained. The baseline is fine for seeds and a small corpus, not for the public web."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **06:00**, the **Northwind News crawl** starts from 10K news, shopping and government seeds after a product launch. The MVP loop fetches **300 pages/s** on one 32-vCPU box and immediately discovers **~3K URLs/s**. By **06:08**, repeated author pages and calendar links have inflated the in-memory frontier to **1.4M queued URLs**; by **06:20**, the fetcher is 70% idle because the single queue lock and parser enqueue path dominate. The target is **1B pages/day ≈ 12K pages/s**, so this design is already **40× short** before DNS, politeness or storage are visible."},
+        {k:"fix",label:"The fix — walk the same case with the honest loop",text:"Keep the same four boxes, but size the baseline as a sharded crawl loop: **200 frontier/fetcher workers**, each owning `hash(domain)%200`, each needing only **~60 pages/s** to reach **12K/s** fleet throughput. Northwind's 10K seeds now spread across workers; the parser emits **~120K discovered URLs/s**, and the visible next question becomes admission control rather than one locked queue. It is still not web-safe, but the baseline now explains the real ceilings the next stages fix."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Frontier MVP**: 200 Redis Streams or RocksDB-backed queue shards, **1 active + 1 standby per shard**. Fleet ready-set is ~**600GB** for ~3B in-flight URLs at ~200B each, so each active shard holds **~3GB** plus spill; a 16GB worker has room for queues, host state and parser buffers. **Fetcher/parser**: 200 async workers at **~60 pages/s each** is below the per-box network ceiling of ~12.5K/s, leaving CPU for ~20ms static parsing. Why 200 not 20: 20 workers would each carry **30GB** queue state and huge domain skew; 200 keeps failover and rebalancing small."},
         {k:"query",label:"The loop",code:"seed due URLs -> frontier.push(url)\nfrontier.pop() -> fetcher.download(url)\nparser.extract_links(html) -> frontier.push(canonical_links)\nparser.extract_text(html) -> index pipeline"}
       ],
-      snap:{title:"Load & capacity — Stage 0",cap:"The loop is correct, but all hidden costs still land on the fetcher and frontier.",
+      snap:{title:"Load & capacity — Stage 0",cap:"The loop is now sized for the crawl budget, but all hidden external controls still land on the fetcher and frontier.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-          {c:["Fetch budget","~12K pages/s","target"]},
-          {c:["New-link fan-out","~120K URLs/s","pressure building"],hi:1},
-          {c:["Known pages","30B","not yet modeled"]},
-          {c:["External controls","none","demo only"],tag:"risk"}
+          {c:["Frontier queue","200 RocksDB queue shards · 1 active + 1 standby","N+1 per shard"],hi:1,tag:"sized"},
+          {c:["Fetch budget","12K pages/s ÷ 200 ≈ 60 pages/s each","headroom"],hi:1},
+          {c:["New-link fan-out","~120K URLs/s","admission pressure"],hi:1},
+          {c:["Known pages","30B target","not yet deduped"],tag:"risk"},
+          {c:["External controls","DNS, robots, rate limits hidden in fetcher","demo only"],tag:"risk"}
         ]}]}},
     {node:"dns",stage:"Stage 1 · DNS cache",title:"A lookup per fetch blocks slots &rarr; add cached DNS",
       live:["seed","frontier","fetcher","parser","dns"],
       edges:[["frontier","fetcher","next URL"],["fetcher","dns","resolve"],["fetcher","parser","raw HTML"]],
       narrate:"At 12K pages/s, resolving a hostname on the hot path is no longer background noise. A blocking lookup per page burns fetch slots and can turn an upstream resolver hiccup into a crawler-wide stall.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"The fetch budget implies ~**12K DNS checks/s**, but the crawl revisits the same ~100M hosts. With locality, only ~**100 real misses/s** should hit recursive DNS."},
-        {k:"pain",label:"What breaks without it",text:"Every slow DNS answer pins an otherwise idle network slot. During resolver rate limiting, fetchers look busy but do no useful page work, and politeness timing becomes noisy because URLs cannot even resolve."},
-        {k:"fix",label:"The fix — resolver cache",text:"Add a partitioned DNS resolver cache keyed by host with TTLs, async refresh and single-flight on misses. Fetchers almost always hit memory; one worker refreshes an expired hot host while the rest wait."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **07:15**, Northwind hits a breaking-news cluster: **2.4M URLs** across **48K hosts**. The MVP fetcher does a fresh DNS lookup for every page, so the fleet generates **~12K recursive DNS requests/s**. The corporate resolver starts rate-limiting at **~2K/s**; median lookup jumps from **20ms to 900ms**. Fetchers still show thousands of open slots, but **~80%** are waiting on DNS instead of downloading pages, so crawl throughput falls from **12K/s to ~2.5K/s** and the news index misses the first hour."},
+        {k:"fix",label:"The fix — walk the same case with cached DNS",text:"Add a partitioned DNS service with TTL-aware in-memory cache, async refresh, and single-flight per host. In the same Northwind run, the **12K checks/s** still happen, but cache locality over the **~100M host** universe means only **~100–200 real misses/s** leave the fleet. Hot hosts like `www.northwindnews.example` refresh once per TTL, not once per URL. Fetch throughput returns to **~12K/s**, and a resolver hiccup consumes miss traffic, not every socket."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**DNS cache**: 16 Unbound/CoreDNS resolver-cache nodes, each **8 vCPU / 16GB**, fronted by consistent hashing; each node has **1 warm standby** for N+1. Cache **100M host records × ~100B ≈ 10GB fleet**, or **~625MB/node** before overhead, so memory is easy. Miss load **200/s ÷ 16 ≈ 13/s/node** is tiny; the point is latency isolation and single-flight, not raw QPS. TTLs are honored, and connect failure forces re-resolve."},
         {k:"gotcha",label:"Stale IPs are recoverable",text:"Honor DNS TTLs, and on connect failure force a re-resolve. A stale address wastes one fetch attempt; it must not poison the host forever."}
       ],
       snap:{title:"Load & capacity — Stage 1",cap:"DNS is now a cached lookup, not a per-page external dependency.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Lookups implied","~12K /s","~12K cache checks/s"]},
-          {c:["Real DNS misses","~12K /s worst case","~100 /s"],hi:1,tag:"fixed"},
-          {c:["Cache size","none","~10GB fleet"]},
+          {c:["DNS tier","none","16 CoreDNS cache nodes + 16 warm standbys · N+1"],hi:1,tag:"fixed"},
+          {c:["Lookups implied","~12K /s recursive","~12K cache checks/s"]},
+          {c:["Real DNS misses","~12K /s worst case","~100–200 /s fleet"],hi:1},
+          {c:["Per-node miss load","resolver rate-limited","~13 /s on 16 nodes"],hi:1},
           {c:["Fetch slot blocked by DNS","common on miss","rare"]}
         ]}]}},
     {node:"politeness",stage:"Stage 2 · Politeness",title:"Parallel fetchers can hammer one host &rarr; enforce per-domain rate",
@@ -965,33 +968,35 @@ var scaling={id:"scaling",name:"From seed loop to web-scale crawl",kind:"scale",
       edges:[["frontier","fetcher","next URL"],["fetcher","dns","resolve"],["fetcher","politeness","rate check"],["fetcher","parser","raw HTML"]],
       narrate:"More fetchers raise global throughput, but they also make it easy to send many concurrent requests to one unlucky domain. A crawler that ignores robots.txt and crawl-delay gets blocked and can harm sites.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"~**200 workers** share the 12K pages/s budget. Without single-owner host state, two workers can each believe a domain is safe and violate a 1s or 10s crawl-delay."},
-        {k:"pain",label:"What breaks without it",text:"The crawler becomes impolite: one hot domain can receive bursts far beyond its allowed interval, leading to 429s, IP bans, bad data freshness, and a system-design miss on the non-functional requirement."},
-        {k:"fix",label:"The fix — host-affine rate state",text:"Co-locate each domain's back-queue, robots cache and last-hit timestamp on the same frontier shard. A URL is eligible only when that host's interval has elapsed; unknown robots defaults conservative."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **08:00**, Northwind's parser discovers a product sitemap from **Harbor Books** with **3M URLs**. Without single-owner host state, 200 workers each see a different slice and each thinks it is safe to fetch. For five minutes Harbor Books receives **~600 requests/s** even though `robots.txt` asks for **1 request every 2s**. Their origin returns **429**, then blocks the crawler IP range. The crawler wastes **180K failed fetches**, loses freshness for that store, and risks being treated as abuse."},
+        {k:"fix",label:"The fix — walk the same case with host-affine rate state",text:"Co-locate each domain's back-queue, robots cache and last-hit timestamp on one frontier shard. Harbor Books hashes to shard 117, so all **3M URLs** line up behind one token bucket at **0.5 requests/s**; excess URLs stay queued or are down-prioritized while other domains keep the fleet at **12K/s**. The crawler is slower on that one host by design, but the global crawl budget is preserved and Harbor Books is never hammered."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Politeness state** lives in the same 200 RocksDB frontier shards: one owner per domain plus one standby. Store **~100M host records × ~50B timing state ≈ 5GB fleet**, plus robots cache **~100M × ~1KB ≈ 100GB fleet**, about **525MB/shard** before compression. That fits beside the ~3GB ready-set. Why shard by domain: per-host ordering and rate tokens must be local; a central limiter would see **12K checks/s** and become a correctness bottleneck."},
         {k:"key",label:"Why co-locate with frontier",text:"The queue and rate decision need the same ordering. Domain affinity avoids a central rate-limit service and avoids cross-worker races on one host."}
       ],
       snap:{title:"Load & capacity — Stage 2",cap:"Global throughput can rise while every individual domain remains protected.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Politeness store","200 RocksDB frontier shards · 1 active + 1 standby","domain owner + N+1"],hi:1,tag:"fixed"},
           {c:["Workers","~200","parallel globally"]},
-          {c:["Timing state","~5GB fleet","small"]},
-          {c:["robots cache","~100GB fleet","partitioned"]},
-          {c:["Per-domain owner","hash(domain)%N","no race"],hi:1,tag:"fixed"}
+          {c:["Timing state","~5GB fleet ≈ 25MB/shard","small"]},
+          {c:["robots cache","~100GB fleet ≈ 500MB/shard","fits RAM"]},
+          {c:["Per-domain owner","hash(domain)%200","no race"],hi:1}
         ]}]}},
     {node:"dedup",stage:"Stage 3 · Dedup",title:"120K discovered URLs/s explodes the frontier &rarr; add seen-set",
       live:["seed","frontier","fetcher","parser","dns","politeness","dedup"],
       edges:[["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","dedup","seen?"],["parser","frontier","new links"]],
       narrate:"The parser emits about ten links per fetched page. At the target crawl rate that is 120K enqueue attempts every second, most of them duplicates, parameter variants, traps, or already-known URLs.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"At ~**120K URL discoveries/s** and **30B known URLs**, an exact in-memory hashset would be multi-terabyte. The frontier only stays finite if admission checks happen before enqueue."},
-        {k:"pain",label:"What breaks without it",text:"The queue grows without bound, spider traps dominate the budget, and the same page is fetched through many URL variants. Fetch capacity is spent rediscovering instead of refreshing."},
-        {k:"fix",label:"The fix — URL and content dedup",text:"Canonicalize first, then check a partitioned Bloom seen-set before enqueue. Use content SimHash later to collapse near-duplicate pages. The Bloom fleet is ~37GB versus 3TB+ for an exact hot set."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **09:20**, Northwind enters the **Civic Calendar** trap: every page links to `?month=next` forever. The parser still emits **~10 links/page**, so at **12K pages/s** the frontier sees **~120K enqueue attempts/s**. Without a seen-set, the same meeting pages appear under tracking params, calendar offsets and slash variants; by lunch one trap domain has **280M queued URLs** and displaces higher-value news recrawls. Fetch capacity is spent proving the same pages are duplicates after download, which is the most expensive place to learn it."},
+        {k:"fix",label:"The fix — walk the same case with URL and content dedup",text:"Canonicalize before admission, then check a partitioned Bloom seen-set keyed by normalized URL. In the same Civic Calendar case, repeated URLs are rejected before they touch the frontier; new calendar variants hit per-domain caps and depth rules. For **30B known URLs** at ~**1%** false positives, the Bloom filter is **~37GB fleet**, so each of 200 workers owns **~190MB**. Content SimHash later collapses near-duplicate pages that different URLs still reach."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Dedup tier**: 200 partitioned Bloom-filter shards in RocksDB or RedisBloom, each **1 active + 1 standby** and aligned with domain/frontier ownership. Sizing: **30B URLs × 9.6 bits ≈ 288B bits ≈ 36GB**, rounded to **~37GB**; per shard **~185–190MB**, plus an exact LRU for high-value URLs. Check rate **120K/s ÷ 200 ≈ 600/s/shard**, far below memory lookup limits. Exact hashset would be **3TB+** at ~100B/url, which is why Bloom is the admission gate."},
         {k:"gotcha",label:"False positives",text:"A Bloom false positive can skip a real URL. Tune it below ~1% and optionally exact-check high-value URLs; it slightly reduces coverage, but it never corrupts stored content."}
       ],
       snap:{title:"Load & capacity — Stage 3",cap:"Dedup turns infinite discovery into bounded admission.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Enqueue attempts","~120K /s","checked before admit"],hi:1},
-          {c:["Seen memory","3TB+ exact","~37GB Bloom fleet"],hi:1,tag:"fixed"},
-          {c:["Per worker seen-set","unbounded","~190MB"]},
+          {c:["Dedup store","none","200 Bloom shards · 1 active + 1 standby · N+1"],hi:1,tag:"fixed"},
+          {c:["Enqueue attempts","~120K /s","~600 checks/s/shard before admit"],hi:1},
+          {c:["Seen memory","3TB+ exact","~37GB Bloom fleet"],hi:1},
+          {c:["Per worker seen-set","unbounded","~190MB + hot exact LRU"]},
           {c:["Trap domains","grow forever","capped + filtered"]}
         ]}]}},
     {node:"store",stage:"Stage 4 · Content store",title:"Bytes outgrow workers &rarr; split blob store from metadata",
@@ -999,18 +1004,19 @@ var scaling={id:"scaling",name:"From seed loop to web-scale crawl",kind:"scale",
       edges:[["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","dedup","seen?"],["parser","frontier","new links"],["parser","store","save page"]],
       narrate:"Once the crawler is polite and bounded, the remaining scale is durable bytes. Parsed content and raw pages cannot live on worker disks; the system needs a write-once archive plus a small lookup index.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"30B pages at ~16KB compressed is ~**500TB** of blobs, written at ~**190MB/s** or ~1.6TB/day. Raw volume is ~3PB before compression."},
-        {k:"pain",label:"What breaks without it",text:"Writing billions of tiny files to a NameNode-style filesystem or a mutable row store creates metadata and compaction pain. Worker-local storage loses pages on failure and cannot feed later indexing or replay."},
-        {k:"fix",label:"The fix — WARC blobs + metadata index",text:"Pack many pages into WARC objects in managed object storage, and keep a narrow metadata index keyed by URL hash with content hash, fetch time and object pointer. Bytes and lookup state scale independently."},
+        {k:"pain",label:"What breaks — a concrete case",text:"By the end of day one, Northwind has fetched **1B pages**. If workers keep page bytes on local disks, **~16TB compressed/day** is scattered across 200 machines; a single worker loss drops that shard's pages, and the indexer cannot replay cleanly. If every page is written as a tiny file, the metadata layer sees **12K creates/s** and billions of inodes. If raw **100KB** pages are kept without packing, the monthly corpus is **~3PB** before compression and impossible to manage from worker disks."},
+        {k:"fix",label:"The fix — walk the same case with WARC blobs and metadata",text:"Pack pages into immutable **WARC** objects and write them to object storage; keep only a narrow metadata index keyed by URL hash with content hash, fetch time and object pointer. Northwind's **12K pages/s × 16KB compressed ≈ 190MB/s** becomes large sequential object writes, not tiny files. A lost worker only replays uncommitted frontier leases; already-written WARC objects survive and the metadata index can be rebuilt by scanning WARC headers."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Blob store**: S3/GCS-style object storage with **3× durability replication** or erasure coding, WARC objects around **128MB** each. At **190MB/s**, writers create about **1.5 objects/s**, not 12K files/s; daily compressed bytes are **~16TB**, monthly **~500TB**. **Metadata index**: Cassandra or Bigtable with **64 tablets/shards, RF3**; **30B rows × ~100B ≈ 3TB logical**, **~9TB RF3**, or **~140GB/shard** before overhead. Why 64: scans and writes stay small, and losing one replica still leaves quorum."},
         {k:"note",label:"Rebuild path",text:"If the metadata index is corrupt, scan WARC headers to rebuild it. The immutable bytes are the durable source; the index is the fast map."}
       ],
       snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The final design has a bounded frontier, polite fetch, cheap DNS, dedup, and durable crawl output.",
         tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
-          {c:["Blob volume","object storage + WARC","~500TB compressed"],hi:1},
-          {c:["Write rate","sharded prefixes","~190MB/s"]},
-          {c:["Metadata","wide-column index","~3TB"]},
-          {c:["Durability","object storage replication","pages survive worker loss"],hi:1,tag:"fixed"}
+          {c:["Blob volume","S3 WARC objects · 3× replicated","~500TB compressed/month"],hi:1,tag:"fixed"},
+          {c:["Write rate","128MB objects","~190MB/s ≈ 1.5 objects/s"]},
+          {c:["Metadata","Cassandra/Bigtable · 64 shards · RF3","~3TB logical, quorum safe"],hi:1},
+          {c:["Why 64 shards","30B ÷ 64 ≈ 470M rows/shard","fits compaction windows"]},
+          {c:["Durability","object storage replication","pages survive worker loss"],hi:1}
         ]}]}},
-  ]};
+  ]}
 d.deepFlows=[scaling].concat(d.deepFlows);
 })();

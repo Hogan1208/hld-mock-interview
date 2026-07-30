@@ -899,14 +899,16 @@ var scaling={id:"scaling",name:"From durable cron to scheduler at scale",kind:"s
       edges:[["client","api","submit"],["api","jobdb","persist"],["jobdb","worker","claim"]],
       narrate:"Draw the smallest correct scheduler first: the API validates a job, durably writes it, and workers claim due rows from the job store. The design protects the core promise — a submitted job is not lost — but the due-scan and handoff are still coupled to the database.",
       details:[
-        {k:"win",label:"Why start here",text:"Durability is earned before scale. Once the API acks only after a quorum-committed row, every later component can crash and the job still exists to be found again."},
-        {k:"scale",label:"Working numbers",text:"~**100M jobs** registered, ~**10K executions/s** steady, with round-time spikes where **1M jobs** may be due at midnight."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **23:59:50**, **FinLedger Bank** has **100M registered jobs** and **1M end-of-day statement jobs** due at midnight. In the baseline, workers poll the job table directly and try to claim due rows. By **00:00:02**, hundreds of workers are running the same `next_run_at &le; now` range, the primary is doing polling work instead of state transitions, and some jobs are already **8–12s late**. The data is durable, but the database has become both scheduler and queue."},
+        {k:"fix",label:"The fix — walk the same case with a durable baseline",text:"Keep the first invariant narrow: API writes a quorum-committed row before returning **201**, and each worker claim is an atomic conditional state flip. FinLedger jobs are not lost if an API pod dies after ack because the row is already in the store. The baseline is acceptable for low volume, but the midnight herd exposes the next required split: due discovery must be bounded and separated from worker execution."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Job store baseline**: CockroachDB or Postgres-compatible NewSQL with **3 replicas** for one range group, quorum writes **2 of 3**. Hot data is **100M jobs × a few KB ≈ few hundred GB**, so storage fits, but write transitions are the ceiling: **10K executions/s × 3–4 writes ≈ 40–50K writes/s**. A single primary-style group cannot also serve a full-table due poll every second; the baseline is correctness-first, not scale-complete."},
         {k:"query",label:"Naive but correct",code:"INSERT INTO jobs(job_id, spec, next_run_at, state) VALUES (..., 'pending');\n-- worker loop\nUPDATE jobs SET state='running'\n WHERE job_id=? AND state='pending' AND next_run_at <= now();"}
       ],
       snap:{title:"Load & capacity — Stage 0",cap:"The data is safe, but polling and execution are not yet independently scalable.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-          {c:["Registered jobs","~100M","durable"]},
-          {c:["Steady executions","~10K /s","target"]},
+          {c:["Job store","1 CockroachDB range group · 3 replicas · quorum 2/3","durable N+1"],hi:1,tag:"safe"},
+          {c:["Registered jobs","~100M","fits storage"]},
+          {c:["Steady executions","~10K /s ⇒ ~40–50K writes/s","write ceiling near"],hi:1},
           {c:["Midnight herd","~1M due","risk"],hi:1,tag:"risk"},
           {c:["Handoff buffer","none","DB coupled"]}
         ]}]}},
@@ -915,50 +917,53 @@ var scaling={id:"scaling",name:"From durable cron to scheduler at scale",kind:"s
       edges:[["client","api","submit"],["api","jobdb","persist"],["scheduler","jobdb","poll due"],["jobdb","worker","claim"]],
       narrate:"Letting every worker hunt for due jobs turns the hot table into a polling target. Due discovery needs its own bounded loop that scans only due partitions, claims rows atomically, and leaves workers focused on execution.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"The due loop ticks about every **1s** and must handle ~**10K/s** steady. A midnight spike is smeared by jitter to roughly **50K/s**, so about **6 scheduler partitions** give headroom."},
-        {k:"pain",label:"What breaks without it",text:"A naive `WHERE next_run_at &le; now` over 100M jobs each tick pins the database and starves state transitions. Workers waste capacity polling instead of running jobs."},
-        {k:"fix",label:"The fix — partitioned due discovery",text:"Add scheduler instances that own disjoint job_id partitions, read a time index or sorted set for due jobs, and perform the atomic pending&rarr;queued claim in the store. Work per tick is proportional to due jobs, not catalog size."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **00:00:00**, FinLedger's 1M statement jobs become due. If every worker scans, even an indexed query is repeated by hundreds of processes and touches the same hot `next_run_at` range. The DB sees more polling reads than useful claims; the first **50K** jobs claim, but the rest wait behind lock contention and repeated range scans. The target is **~1s** timely firing; by **00:00:10** customers still have unstarted statement jobs."},
+        {k:"fix",label:"The fix — walk the same case with partitioned due discovery",text:"Add scheduler instances that own disjoint `job_id` partitions. FinLedger smears the 1M midnight jobs with jitter over **~20s**, so the peak due rate is **~50K/s**. With **6 scheduler partitions**, each partition claims **~8.3K/s**, below the **~10K claims/s** per-instance ceiling, and workers stop polling entirely. The DB claim remains authoritative; Redis sorted sets only make the hot due loop cheap."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Due tier**: 6 scheduler partitions, each with an active scheduler and a standby, backed by Redis sorted sets scored by fire time plus the CockroachDB job table. Sizing: **50K due/s ÷ 6 ≈ 8.3K claims/s/partition**, leaving ~17% headroom under a **10K/s** claim ceiling; if one scheduler dies, the standby takes its partition and runs slightly hot until the herd drains. DB shards are aligned by `job_id` so claims are parallel, not one global hot scan."},
         {k:"key",label:"Still source-of-truth in DB",text:"The sorted set can accelerate the hot loop, but the conditional claim in the job store decides. If the cache is lost, an overdue DB scan rebuilds due work."}
       ],
       snap:{title:"Load & capacity — Stage 1",cap:"Due discovery is bounded and parallel, but dispatch still has no shock absorber.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Due scan","100M-row risk","range/sorted-set due only"],hi:1,tag:"fixed"},
-          {c:["Steady claims","~10K /s","partitioned"]},
-          {c:["Midnight rate","~50K /s after jitter","~6 partitions"]},
-          {c:["Tick target","can exceed 1s","finishes within tick"]}
+          {c:["Due index","DB range only","6 Redis sorted-set partitions + DB claims"],hi:1,tag:"fixed"},
+          {c:["Due scan","100M-row risk","due rows only"]},
+          {c:["Steady claims","~10K /s","~1.7K/s per partition"]},
+          {c:["Midnight rate","~50K /s after jitter","~8.3K/s per partition"],hi:1},
+          {c:["Why 6 not 5","5 ⇒ 10K/s each, no failover headroom","N+1 safer"]}
         ]}]}},
     {node:"queue",stage:"Stage 2 · Task queue",title:"Execution bursts back up claims &rarr; decouple with a queue",
       live:["client","api","jobdb","worker","scheduler","queue"],
       edges:[["api","jobdb","persist"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"]],
       narrate:"The scheduler should be fast at finding due work, not blocked by slow handlers or a temporarily undersized worker pool. A durable queue turns a spike into backlog and gives workers leases, visibility timeouts and ack semantics.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Workers need about **20K in-flight** slots for 10K/s at ~2s average duration, with **400–600 workers** as a practical floor. Midnight dispatch can hit **50K msgs/s**."},
-        {k:"pain",label:"What breaks without it",text:"Without a buffer, a worker slowdown makes schedulers hold DB claims longer or retry dispatch in place. Jobs fire late, and the database becomes the backpressure queue."},
-        {k:"fix",label:"The fix — durable at-least-once queue",text:"Schedulers enqueue due executions and move on. Workers lease messages under a visibility timeout, heartbeat long jobs, and ack only after success. No ack means redelivery, not loss."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **00:01**, FinLedger's downstream PDF renderer slows from **2s** average to **8s** because a template cache is cold. Without a queue, schedulers keep claims open while trying to hand work to saturated workers, or they retry dispatch from the DB. The job table becomes the backpressure buffer, overdue rows pile up, and new due scans compete with long-running execution bookkeeping."},
+        {k:"fix",label:"The fix — walk the same case with a durable queue",text:"Schedulers claim due executions, enqueue messages, and immediately move on. Workers lease from the queue with a visibility timeout and heartbeat while rendering. With **10K/s** steady and **2s** average, Little's law says **~20K in-flight**; when render time jumps to 8s the queue depth grows instead of blocking claims, autoscaling adds workers, and unacked messages redeliver rather than disappear."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Task queue**: Kafka or SQS-like durable queue with **16 partitions**, RF3 if Kafka. Peak dispatch **50K msgs/s ÷ 16 ≈ 3.1K/s/partition**, comfortably below common partition limits; partitions are for consumer parallelism and ordered retry lanes, not bytes. **Workers**: 600 pods with ~50 IO-bound slots each gives **30K slots**, covering the **20K** steady in-flight plus N+1 headroom. Visibility timeout **60s** with heartbeats handles long jobs."},
         {k:"gotcha",label:"At-least-once means idempotency",text:"A re-delivered execution must be harmless. Pass `jobId + scheduledFireTime` as the execution id so downstream side effects can dedup."}
       ],
       snap:{title:"Load & capacity — Stage 2",cap:"The queue absorbs scheduling spikes and lets workers scale on lag.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-          {c:["Queue throughput","10K steady · 50K peak","partitioned"]},
-          {c:["Partitions","~12–16","headroom"],hi:1},
-          {c:["In-flight workers","~20K tasks","Little's law"]},
-          {c:["Crash during execution","lease expires","redelivered"],hi:1,tag:"fixed"}
+          {c:["Queue","Kafka/SQS · 16 partitions · RF3 if Kafka","N+1 + durable"],hi:1,tag:"fixed"},
+          {c:["Throughput","10K steady · 50K peak","~3.1K/s/partition"]},
+          {c:["In-flight workers","10K/s × 2s ≈ 20K tasks","Little's law"],hi:1},
+          {c:["Worker fleet","~600 pods × 50 slots = 30K","headroom"]},
+          {c:["Crash during execution","lease expires","redelivered"],hi:1}
         ]}]}},
     {node:"coordinator",stage:"Stage 3 · Coordinator",title:"Multiple schedulers can double-own work &rarr; elect and fence",
       live:["client","api","jobdb","worker","scheduler","queue","coordinator"],
       edges:[["api","jobdb","persist"],["coordinator","scheduler","elect"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"]],
       narrate:"Partitioned schedulers scale, but now ownership is a correctness problem. If two schedulers believe they own the same partition during a failover, both can claim or enqueue the same job window.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"At **6+ scheduler partitions** and frequent deploys/failovers, manual ownership is not safe. Every claim needs an owner epoch so stale schedulers are fenced."},
-        {k:"pain",label:"What breaks without it",text:"Split-brain schedulers double-fire jobs, or an abandoned partition stops firing until a human notices. Both violate the reliability contract: duplicates may be harmful, and silent drops are worse."},
-        {k:"fix",label:"The fix — leases, epochs and fencing",text:"A coordinator assigns partitions with short leases and monotonic epochs. The job store accepts claims only from the current epoch; a stale scheduler can keep running but its writes are rejected."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **00:03**, scheduler `s2` pauses for a **12s** GC while owning FinLedger partition 2. A standby notices the missed heartbeat and starts scanning the same due range. Without fencing, both schedulers enqueue execution `statement-8842@midnight`; one worker sends the statement email and another starts the same payment export. A duplicate may be idempotent, but if the target is not, the scheduler has created a real business incident."},
+        {k:"fix",label:"The fix — walk the same case with leases, epochs and fencing",text:"A coordinator such as etcd or ZooKeeper assigns each scheduler partition a short lease and monotonic epoch. When `s2` stalls, standby `s2b` gets epoch **43**; the job store accepts claims only with the current epoch. The old `s2` wakes up with epoch **42**, keeps trying, and every write is rejected. The partition may be late by a few seconds, but FinLedger does not double-fire."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Coordinator**: 5-node etcd cluster across AZs, quorum **3 of 5**. Load is tiny: 6 scheduler partitions renew leases every **~2s**, so single-digit writes/s; the 5-node size is for failure tolerance, not throughput. Why 5 not 3: a 3-node quorum survives one loss; 5 nodes survive one loss plus one maintenance or slow AZ while still electing. JobDB stores `owner_epoch` on claims so the coordinator's decision is enforced at the data write."},
         {k:"note",label:"Late beats double",text:"On uncertainty, pause, elect, fence and resume. A job firing a few seconds late is recoverable by overdue scan; a double-fired billing job is not."}
       ],
       snap:{title:"Load & capacity — Stage 3",cap:"Ownership is explicit, failover is automatic, and stale writers are fenced.",
         tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
-          {c:["Partition ownership","coordinator lease","single active owner"],hi:1,tag:"fixed"},
-          {c:["Stale scheduler","epoch fenced","no double claim"]},
-          {c:["Scheduler crash","overdue scan","late not lost"],hi:1},
+          {c:["Coordinator","etcd · 5 nodes · quorum 3/5","survives loss + maintenance"],hi:1,tag:"fixed"},
+          {c:["Partition ownership","lease + epoch","single active owner"]},
+          {c:["Stale scheduler","DB epoch fenced","no double claim"],hi:1},
+          {c:["Scheduler crash","standby + overdue scan","late not lost"]},
           {c:["Clock skew","DB claim arbiter","bounded timing error"]}
         ]}]}},
     {node:"deadletter",stage:"Stage 4 · Dead-letter",title:"Retries can loop forever &rarr; isolate exhausted executions",
@@ -966,18 +971,19 @@ var scaling={id:"scaling",name:"From durable cron to scheduler at scale",kind:"s
       edges:[["api","jobdb","persist"],["coordinator","scheduler","elect"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"],["worker","deadletter","on fail"]],
       narrate:"The scheduler can now find and dispatch reliably, but a permanently failing handler can churn forever, hide the real error and starve healthy work. Failed executions need policy, visibility and a terminal place to land.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"At **10K executions/s**, even a 0.1% permanent failure rate is 10 poisoned jobs every second. Unbounded retries become a self-inflicted queue flood."},
-        {k:"pain",label:"What breaks without it",text:"A bad payload or downstream bug retries forever, burns worker slots, and buries the root cause in logs. Users see pending jobs with no clear final state."},
-        {k:"fix",label:"The fix — retry policy + dead-letter",text:"Track attempts in the job store, retry with exponential backoff and jitter, then move exhausted executions to a dead-letter table/topic with reason, payload pointer and replay controls. Operators can inspect and re-drive after a fix."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **00:08**, a FinLedger customer uploads a malformed SFTP credential. The job fails in **50ms**, retries immediately, fails again, and does this forever. At a modest **0.1%** permanent failure rate on **10K executions/s**, the platform creates **10 poison executions/s**; after an hour, tens of thousands of retries are competing with healthy jobs and operators only see noisy logs, not a terminal state."},
+        {k:"fix",label:"The fix — walk the same case with retry policy and dead-letter",text:"Track attempt count and next retry in the job store. The malformed SFTP job retries with exponential backoff and jitter, then moves to a dead-letter table/topic after the configured max attempts with the payload pointer, reason and last error. Healthy FinLedger jobs keep running; an operator fixes the credential and re-drives that one execution. A recurring cron can dead-letter the failed run while the next scheduled fire remains active."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Dead-letter store**: Postgres/CockroachDB table for indexed operator queries plus Kafka compacted topic for replay, RF3. If poison jobs are **10/s**, that is **864K/day**; even at **5KB** per record it is **~4.3GB/day logical**, **~13GB/day RF3**, small versus run history. Retry scheduler reuses the same due-index pattern, but backoff and jitter cap re-entry so DLQ traffic cannot starve the **10K/s** healthy lane."},
         {k:"gotcha",label:"Recurring jobs",text:"Dead-letter the failed execution, not the entire cron definition unless policy says to pause it. The next scheduled fire time can still be computed and run."}
       ],
       snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The complete scheduler has durable intake, bounded due discovery, buffered dispatch, fenced ownership and visible terminal failures.",
         tables:[{name:"signals",cols:["signal","mechanism","result"],rows:[
-          {c:["Permanent failures","max attempts + DLQ","no infinite loop"],hi:1,tag:"fixed"},
+          {c:["DLQ store","Postgres/Cockroach RF3 + Kafka compacted topic","durable + replayable"],hi:1,tag:"fixed"},
+          {c:["Permanent failures","~10/s at 0.1%","~864K/day isolated"]},
           {c:["Retry burst","backoff + jitter","smoothed"]},
           {c:["Operator action","inspect + replay","recoverable"]},
           {c:["Core invariant","job store truth","never silently lost"],hi:1}
         ]}]}},
-  ]};
+  ]}
 d.deepFlows=[scaling].concat(d.deepFlows);
 })();

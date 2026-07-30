@@ -1004,63 +1004,68 @@ var scaling = {id:"scaling",name:"From query-time feed to hybrid fan-out",kind:"
       edges:[["feed","db","timeline query"]],
       narrate:"The MVP is fan-out-on-read. Opening the app asks the DB for the user's followees, fetches their recent posts, sorts by time or rank, and returns the first page. Posting is just an insert into the canonical post store.",
       details:[
-        {k:"win",label:"Why start here",text:"It is correct and easy to reason about: one canonical post row, one follow graph, no derived feed lists to rebuild. For small accounts and low traffic, it avoids the whole fan-out machinery."},
+        {k:"pain",label:"What breaks — a concrete case",text:"**CityPulse** runs live coverage of the **Luna Park election night**. At 20:00, push alerts bring users back and feed opens rise toward **~300K/s peak**. In the baseline, each open reads about **300 followees**, fetches recent posts, sorts, and hydrates. That is **300K × 300 ≈ 90M followee-post probes/s** before ranking, and popular users with thousands of followees are worse. Posting is only **~3,500/s**; the read-time join is what melts the DB and makes the app show spinners during the one event everyone opened it for."},
+        {k:"fix",label:"The fix — walk the same case, start with correctness",text:"For the first CityPulse beta, keep one canonical post store and one follow graph. The query-time design is excellent at low traffic because a post commit is just one durable insert and a follow edge is easy to reason about. It also gives the fallback used later to rebuild caches. The moment election-night reads approach **70K/s sustained** and then **300K/s peak**, the same case tells us to move repeated timeline assembly out of the database."},
         {k:"query",label:"Baseline timeline query",code:"SELECT p.post_id, p.author_id, p.created_at\nFROM follows f\nJOIN posts p ON p.author_id = f.followee_id\nWHERE f.follower_id = 42\nORDER BY p.created_at DESC\nLIMIT 50;"},
-        {k:"scale",label:"Working numbers",text:"The product target is **~70K reads/s** sustained, **~300K/s peak**, against only **~3,500 posts/s**. Reads dominate from the first capacity pass."}
+        {k:"host",label:"Load & capacity — what runs it",text:"Run the MVP on **Postgres for launch**: 1 primary + 2 async read replicas, 32 vCPU / 128 GB each. A tuned replica might handle **~5K timeline joins/s** when follow counts are modest, so two replicas give **~10K/s** and survive losing one only at **~5K/s**. That is fine for a city beta, but not for CityPulse at **70K/s sustained** or **300K/s peak**; the math proves the join cannot remain on the hot path."}
       ],
-      snap:{title:"Load & capacity — Stage 0",cap:"The query is correct, but the join and sort sit on the read hot path.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-        {c:["Timeline reads","~70K /s sustained","rising toward ~300K /s peak"],hi:1,tag:"risk"},
+      snap:{title:"Load & capacity — Stage 0",cap:"The query is correct, but election-night reads make the join and sort an explicit ceiling.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Datastore","Postgres · 1 primary + 2 async replicas","N+1 only for beta"],hi:1,tag:"base"},
+        {c:["Timeline reads","~70K /s sustained · ~300K /s peak","beyond joins"],hi:1},
+        {c:["Join probes","300K × 300 ≈ 90M followee probes/s","breaks"]},
         {c:["Post writes","~3,500 /s","small by comparison"]},
-        {c:["Typical follows","~300 followees","join per read"]},
-        {c:["Celebrity followers","~50M","not touched yet"]}
+        {c:["Replica capacity","2 × ~5K joins/s = ~10K/s","not enough"]}
       ]}]}},
     {node:"cache",stage:"Stage 1 · Feed cache",title:"Read-time joins get expensive &rarr; cache timelines and hot posts",
       live:["client","lb","feed","db","cache"],
       edges:[["feed","cache","read page"],["cache","db","miss rebuild"]],
       narrate:"At hundreds of thousands of timeline opens per second, repeating the same graph lookup, post fetches, ranking, and hydration for active users is waste. The first scale move is to cache the assembled candidate list and hot post bodies.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Peak reads are **~300K/s**, with a **p99 target under 200 ms**. A feed read must become a cache list range plus bounded hydration, not a fresh graph join every time."},
-        {k:"pain",label:"What breaks without it",text:"The DB becomes a ranking engine: every app open scans followees, finds posts, sorts, hydrates, and repeats for the same active users. P99 grows with follow count and cache-cold post bodies."},
-        {k:"fix",label:"The fix — cached candidate lists",text:"Keep a Redis sorted set per active user with recent post ids and cache hot post objects for hydration. The durable DB remains source of truth; the cache is a recomputable read model.",pill:"read model"},
-        {k:"gotcha",label:"Derived means rebuildable",text:"A lost feed list is a latency event, not data loss. Rebuild lazily from posts plus graph with request coalescing so a cache restart does not become a DB stampede."}
+        {k:"pain",label:"What breaks — a concrete case",text:"At 20:05, CityPulse users keep refreshing for Luna Park results. The same **50M active users** ask for the same top few hundred candidate ids again and again, yet the baseline redoes graph reads, ranking, and post-body hydration on every open. Cache-cold post bodies add scatter-gather latency, and p99 drifts past the **200 ms** target even though most answers changed only by a handful of new posts."},
+        {k:"fix",label:"The fix — walk the same case, cached candidate lists",text:"Keep a **Redis sorted set per active user** with recent post ids and cache hot post objects separately. A CityPulse open becomes `ZRANGE timeline:user` for 50 ids plus bounded multi-get hydration; cold timelines rebuild from the DB with request coalescing. At **300K reads/s**, Redis serves the repeated list work while the DB handles canonical posts, graph reads for rebuilds, and writes."},
+        {k:"host",label:"Load & capacity — what runs it",text:"Use **Redis Cluster for feed cache: 64 primary shards + 64 replicas**. Working-set math: **50M active timelines × 500 ids × ~200 B sorted-set overhead ≈ 5 TB**; 64 shards with **~90 GB usable each ≈ 5.8 TB** leave headroom. Read math: **300K reads/s ÷ 64 ≈ 4.7K list reads/s/shard**, well under Redis limits. Replicas give failover; 64, not 48, keeps both RAM and failover headroom."},
+        {k:"gotcha",label:"Derived means rebuildable",text:"A lost feed list is a latency event, not data loss. CityPulse can lazily rebuild from posts plus graph, and single-flight rebuilds stop one cache restart from turning into thousands of identical DB queries."}
       ],
-      snap:{title:"Load & capacity — Stage 1",cap:"Reads become bounded cache operations; cold rebuilds are controlled.",tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
-        {c:["Timeline read","graph join + sort","Redis range + hydration"],hi:1,tag:"fixed"},
-        {c:["Read p99","grows with followees","under 200 ms target"]},
-        {c:["Working-set RAM","none","~6 TB for active timelines"]},
-        {c:["Cache loss","blank risk","lazy rebuild"]}
+      snap:{title:"Load & capacity — Stage 1",cap:"Reads become bounded cache operations; the DB stops acting as the election-night ranking engine.",tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
+        {c:["Feed cache","none","Redis Cluster · 64 primaries + 64 replicas · N+1"],hi:1,tag:"fixed"},
+        {c:["Timeline read","graph join + sort","Redis range + hydration"]},
+        {c:["Working-set RAM","none","~5 TB used of ~5.8 TB usable"],hi:1},
+        {c:["Per-shard read load","DB replicas saturated","300K ÷ 64 ≈ 4.7K/s"]},
+        {c:["Read p99","grows with followees","under 200 ms target"]}
       ]}]}},
     {node:"fanout",stage:"Stage 2 · Hybrid fan-out",title:"Read-time fan-out still bends under skew &rarr; pre-push normal posts",
       live:["client","lb","feed","db","cache","fanout"],
       edges:[["feed","fanout","post event"],["fanout","cache","append ids"]],
       narrate:"Caching the read helps, but now the question is how the cached lists get fresh. Pure fan-out-on-read makes each active read merge posts from every followee; users with thousands of followees and large accounts make that merge too expensive.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Average fan-out is **~300 followers** per post, so **~3,500 posts/s** becomes roughly **~1M feed-list writes/s**. One celebrity post can address **50M followers**, so the strategy must be hybrid."},
-        {k:"pain",label:"What breaks without it",text:"Without fan-out workers, every read pays the followee merge and rank cost. Heavy readers and celebrity follow sets turn a feed open into a wide scatter, blowing the 200 ms budget."},
-        {k:"fix",label:"The fix — hybrid delivery",text:"Normal authors fan out on write: workers push the post id into followers' cached timelines asynchronously. Celebrity accounts skip write fan-out and are merged at read time from their author index.",pill:"hybrid"},
-        {k:"gotcha",label:"The trade-off",text:"Write fan-out buys cheap reads by spending writes. The threshold is a dial: lower it under backlog to shed large accounts back to read-time merge; raise it when reads need to be cheaper."}
+        {k:"pain",label:"What breaks — a concrete case",text:"At 20:12, normal CityPulse users are posting **~3,500 posts/s** about Luna Park. If feeds stay pure fan-out-on-read, every open must merge fresh posts from hundreds of authors; heavy readers who follow newsrooms, candidates, and friends trigger wide merges on every page. If we naively fan out every author, a celebrity candidate with **50M followers** creates **50M feed-list writes** from one post. Either extreme breaks: read-time merge misses the 200 ms budget, and all-write fan-out creates a celebrity write storm."},
+        {k:"fix",label:"The fix — walk the same case, hybrid delivery",text:"Normal authors fan out on write: workers append the new post id into follower Redis timelines asynchronously. Average math is **3,500 posts/s × 300 followers ≈ 1M feed-list writes/s**, which is large but batchable. Celebrity accounts above the threshold skip write fan-out; CityPulse merges their latest posts at read time from the author index. The Luna Park candidate's **50M-follower** post becomes zero immediate feed-list writes and a small read-time merge for users who actually open the app."},
+        {k:"host",label:"Load & capacity — what runs it",text:"Use a **Kafka fan-out log with 512 partitions, RF=3, on 12 brokers**, plus **~200 steady workers** doing **~10K Redis inserts/s** each. Average load **~1M inserts/s** needs **100 workers**, so 200 gives N+1 plus backlog catch-up; peak can scale toward **600 workers**. Kafka partition math: **1M/s ÷ 512 ≈ 2K events/s/partition** average, and partitions are for ordered parallelism by author or fan-out chunk, not bytes."},
+        {k:"gotcha",label:"The threshold is a dial",text:"During CityPulse backlog, lower the celebrity threshold and fan out only to recently active users. The system trades a little read-time merge for a huge drop in write volume instead of letting the queue age for hours."}
       ],
       snap:{title:"Load & capacity — Stage 2",cap:"The system spends async writes to make the dominant read path cheap, while capping celebrity storms.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
-        {c:["Feed-list writes","~1M /s average","async workers + cache"],hi:1},
-        {c:["Celebrity post","50M naive writes","skip and merge on read"],hi:1,tag:"fixed"},
-        {c:["Read path","prebuilt list","cheap page fetch"]},
-        {c:["Backlog control","threshold + active users","degrades gracefully"]}
+        {c:["Fan-out log","Kafka · 512 partitions · RF3 · 12 brokers","parallel + ordered chunks"],hi:1,tag:"fixed"},
+        {c:["Feed-list writes","3,500 × 300 ≈ 1M /s average","async workers"]},
+        {c:["Workers","200 steady × 10K inserts/s ≈ 2M/s capacity","N+1 headroom"],hi:1},
+        {c:["Celebrity post","50M naive writes","skip and merge on read"]},
+        {c:["Redis target","64-shard feed cache","writes spread by follower_id"]}
       ]}]}},
     {node:"media",stage:"Stage 3 · Media and CDN",title:"Images and video bloat the feed &rarr; split bytes to object storage",
       live:["client","lb","feed","db","cache","fanout","media"],
       edges:[["feed","media","media refs"]],
       narrate:"The text feed is now fast, but media can dwarf everything else. If app servers proxy uploads or DB rows carry image and video bytes, a few viral clips turn the feed architecture into a bandwidth system.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"If **~20% of 300M posts/day** include ~2 MB media, originals alone are about **120 TB/day**. Feed reads can request **~900 TB/day** of viewer bytes before CDN absorption."},
-        {k:"pain",label:"What breaks without it",text:"Putting media bytes in the DB or app path explodes storage, egress, and p99. Feed service instances become upload proxies and video servers instead of timeline assemblers."},
-        {k:"fix",label:"The fix — object store plus CDN",text:"Clients upload media directly to object storage using pre-signed URLs. The post row stores only media ids; an async pipeline creates renditions; viewers fetch from the CDN in parallel with feed rendering.",pill:"bytes off path"},
-        {k:"note",label:"Independent failure domain",text:"If transcode or a CDN region has trouble, text feeds and post metadata still load. Media degrades to processing thumbnails or retries instead of taking the timeline down."}
+        {k:"pain",label:"What breaks — a concrete case",text:"At 20:30, a Luna Park victory clip goes viral. If CityPulse stores media bytes in post rows or proxies downloads through feed servers, the timeline tier becomes a video CDN by accident. With **20% of 300M posts/day** carrying **~2 MB** originals, ingest is **~120 TB/day**; viewer traffic for thumbnails and clips is roughly **~900 TB/day** before CDN. The DB and feed service were sized for ids and metadata, not petabyte-class byte serving."},
+        {k:"fix",label:"The fix — walk the same case, bytes off path",text:"Clients upload directly to **S3/GCS-style object storage** with pre-signed URLs; the post row stores only media ids and rendition metadata. A transcode pipeline creates thumbnails and video ladders, and viewers fetch from a CDN while the feed response carries references. During the viral victory clip, feed p99 remains about Redis plus hydration; CDN edge hits absorb about **95%** of viewer bytes."},
+        {k:"host",label:"Load & capacity — what runs it",text:"Use **object storage with 3-region replication** for originals, a **Kafka/SQS media queue with 256 partitions**, and a CDN in front. Origin math: **120 TB/day originals ≈ 1.4 GB/s ingest average** before renditions, which object storage handles horizontally. Viewer math: **900 TB/day ÷ 24 h ≈ 10.4 GB/s average**; with **95% CDN hit**, origin egress falls to **~45 TB/day**. Queue partitions are for transcode parallelism and retry isolation, not for raw byte storage."},
+        {k:"note",label:"Independent failure domain",text:"If transcode lags during the Luna Park clip, text feeds and metadata still load. The client shows a processing thumbnail or retries media while the timeline path remains healthy."}
       ],
       snap:{title:"Load & capacity — Stage 3",cap:"The complete design keeps feed reads about ids and metadata; heavy bytes flow through media infrastructure.",tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
-        {c:["Original ingest","~120 TB/day","object storage direct upload"],hi:1,tag:"fixed"},
-        {c:["Viewer bytes","~900 TB/day","CDN absorbs ~95%"]},
-        {c:["Post row","media ids only","small hydration payload"]},
-        {c:["Media outage","isolated path","text feed survives"]}
+        {c:["Original ingest","~120 TB/day","object storage · 3-region replication"],hi:1,tag:"fixed"},
+        {c:["Viewer bytes","~900 TB/day raw","CDN absorbs ~95%"]},
+        {c:["Origin egress","~900 TB/day","~45 TB/day after CDN"],hi:1},
+        {c:["Media queue","256 partitions · retryable transcode jobs","parallel"]},
+        {c:["Post row","media ids only","small hydration payload"]}
       ]}]}}
   ]};
 byId['timeline-read-e2e'].name = "Read timeline (hit path)";

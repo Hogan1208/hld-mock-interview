@@ -642,15 +642,17 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
       edges:[["client","api","browse / buy"],["api","invdb","read / commit"]],
       narrate:"Draw the smallest correct design: the client asks the API, and the API reads or decrements a strongly-consistent inventory row for `(sku, fc)`. The core invariant is already present: subtract only if enough is available, so two buyers cannot both take the last unit.",
       details:[
-        {k:"win",label:"Why start here",text:"Oversell prevention lives in one atomic write. Everything later can be stale or replayed, but the decrement path must remain strongly consistent and durable."},
-        {k:"scale",label:"Working numbers",text:"~**100M SKUs** across ~**1,000 FCs**, ~**1M availability reads/s**, ~**10K reserve writes/s** steady, and a flash sale can push ~**100K/s** onto one SKU."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **10:00**, the **NovaPhone X drop** opens with **50K units** across three fulfillment centers. Browse traffic is **~1M availability reads/s**, and checkout attempts spike to **~100K/s** for one SKU. A naive app that reads `available=1` and then writes later lets two buyers see the last unit and both confirm. Even with one database, if reads and writes are separated from the conditional decrement, the launch produces oversells in the first seconds."},
+        {k:"fix",label:"The fix — walk the same case with the atomic counter",text:"Put the invariant inside the inventory store: `reserved = reserved + qty` only when `on_hand - reserved &ge; qty`. During the NovaPhone drop, the last unit is won by exactly one transaction; all racing buyers get **0 rows updated** and a clean out-of-stock response. The baseline is correct for one hot row, but it has not yet solved payment delays, abandoned carts or the **1M/s** read firehose."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Inventory store baseline**: strongly consistent Postgres/CockroachDB shard with **1 write leader + 2 synchronous replicas** across AZs, quorum **2 of 3**. The row set is modest: a few hundred million `(sku, fc)` rows at a few hundred bytes each is tens to low hundreds of GB. The ceiling is hot-row writes: one NovaPhone row cannot truly process **100K conditional updates/s** forever, but the atomic statement is the only safe primitive; later stages reduce unnecessary writes and protect reads."},
         {k:"query",label:"The invariant",code:"UPDATE inventory\n   SET reserved = reserved + :qty\n WHERE sku_id=:sku AND fc_id=:fc\n   AND on_hand - reserved >= :qty;\n-- rows affected = 1 means held; 0 means out of stock"}
       ],
       snap:{title:"Load & capacity — Stage 0",cap:"Correct for one counter, but checkout, abandoned carts and read load are not solved yet.",
         tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Inventory DB","1 leader + 2 sync replicas · quorum 2/3","no oversell + N+1"],hi:1,tag:"safe"},
           {c:["Availability reads","~1M /s","not offloaded"],hi:1,tag:"risk"},
           {c:["Reserve writes","~10K /s steady","source of truth"]},
-          {c:["Flash-sale SKU","~100K /s","hot-row risk"]},
+          {c:["Flash-sale SKU","~100K /s","hot-row risk"],hi:1},
           {c:["No-oversell guard","conditional update","correct"],hi:1}
         ]}]}},
     {node:"holds",stage:"Stage 1 · Reservation holds",title:"Checkout cannot be a long transaction &rarr; create holds",
@@ -658,33 +660,35 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
       edges:[["client","api","browse / buy"],["api","holds","reserve"],["holds","invdb","atomic decrement"]],
       narrate:"The first upgrade is not raw QPS; it is checkout shape. A customer can take minutes to pay. Holding a DB lock during that time would serialize everyone behind one slow checkout on a hot SKU.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Reserve traffic is ~**10K/s** steady and can spike to **100K/s** on a flash-sale SKU. Lock time must be milliseconds, not payment-duration."},
-        {k:"pain",label:"What breaks without it",text:"A book-and-pay transaction holds the inventory row while the user or payment processor stalls for seconds or minutes. Hot SKU throughput collapses and buyers time out behind abandoned carts."},
-        {k:"fix",label:"The fix — time-limited hold",text:"Reserve does the atomic decrement plus a reservation row in one short transaction, then returns a reservation_id. Commit after payment flips held&rarr;committed; release flips held&rarr;released."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **10:00:03**, NovaPhone has **1 unit left** in FC-7. A buyer enters card details, the bank challenges with 3-D Secure, and the shopper takes **42s**. If checkout keeps the inventory row locked while payment runs, every other NovaPhone buyer waits behind that one human. Hot-row throughput becomes **1 / 42s ≈ 0.024/s**, thousands of checkouts time out, and the site looks broken even though the no-oversell invariant is technically intact."},
+        {k:"fix",label:"The fix — walk the same case with time-limited holds",text:"Reserve is split from pay. The hold transaction performs the conditional decrement plus a reservation row and commits in **~5ms**; payment runs out of band. The same 42-second shopper now blocks the row for **5ms**, not 42s, so theoretical hot-row lease throughput is **~200/s** before admission control. After payment, commit flips `held&rarr;committed`; if the client retries with the same cart-line key, it gets the same reservation instead of a second hold."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Reservations table**: colocated with the inventory shard, same **1 leader + 2 sync replicas** so the hold row and count change commit atomically. Steady **10K reserves/s** across many SKUs is sharded by `sku_id`; the hot NovaPhone SKU still needs edge admission because physical stock is only **50K units**. Live holds: millions at **10–15 min TTL**; at 10K/s and 10 min, the upper bound is **~6M live holds**, only a few GB of rows."},
         {k:"key",label:"Idempotency",text:"A retry with the same cart-line idempotency key returns the same hold. It never creates a second reservation for one click."}
       ],
       snap:{title:"Load & capacity — Stage 1",cap:"The row lock is held for the decrement only; checkout latency leaves the write path.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Lock hold time","payment duration","single decrement txn"],hi:1,tag:"fixed"},
+          {c:["Hold store","none","reservations table on inventory shard · 3 replicas"],hi:1,tag:"fixed"},
+          {c:["Lock hold time","payment duration, e.g. 42s","~5ms decrement txn"],hi:1},
+          {c:["Hot-row throughput","~0.024/s in story","~200/s before admission"]},
           {c:["Reserve retry","could double-hold","same reservation_id"]},
-          {c:["Live holds","none","millions possible"]},
-          {c:["Hold TTL","not present","~10–15 min"]}
+          {c:["Live holds","none","~6M at 10K/s × 10 min"]}
         ]}]}},
     {node:"reaper",stage:"Stage 2 · Hold reaper",title:"Abandoned carts leak stock &rarr; expire and release holds",
       live:["client","api","invdb","holds","reaper"],
       edges:[["api","holds","reserve"],["holds","invdb","atomic decrement"],["reaper","holds","expire"]],
       narrate:"Once holds exist, every abandoned checkout is a potential phantom stock-out. The system needs a background path that turns expired leases back into available stock without racing real commits.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"With **millions of live holds** and expiries in the **thousands/s**, a delayed or missing reaper can make popular SKUs look sold out despite stock not being purchased."},
-        {k:"pain",label:"What breaks without it",text:"Reserved-but-never-bought units stay locked. A hot SKU can be functionally sold out because carts were abandoned, not because orders were placed."},
-        {k:"fix",label:"The fix — bounded expiry scan",text:"Index reservations by `(status, expires_at)`. Reaper scans due held rows every few seconds and performs an idempotent conditional release: held&rarr;released plus `reserved - qty`."},
+        {k:"pain",label:"What breaks — a concrete case",text:"By **10:08**, NovaPhone shows sold out, but payment data says only **31K** of **50K** held units have converted. The other **19K** are shoppers who closed the tab, failed 3-D Secure, or lost network. Without expiry, those units remain `reserved` forever; support sees angry customers while the warehouse still has boxes. At a **10-minute TTL**, expiries can arrive in the **thousands/s** right after the launch wave."},
+        {k:"fix",label:"The fix — walk the same case with bounded expiry scan",text:"Index reservations by `(status, expires_at)` and run reapers every few seconds. At **10:10**, due NovaPhone holds are released with a conditional flip `held&rarr;released` plus `reserved - qty`. If a payment commit wins first, the reaper sees `committed` and skips; if the reaper wins, commit fails cleanly and the customer retries. The **19K** abandoned units return to available instead of becoming phantom stock-outs."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Reaper tier**: 32 stateless workers scanning 256 time buckets in the reservations table, same RF3 inventory database. If **6M live holds** are spread over a **10-minute** TTL, average expiry is **~10K/s**; each worker handles **~313 releases/s**. The `(status, expires_at)` index makes scans due-only, not table-wide. N+1: 32 workers sized so losing 25% still clears **~10K/s** before the next bucket piles up."},
         {k:"gotcha",label:"Race with commit",text:"Commit and release are both conditional state flips. If commit wins first, reaper sees committed and skips; if reaper wins, commit fails cleanly and the customer must retry."}
       ],
       snap:{title:"Load & capacity — Stage 2",cap:"Holds are now leases, not leaks.",
         tables:[{name:"signals",cols:["signal","before","after"],rows:[
-          {c:["Abandoned checkout","stock stranded","released after TTL"],hi:1,tag:"fixed"},
-          {c:["Scan shape","table scan risk","status + expires_at index"]},
-          {c:["Expiry volume","1000s/s","partitioned sweep"]},
+          {c:["Expiry index","none","reservations(status, expires_at) on RF3 DB"],hi:1,tag:"fixed"},
+          {c:["Abandoned checkout","stock stranded","released after TTL"],hi:1},
+          {c:["Expiry volume","1000s/s to ~10K/s","32 reapers ≈ 313/s each"]},
+          {c:["Scan shape","table scan risk","256 due-time buckets"]},
           {c:["Commit race","double-release risk","conditional flip"]}
         ]}]}},
     {node:"cache",stage:"Stage 3 · Availability cache",title:"1M reads/s should not hit truth &rarr; cache availability",
@@ -692,15 +696,16 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
       edges:[["client","api","browse / buy"],["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["reaper","holds","expire"]],
       narrate:"The write path is safe, but product pages and search results outnumber checkouts by about 100:1. Availability is advisory, so it should be served from a derived cache while reserve still decrements the authoritative row.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Peak availability reads are ~**1M/s** versus ~**10K/s** reserves. Serving exact counts from the primary would let reads starve the only path that prevents oversell."},
-        {k:"pain",label:"What breaks without it",text:"Every product-page refresh hits the inventory store. Under browse traffic, the primary's CPU and connections are spent on stale-tolerant reads while real reserves wait."},
-        {k:"fix",label:"The fix — derived cache",text:"Cache a coarse per-SKU or per-region availability badge in Redis. Use request coalescing on miss and short TTLs or async refresh. A stale in-stock result can only lead to a clean reserve failure, not oversell."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **10:12**, influencers post the NovaPhone link and product pages generate **~1M availability reads/s**. If every page asks the inventory store for the exact count across FCs, read CPU and connection pools starve the same leader that must process reserve, commit and release writes. A stale-tolerant badge is now competing with the only path that prevents oversell; reserve p99 jumps from **~15ms** into seconds."},
+        {k:"fix",label:"The fix — walk the same case with derived Redis availability",text:"Cache a coarse `in_stock`, `low`, or `out` badge in **Redis**, refreshed by movement events and short TTLs. During the same NovaPhone storm, **~95%** of **1M reads/s** hit cache, so the store sees **~50K/s** misses or fills at most, protected by single-flight. If Redis says in stock one second after sellout, reserve still hits the primary and returns a clean 409; the cache can be optimistic, but it cannot oversell."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Availability cache**: Redis Cluster with **16 shards**, each primary + replica. Peak **1M reads/s ÷ 16 ≈ 62.5K/s/shard**, under a conservative **100K ops/s** per shard; losing one primary fails to its replica, and clients rebalance. Entry size is tiny: **100M SKUs × ~100B ≈ 10GB logical**, so memory is dominated by overhead but still fits with 16 shards. Store miss load after **95%** hit is **~50K/s**, coalesced per SKU."},
         {k:"gotcha",label:"Do not trust cache on reserve",text:"Reserve never decrements the cache. It always executes the conditional update in the store; the cache is a hint for browse UX."}
       ],
       snap:{title:"Load & capacity — Stage 3",cap:"Read pressure moves off the source of truth.",
         tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
-          {c:["Availability reads","~1M /s to store","mostly Redis"],hi:1,tag:"fixed"},
-          {c:["Read:write skew","~100:1","absorbed by cache"]},
+          {c:["Cache tier","none","Redis Cluster · 16 shards · primary + replica"],hi:1,tag:"fixed"},
+          {c:["Availability reads","~1M /s to store","~62.5K/s per Redis shard"],hi:1},
+          {c:["Store read miss","~1M/s","~50K/s at 95% hit + single-flight"]},
           {c:["Reserve path","primary contended by reads","primary reserved for writes"]},
           {c:["Staleness","not explicit","acceptable advisory"]}
         ]}]}},
@@ -709,15 +714,16 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
       edges:[["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["invdb","ledger","movement event"],["ledger","cache","CDC refresh"],["reaper","holds","expire"]],
       narrate:"Now there are derived views: cache, analytics, reconciliation. Updating the count and then separately updating those views is a dual write. Inventory needs one durable event for every movement, emitted with the count change.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Movement events run around **50–100K/s** across reserves, commits, releases and restocks. That is the natural fan-out stream for cache refresh and audit."},
-        {k:"pain",label:"What breaks without it",text:"A reserve can commit in the store and crash before the cache update, leaving product pages optimistic. Worse, audits cannot explain why physical stock and system count drifted."},
-        {k:"fix",label:"The fix — transactional outbox ledger",text:"Write the stock movement event in the same transaction as the count change, then relay it to a log partitioned by sku_id. Cache consumers are idempotent and write-if-newer by version."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **10:15**, the NovaPhone reserve transaction commits the last units in FC-12, then the API crashes before updating Redis. The store says out of stock, but the product page keeps showing in stock for that region. Separately, finance asks why FC-7 moved from **50K** to **31K committed + 19K released**, and there is no ordered movement history to reconcile against physical stock."},
+        {k:"fix",label:"The fix — walk the same case with a transactional outbox ledger",text:"Write a movement event in the same transaction as every reserve, commit, release and adjustment. A relay publishes events to Kafka partitioned by `sku_id`; cache consumers apply version-stamped updates with write-if-newer. After the NovaPhone crash, the relay resumes and publishes the already-committed outbox row, Redis flips to out-of-stock, and auditors can fold the ledger to reconstruct the count."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Ledger/outbox**: inventory DB outbox table plus Kafka topic with **64 partitions**, RF3. Movement volume **50–100K/s ÷ 64 ≈ 0.8–1.6K/s/partition**; partitions are chosen for per-SKU ordering and consumer parallelism, not byte volume. Events are small, ~hundreds of bytes, so Kafka throughput is easy. Cache consumers run one per partition group and update Redis idempotently by version."},
         {k:"note",label:"Reconciliation",text:"Folding the ledger reconstructs on_hand and reserved. If a cache consumer falls behind, it replays from its offset; the store remains the authority while it catches up."}
       ],
       snap:{title:"Load & capacity — Stage 4",cap:"Every mutation now has an ordered, replayable audit and cache-refresh event.",
         tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
-          {c:["DB↔cache drift","transactional outbox","no dual-write gap"],hi:1,tag:"fixed"},
-          {c:["Event rate","~50–100K /s","log by sku_id"]},
+          {c:["Ledger bus","Kafka · 64 partitions by sku_id · RF3","ordered + parallel"],hi:1,tag:"fixed"},
+          {c:["DB↔cache drift","transactional outbox","no dual-write gap"],hi:1},
+          {c:["Event rate","~50–100K /s","~0.8–1.6K/s/partition"]},
           {c:["Cache refresh","CDC consumer","sub-second to few s"]},
           {c:["Audit","append-only ledger","reconstructable"]}
         ]}]}},
@@ -726,19 +732,20 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
       edges:[["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["invdb","ledger","movement event"],["ledger","cache","CDC refresh"],["reaper","holds","expire"],["replenish","invdb","restock / adjust"]],
       narrate:"A commerce inventory system is not only checkout decrements. Trucks arrive, returns happen, units are damaged, and cycle counts correct reality. Inbound stock must use the same idempotent, auditable path as checkout so it cannot inflate counts or race live reserves.",
       details:[
-        {k:"scale",label:"The number that forces it",text:"Receipts are bursty by fulfillment center: a truckload may add thousands of units at once, while live reserves continue. The write path must compose increments and decrements safely."},
-        {k:"pain",label:"What breaks without it",text:"A duplicate receipt message can double-add stock, and a blind absolute count can erase concurrent reserves. Either bug creates oversell or dead inventory that takes days to reconcile."},
-        {k:"fix",label:"The fix — idempotent signed movements",text:"Apply receipts and adjustments as signed deltas keyed by receipt_id or adjustment_id, in the inventory store transaction, with a matching ledger event. Batch per `(sku, fc)` so large inbound loads are a few big increments."},
+        {k:"pain",label:"What breaks — a concrete case",text:"At **14:00**, a truck delivers **12K more NovaPhones** to FC-7 while backorders and live reserves continue. The warehouse scanner retries the same receipt message three times after a Wi-Fi drop. If replenishment blindly sets `on_hand=12000` or applies duplicate increments, the system either erases concurrent reservations or adds **36K** units that do not exist. Either bug becomes oversell later, when customers buy phantom stock."},
+        {k:"fix",label:"The fix — walk the same case with idempotent signed movements",text:"Treat receipts, returns, damage and cycle counts as signed movements with an idempotency key such as `receipt_id`. The FC-7 truck applies one `+12000` delta in the same inventory transaction that writes the ledger event; the two retry messages return already-applied. Concurrent reserves compose because they are deltas on the same strongly consistent row, not blind overwrites. Cache refresh comes from the same ordered ledger stream."},
+        {k:"host",label:"Load & capacity — what runs it",text:"**Replenishment path**: same inventory DB shards and Kafka ledger, plus a durable intake table keyed by `receipt_id`, RF3. A truckload is batched by `(sku, fc)`, so **12K units** become one or a few delta writes, not 12K row updates. If 1,000 FCs each receive bursts, shard by `sku_id` and `fc_id` keeps writes local; the ledger's **64 partitions** preserve per-SKU ordering so cache and audit see receipts after prior holds for that SKU."},
         {k:"gotcha",label:"Never silent overwrite",text:"Cycle-count corrections should write a reasoned adjustment event, not set the row to a magic number. The discrepancy must remain auditable."}
       ],
       snap:{title:"Load & capacity — Stage 5 (full design)",cap:"The complete design protects decrements, reclaims holds, offloads reads, fans out changes and admits new stock safely.",
         tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Inbound intake","receipt_id table on RF3 inventory DB","idempotent"]},
+          {c:["Truckload burst","batch by (sku, fc)","12K units ⇒ few writes"],hi:1},
           {c:["Inbound duplicate","receipt_id idempotency","no double-add"],hi:1,tag:"fixed"},
-          {c:["Cycle count","signed adjustment","auditable"]},
-          {c:["Concurrent reserves","atomic delta","composes safely"],hi:1},
-          {c:["Cache update","same ledger stream","eventual convergence"]}
+          {c:["Concurrent reserves","atomic signed delta","composes safely"],hi:1},
+          {c:["Cache update","same Kafka ledger · 64 partitions","eventual convergence"]}
         ]}]}},
-  ]};
+  ]}
 d.deepFlows=[scaling].concat(d.deepFlows);
 })();
 
