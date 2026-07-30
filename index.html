@@ -340,6 +340,19 @@
   .wt-ask .out .qa .q{display:flex;gap:7px;align-items:flex-start;font-size:12px;font-weight:600;color:#e9dcff;background:#1a1430;border:1px solid #3a2d63;border-radius:8px;padding:7px 10px;margin-bottom:9px}
   .wt-ask .out .qa .q i{color:#c9a6ff;font-size:14px;margin-top:1px;flex:none}
   .wt-ask .out .qa .a{color:#cdd8e3}
+  /* Ask-ChatGPT redirect button + confirmation toast */
+  .gpt-btn{background:#0e1a15;border:1px solid #2a7d5f;color:#4fe3a1;border-radius:8px;padding:8px 13px;cursor:pointer;font-weight:600;font-size:12.5px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;font-family:inherit;transition:background .15s,border-color .15s}
+  .gpt-btn:hover{background:#123024;border-color:#4fe3a1}
+  .gpt-btn i{font-size:15px;color:#4fe3a1}
+  .wt-ask .gpt-btn{background:#0e1a15;border:1px solid #2a7d5f;color:#4fe3a1}
+  .wt-ask .gpt-btn:hover{background:#123024;border-color:#4fe3a1}
+  .wt-ask .row2{display:flex;align-items:center;gap:10px;margin-top:8px}
+  .wt-ask .gpt-hint{font-size:10.5px;color:var(--muted);line-height:1.4}
+  .dd-gate .gpt-btn{align-self:stretch}
+  .cgpt-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(10px);z-index:4000;max-width:min(560px,92vw);background:#0d1512;border:1px solid #2a7d5f;color:#dbe7e1;border-radius:12px;padding:12px 15px;font-size:12.5px;line-height:1.55;box-shadow:0 18px 44px rgba(0,0,0,.55);display:flex;gap:11px;align-items:flex-start;opacity:0;transition:opacity .25s ease,transform .3s cubic-bezier(.2,.9,.2,1);pointer-events:none}
+  .cgpt-toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .cgpt-toast>i{color:#4fe3a1;font-size:18px;flex:none;margin-top:1px}
+  .cgpt-toast b{color:#fff}
 
   .transcript{padding:16px;max-height:74vh;overflow-y:auto;scroll-behavior:smooth}
   .bubble{margin-bottom:16px;animation:fade .35s ease}
@@ -803,6 +816,7 @@ function wtRender(){
           <div class="wt-ask">
             <div class="lbl"><i class="ti ti-help-circle"></i> Stuck on this step? <b>Ask a doubt</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live':'<i class="ti ti-book"></i> offline'}</span> — ask as many follow-ups as you need; each is grounded on exactly what's on screen now.</div>
             <div class="row"><textarea id="wtAskText" placeholder="e.g. why 3 read replicas here and not 2? what exactly overflows first?"></textarea><button id="wtAskGo">Ask &#8599;</button></div>
+            <div class="row2"><button id="wtAskGPT" class="gpt-btn"><i class="ti ti-brand-openai"></i> Ask ChatGPT</button><span class="gpt-hint">Opens ChatGPT (your logged-in tab) with your question + the full design &amp; this exact step attached.</span></div>
             <div id="wtAskOut" class="out"></div>
           </div>
         </div>
@@ -842,6 +856,7 @@ function wtRender(){
       aiAnswer(qText, studyCtx('the "'+f.name+'" scaling journey', convo)).then(function(txt){ aEl.innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> live answer</div>'+mdToHtml(txt); thread.push({q:qText,a:txt}); }).catch(function(){ var lt=localAnswer('system', qText); aEl.innerHTML=lt; thread.push({q:qText,a:stripTags(lt)}); }); };
     wg.onclick=run;
     ta.addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') run(); });
+    var wgpt=document.getElementById('wtAskGPT'); if(wgpt){ wgpt.onclick=function(){ askChatGPT((ta.value||'').trim(), 'the \u201c'+f.name+'\u201d scaling journey \u2014 stage: '+stripTags(step.title||''), stepCtx); }; }
   })();
   if(fromId&&activeId&&fromId!==activeId) setTimeout(()=>wtPulse(fromId,activeId),260);
 }
@@ -1054,8 +1069,8 @@ function addReveal(names){ const t=document.getElementById('transcript'); const 
 function addResources(list){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='res'; const links=list.map(r=>{let host='';try{host=new URL(r.url).hostname.replace('www.','');}catch(e){} return `<a href="${r.url}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:14px"></i><span>${r.title}<br><span class="d">${host}</span></span></a>`;}).join(''); d.innerHTML=`<div class="rh"><i class="ti ti-book"></i>Resources &amp; further reading</div>${links}`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
 
 /* ---------------- live ask (answered in-app by Claude in the background) ---------------- */
-function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live answers on':'<i class="ti ti-book"></i> offline notes'}</span><br>Answered in depth on the fly. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
-function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(go){ go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); } const q=document.getElementById('quizGo'); if(q) q.onclick=()=>quizMe(scopeId); }
+function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live answers on':'<i class="ti ti-book"></i> offline notes'}</span><br>Answered in depth on the fly. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center"><button class="gpt-btn" id="gptGo"><i class="ti ti-brand-openai"></i> Ask ChatGPT</button><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
+function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(go){ go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); } const q=document.getElementById('quizGo'); if(q) q.onclick=()=>quizMe(scopeId); const g=document.getElementById('gptGo'); if(g) g.onclick=()=>askChatGPTScope(scopeId); }
 /* ---------------- local answer engine (offline; synthesized from each problem's curated study data) ---------------- */
 const ASK_STOP=new Set("the a an and or of to in on for with is are be as at by from it its this that these those you your we our they their how what why when which who where do does did can could should would will if then else than so not no into over under about across via per vs versus use used using here there them then also more most much many few some any".split(" "));
 function askToks(s){ return String(s||"").toLowerCase().replace(/<[^>]+>/g," ").replace(/[^a-z0-9]+/g," ").split(" ").filter(function(w){return w.length>2 && !ASK_STOP.has(w);}); }
@@ -1176,6 +1191,62 @@ function studyCtx(scopeName,extra){
   if(extra) s+='\n'+extra;
   return s;
 }
+/* ---- "Ask ChatGPT" redirect: full design context + on-screen context + question ---- */
+function designContext(){
+  var p=DATA[state.prob]; if(!p) return '';
+  var nm=function(id){ var n=(p.nodes||[]).find(function(x){return x.id===id;}); return n?n.name:id; };
+  var L=[];
+  L.push('=== SYSTEM DESIGN PROBLEM ===');
+  L.push('Title: '+stripTags(p.title||state.prob));
+  if(p.cat) L.push('Theme: '+stripTags(p.cat));
+  if(p.blurb) L.push('One-liner: '+stripTags(p.blurb));
+  if(p.prompt) L.push('\nInterviewer framing:\n'+stripTags(p.prompt));
+  var r=p.requirements||{};
+  if(r.functional&&r.functional.length){ L.push('\nFunctional requirements:'); r.functional.forEach(function(x,i){ L.push('  '+(i+1)+'. '+stripTags(x)); }); }
+  if(r.nonFunctional&&r.nonFunctional.length){ L.push('\nNon-functional requirements:'); r.nonFunctional.forEach(function(x,i){ L.push('  '+(i+1)+'. '+stripTags(x)); }); }
+  if(p.nodes&&p.nodes.length){ L.push('\nArchitecture components:'); p.nodes.forEach(function(n){ L.push('  - '+n.name+(n.sub?' \u2014 '+stripTags(n.sub):'')); }); }
+  if(p.edges&&p.edges.length){ L.push('\nData flow (A \u2192 B: what travels):'); p.edges.forEach(function(e){ L.push('  '+nm(e[0])+' \u2192 '+nm(e[1])+(e[2]?': '+stripTags(e[2]):'')); }); }
+  var board=(p.nodes||[]).filter(function(n){return state.revealed.has(n.id);}).map(function(n){return n.name;}).join(', ');
+  L.push('\nInterview difficulty: '+(state.diff||'n/a')+'. Components currently placed on the board: '+(board||'(none yet)')+'.');
+  return L.join('\n');
+}
+function buildAskPrompt(question, scopeName, scopeCtx){
+  var P=[];
+  P.push('You are a senior/staff software engineer acting as my system-design interviewer and study partner. I am practising this problem in a mock-interview tool. Answer my question in depth and specific to THIS design (not generic): give concrete numbers, a worked example, the key trade-offs, the failure modes, and anything a strong senior candidate would be expected to add. If my question is vague, state your assumptions and answer the most useful version.');
+  P.push('\n'+designContext());
+  if(scopeName) P.push('\nRight now I am focused on: '+scopeName+'.');
+  if(scopeCtx) P.push('\nExactly what is on my screen right now:\n'+scopeCtx);
+  P.push('\n=== MY QUESTION ===\n'+question);
+  return P.join('\n');
+}
+function cgptToast(html){
+  var ex=document.getElementById('cgptToast'); if(ex)ex.remove();
+  var d=document.createElement('div'); d.className='cgpt-toast'; d.id='cgptToast';
+  d.innerHTML='<i class="ti ti-brand-openai"></i><div>'+html+'</div>';
+  document.body.appendChild(d);
+  requestAnimationFrame(function(){ d.classList.add('on'); });
+  setTimeout(function(){ d.classList.remove('on'); setTimeout(function(){ if(d.parentNode)d.remove(); },320); }, 6500);
+}
+function openChatGPT(prompt){
+  var copied=false;
+  try{ if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(prompt); copied=true; } }catch(e){}
+  var w=window.open('https://chatgpt.com/?q='+encodeURIComponent(prompt),'_blank');
+  if(!w){ cgptToast('<b>Popup blocked.</b> I copied your question + the full design context to the clipboard \u2014 open ChatGPT and paste (\u2318/Ctrl+V).'); return; }
+  cgptToast('<b>Opened ChatGPT</b> in a new tab with your question plus the full design &amp; on-screen context'+(copied?'. Also copied to your clipboard \u2014 if it didn\u2019t prefill, just paste (\u2318/Ctrl+V).':'.'));
+}
+function askChatGPT(question, scopeName, scopeCtx){
+  question=(question||'').trim();
+  if(!question){ cgptToast('<b>Type your question first,</b> then press Ask ChatGPT \u2014 I\u2019ll send it with the full design context attached.'); return false; }
+  openChatGPT(buildAskPrompt(question, scopeName, scopeCtx)); return true;
+}
+function askChatGPTScope(scopeId){
+  var ta=document.getElementById('askText'); var v=ta?(ta.value||'').trim():'';
+  var p=DATA[state.prob];
+  var scopeName = scopeId==='system' ? ('the overall system for \u201c'+stripTags(p.title||state.prob)+'\u201d') : ('the \u201c'+((p.nodes.find(function(n){return n.id===scopeId;})||{}).name||scopeId)+'\u201d component');
+  var extra='';
+  if(scopeId!=='system'){ var dd=(p.deepDive||{})[scopeId]; if(dd&&dd.role) extra='What this component does in this design: '+stripTags(dd.role); }
+  return askChatGPT(v, scopeName, extra);
+}
 /* Create a live "Tutor" answer bubble and fill it: LLM-first, offline fallback. */
 function answerBubble(scopeId,question,ctx){
   var t=document.getElementById('transcript'); if(t.querySelector('.empty-t'))t.innerHTML='';
@@ -1196,13 +1267,14 @@ function ddGate(opts){
   var d=document.createElement('div'); d.className='dd-gate'; d.id='ddgate';
   var btns=(opts.buttons||[]).map(function(bn,idx){ return '<button class="'+(bn.cls||'')+'" data-b="'+idx+'">'+bn.label+'</button>'; }).join('');
   d.innerHTML='<div class="q">'+opts.prompt+'</div>'
-    +'<div class="row"><textarea id="ddText" placeholder="'+(opts.placeholder||'Type your doubt...')+'"></textarea><button class="go" id="ddAsk">Ask &#8599;</button></div>'
+    +'<div class="row"><textarea id="ddText" placeholder="'+(opts.placeholder||'Type your doubt...')+'"></textarea><button class="go" id="ddAsk">Ask &#8599;</button>'+(opts.onGPT?'<button class="gpt-btn" id="ddGPT" title="Send to your logged-in ChatGPT with full context"><i class="ti ti-brand-openai"></i> ChatGPT</button>':'')+'</div>'
     +'<div class="btns">'+btns+'</div>';
   t.appendChild(d); t.scrollTop=t.scrollHeight;
   var ta=d.querySelector('#ddText');
   var fire=function(){ var v=(ta.value||'').trim(); if(!v)return; ta.value=''; addBubble('you','<span style="color:var(--muted);font-size:11px">[your doubt]</span><br>'+v); opts.onAsk(v); };
   d.querySelector('#ddAsk').onclick=fire;
   ta.addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') fire(); });
+  if(opts.onGPT){ var gp=d.querySelector('#ddGPT'); if(gp) gp.onclick=function(){ opts.onGPT((ta.value||'').trim()); }; }
   (opts.buttons||[]).forEach(function(bn,idx){ d.querySelector('[data-b="'+idx+'"]').onclick=function(){ removeGate(); bn.fn(); }; });
 }
 function removeGate(){ var e=document.getElementById('ddgate'); if(e)e.remove(); }
@@ -1230,6 +1302,7 @@ function runInteractive(cfg){
       prompt:'<i class="ti ti-help-hexagon"></i> Before the answer &mdash; <b>anything unclear about the question itself?</b> Ask and I&rsquo;ll clarify what&rsquo;s being tested. When you&rsquo;re ready, reveal how a strong senior candidate would answer.',
       placeholder:'e.g. what exactly do they mean by "consistency" here?',
       onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'The interviewer just asked:\n"'+stripTags(cfg.questionText)+'"\nThe learner has a doubt about what the QUESTION is asking (scope, terms, what a strong answer must cover). Clarify the question itself; do not yet hand them the full design answer.')); },
+      onGPT:function(v){ askChatGPT(v||stripTags(cfg.questionText), cfg.scopeName, 'This is the interview question I was asked:\n"'+stripTags(cfg.questionText)+'"\n'+(v?'My specific doubt is in the question above \u2014 first clarify what the question is really testing, then give the full senior-level answer.':'Explain what this question is really testing, then give the complete answer a strong senior/staff candidate would give.')); },
       buttons:[{label:'Reveal the answer &rarr;',cls:'prim',fn:revealAnswer}]
     });
   },300);
@@ -1251,6 +1324,7 @@ function runInteractive(cfg){
       prompt:'<i class="ti ti-messages"></i> <b>What didn&rsquo;t land?</b> Ask a follow-up about the answer and I&rsquo;ll go deeper &mdash; or test yourself with a quick quiz on exactly this.',
       placeholder:'e.g. why async replication and not sync here?',
       onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'Question:\n"'+stripTags(cfg.questionText)+'"\nReference answer given:\n"'+stripTags(cfg.answerText)+'"\nThe learner is asking a follow-up about this answer. Go deeper with concrete detail and numbers.')); },
+      onGPT:function(v){ askChatGPT(v||'Go deeper than this answer.', cfg.scopeName, 'Interview question:\n"'+stripTags(cfg.questionText)+'"\nA reference answer I was given:\n"'+stripTags(cfg.answerText)+'"\n'+(v?'My follow-up is in the question above \u2014 go deeper with concrete detail, numbers, trade-offs and failure modes.':'Critique this answer and go deeper with concrete numbers, trade-offs, and failure modes a senior candidate should cover.')); },
       buttons:[{label:'<i class="ti ti-help-circle"></i> Quiz me on this &rarr;',cls:'prim',fn:runQuiz},{label:'Done &check;',cls:'ghost',fn:finish}]
     });
   }
@@ -1282,6 +1356,7 @@ function runInteractive(cfg){
       prompt:'<i class="ti ti-circle-check"></i> Nice. Ask one more follow-up, try another angle, or wrap up this thread.',
       placeholder:'e.g. how would this change at 10x the traffic?',
       onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'Question:\n"'+stripTags(cfg.questionText)+'"\nAnswer:\n"'+stripTags(cfg.answerText)+'"\nLearner follow-up after the quiz. Go deep.')); },
+      onGPT:function(v){ askChatGPT(v||'Push this further \u2014 what would a staff-level answer add?', cfg.scopeName, 'Interview question:\n"'+stripTags(cfg.questionText)+'"\nReference answer:\n"'+stripTags(cfg.answerText)+'"\nGo deep with concrete detail and numbers.'); },
       buttons:[{label:'Another quiz &#8635;',cls:'',fn:runQuiz},{label:'Done &check;',cls:'prim',fn:finish}]
     });
   }
