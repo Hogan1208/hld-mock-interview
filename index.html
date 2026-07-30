@@ -305,6 +305,35 @@
   .askbox textarea:focus{outline:none;border-color:var(--accent)}
   .askbox .go{background:var(--accent2);border:none;color:#fff;border-radius:8px;padding:0 14px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap}
   .askbox .go:hover{background:#6a4ce0}.askbox .go:disabled{opacity:.5;cursor:not-allowed}
+  .ask-live{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:var(--muted);background:#161b24;border:1px solid var(--line);border-radius:20px;padding:1px 8px;vertical-align:middle}
+  .ask-live.on{color:#c9a6ff;background:#1a1430;border-color:#3a2d63}
+  .ask-live i{font-size:12px}
+  .ai-tag{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:#c9a6ff;background:#1a1430;border:1px solid #3a2d63;border-radius:20px;padding:2px 8px;margin-bottom:8px}
+  .ai-tag i{font-size:12px}
+  .dd-gate{margin:2px 0 18px;border:1px solid var(--accent2);border-radius:12px;padding:13px 14px;background:linear-gradient(180deg,#161226,#111019);animation:fade .35s ease}
+  .dd-gate .q{font-size:12.5px;color:#cdbef2;line-height:1.58;margin-bottom:10px}
+  .dd-gate .q b{color:#fff}.dd-gate .q i{color:var(--accent2);margin-right:3px}
+  .dd-gate .row{display:flex;gap:8px}
+  .dd-gate textarea{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 11px;font-size:13px;min-height:40px;font-family:inherit;resize:vertical}
+  .dd-gate textarea:focus{outline:none;border-color:var(--accent)}
+  .dd-gate .go{background:var(--accent2);border:none;color:#fff;border-radius:8px;padding:0 15px;cursor:pointer;font-weight:600;white-space:nowrap}
+  .dd-gate .go:hover{background:#6a4ce0}
+  .dd-gate .btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .dd-gate .btns button{border-radius:8px;padding:8px 14px;font-size:12.5px;font-weight:600;cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--text);display:inline-flex;align-items:center;gap:6px}
+  .dd-gate .btns button:hover{border-color:var(--accent)}
+  .dd-gate .btns .prim{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  .dd-gate .btns .prim:hover{background:#6a4ce0}
+  .dd-gate .btns .ghost{background:none;color:var(--muted)}
+  .wt-ask{margin-top:16px;border:1px solid var(--line);border-radius:10px;padding:11px 12px;background:#0f141c}
+  .wt-ask .lbl{font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:8px}.wt-ask .lbl b{color:#d3dde7}.wt-ask .lbl>i{color:var(--accent2);margin-right:4px}
+  .wt-ask .row{display:flex;gap:7px}
+  .wt-ask textarea{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;font-size:12.5px;min-height:34px;font-family:inherit;resize:vertical}
+  .wt-ask textarea:focus{outline:none;border-color:var(--accent)}
+  .wt-ask button{background:var(--accent2);border:none;color:#fff;border-radius:8px;padding:0 13px;cursor:pointer;font-weight:600;font-size:12.5px;white-space:nowrap}
+  .wt-ask button:hover{background:#6a4ce0}
+  .wt-ask .out{display:none;margin-top:11px;font-size:12.5px;line-height:1.62;color:#cdd8e3;border-top:1px solid var(--line);padding-top:11px}
+  .wt-ask .out strong{color:#fff}.wt-ask .out code{background:#0e1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:11.5px;color:#b8c7d6}
+  .wt-ask .out .typing{display:flex;gap:4px}
 
   .transcript{padding:16px;max-height:74vh;overflow-y:auto;scroll-behavior:smooth}
   .bubble{margin-bottom:16px;animation:fade .35s ease}
@@ -765,6 +794,11 @@ function wtRender(){
           <div class="wt-narr">${wtInline(step.narrate||'')}</div>
           ${cards}
           ${step.snap?wtStateHTML(step.snap):''}
+          <div class="wt-ask">
+            <div class="lbl"><i class="ti ti-help-circle"></i> Stuck on this step? <b>Ask a doubt</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live':'<i class="ti ti-book"></i> offline'}</span> — grounded on exactly what's on screen now.</div>
+            <div class="row"><textarea id="wtAskText" placeholder="e.g. why 3 read replicas here and not 2? what exactly overflows first?"></textarea><button id="wtAskGo">Ask &#8599;</button></div>
+            <div id="wtAskOut" class="out"></div>
+          </div>
         </div>
         <div class="wt-nav">
           <button id="wtprev" ${i===0?'disabled':''}><i class="ti ti-chevron-left"></i> Prev</button>
@@ -783,6 +817,16 @@ function wtRender(){
   document.getElementById('wtplay').onclick=wtPlayToggle;
   ov.querySelectorAll('.wt-dots .dot').forEach(el=>el.onclick=()=>{ wtStopPlay(); wtJump(parseInt(el.dataset.k)); });
   ov.querySelectorAll('#wtdiagram .node').forEach(el=>el.onclick=()=>{ const idx=f.steps.findIndex(s=>(s.node||s.to)===el.dataset.node); if(idx>=0){ wtStopPlay(); wtJump(idx);} });
+  (function(){
+    var wg=document.getElementById('wtAskGo'); if(!wg)return;
+    var stepCtx='Scaling-journey step: "'+(step.title||'')+'"'+(step.stage?' ('+stripTags(step.stage)+')':'')+'.\n'+stripTags(step.narrate||'');
+    (step.details||[]).forEach(function(d){ stepCtx+='\n- '+(d.label||d.k||'note')+': '+stripTags(d.text||d.code||''); });
+    if(step.snap){ if(step.snap.cap) stepCtx+='\nState note: '+stripTags(step.snap.cap); (step.snap.tables||[]).forEach(function(tb){ stepCtx+='\nTable '+tb.name+(tb.note?' ('+stripTags(tb.note)+')':'')+'.'; }); (step.snap.queues||[]).forEach(function(q){ stepCtx+='\nQueue '+q.name+' ('+(q.kind||'kafka')+').'; }); }
+    var run=function(){ var ta=document.getElementById('wtAskText'); var v=(ta.value||'').trim(); if(!v)return; var out=document.getElementById('wtAskOut'); out.style.display='block'; out.innerHTML='<div class="typing"><span></span><span></span><span></span></div>';
+      aiAnswer(v, studyCtx('the "'+f.name+'" scaling journey', stepCtx)).then(function(txt){ out.innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> live answer</div>'+mdToHtml(txt); }).catch(function(){ out.innerHTML=localAnswer('system', v); }); };
+    wg.onclick=run;
+    document.getElementById('wtAskText').addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') run(); });
+  })();
   if(fromId&&activeId&&fromId!==activeId) setTimeout(()=>wtPulse(fromId,activeId),260);
 }
 document.addEventListener('keydown',(e)=>{
@@ -965,8 +1009,24 @@ function playTurns(item, tagLabel, after){
   step();
 }
 function playReqStep(i){ const p=DATA[state.prob], s=p.reqBuild[i]; state.reqDone[i]=true; playTurns(s, `[requirement ${i+1}]`); }
-function playDive(i){ const p=DATA[state.prob], s=p.systemDives[i]; state.diveDone[i]=true; playTurns(s, `[system deep dive · ${s.tag||''}]`); }
-function playThread(nid,idx){ const p=DATA[state.prob], item=p.q[nid][idx]; state.asked[nid+':'+idx]=true; state.answeredCount[nid]=(state.answeredCount[nid]||0)+1; const node=p.nodes.find(n=>n.id===nid); playTurns(item, `[${node.name} · ${item.tag||'concept'} · ${item.l}]`, ()=>appendQuizPrompt(nid, item)); }
+function playDive(i){ const p=DATA[state.prob], s=p.systemDives[i];
+  runInteractive({
+    scopeId:'system', scopeName:'the overall system for '+(p.title||''),
+    tagLabel:'[system deep dive &middot; '+(s.tag||'')+(s.title?' &middot; '+stripTags(s.title):'')+']',
+    questionText: questionOf(s), answerText: collapseAnswer(s),
+    reveal:s.reveal, resources:s.resources, quiz:s.quiz,
+    onDone:function(){ state.diveDone[i]=true; }
+  });
+}
+function playThread(nid,idx){ const p=DATA[state.prob], item=p.q[nid][idx], node=p.nodes.find(n=>n.id===nid);
+  runInteractive({
+    scopeId:nid, scopeName:node.name,
+    tagLabel:'['+node.name+' &middot; '+(item.tag||'concept')+' &middot; '+item.l+']',
+    questionText: questionOf(item), answerText: collapseAnswer(item),
+    reveal:item.reveal, resources:item.resources, quiz:item.quiz,
+    onDone:function(){ state.asked[nid+':'+idx]=true; state.answeredCount[nid]=(state.answeredCount[nid]||0)+1; }
+  });
+}
 
 let typingEl=null;
 function showTyping(who){ const t=document.getElementById('transcript'); typingEl=document.createElement('div'); typingEl.className=`bubble ${who}`; typingEl.innerHTML=`<div class="who"><span class="av">${who==='intv'?'I':'C'}</span>${who==='intv'?'Interviewer':'Candidate'}</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>`; t.appendChild(typingEl); t.scrollTop=t.scrollHeight; }
@@ -976,7 +1036,7 @@ function addReveal(names){ const t=document.getElementById('transcript'); const 
 function addResources(list){ const t=document.getElementById('transcript'); const d=document.createElement('div'); d.className='res'; const links=list.map(r=>{let host='';try{host=new URL(r.url).hostname.replace('www.','');}catch(e){} return `<a href="${r.url}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:14px"></i><span>${r.title}<br><span class="d">${host}</span></span></a>`;}).join(''); d.innerHTML=`<div class="rh"><i class="ti ti-book"></i>Resources &amp; further reading</div>${links}`; t.appendChild(d); t.scrollTop=t.scrollHeight; }
 
 /* ---------------- live ask (answered in-app by Claude in the background) ---------------- */
-function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> — answered instantly from the study notes. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
+function askBoxHTML(scopeLabel,scopeId){ return `<div class="askbox"><label>Ask your own question about <b>${scopeLabel}</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live answers on':'<i class="ti ti-book"></i> offline notes'}</span><br>Answered in depth on the fly. Or <b>flip it</b>: let me quiz you and grade your answer.</label><div class="askrow"><textarea id="askText" placeholder="e.g. How would you handle a poison-pill event stuck in the pipeline?"></textarea><button class="go" id="askGo">Ask ↗</button></div><div style="margin-top:8px"><button class="quizme" id="quizGo" data-scope="${scopeId||'system'}"><i class="ti ti-help-circle"></i> Quiz me on ${scopeLabel} ↳</button></div></div>`; }
 function wireAsk(scopeId){ const go=document.getElementById('askGo'); if(go){ go.onclick=()=>submitAsk(scopeId); const ta=document.getElementById('askText'); if(ta) ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') submitAsk(scopeId); }); } const q=document.getElementById('quizGo'); if(q) q.onclick=()=>quizMe(scopeId); }
 /* ---------------- local answer engine (offline; synthesized from each problem's curated study data) ---------------- */
 const ASK_STOP=new Set("the a an and or of to in on for with is are be as at by from it its this that these those you your we our they their how what why when which who where do does did can could should would will if then else than so not no into over under about across via per vs versus use used using here there them then also more most much many few some any".split(" "));
@@ -1030,17 +1090,10 @@ function localGrade(model,user){ var mt=askToks(model); var uset={}; askToks(use
 function submitAsk(scopeId){
   var ta=document.getElementById("askText"); var txt=(ta.value||"").trim(); if(!txt)return;
   var p=DATA[state.prob];
-  var scopeName= scopeId==="system" ? "the overall system" : ((p.nodes.find(function(n){return n.id===scopeId;})||{}).name||scopeId);
-  var id="q_"+Date.now()+"_"+Math.random().toString(36).slice(2,7);
+  var scopeName= scopeId==="system" ? ("the overall system for "+(p.title||'')) : ((p.nodes.find(function(n){return n.id===scopeId;})||{}).name||scopeId);
   addBubble("you","<span style=\"color:var(--muted);font-size:11px\">[your question &middot; "+scopeName+"]</span><br>"+txt);
-  var t=document.getElementById("transcript"); var live=document.createElement("div"); live.className="bubble cand live"; live.id="live-"+id;
-  live.innerHTML="<div class=\"who\"><span class=\"av\">C</span>Candidate</div><div class=\"body\"><div class=\"typing\"><span></span><span></span><span></span></div></div>";
-  t.appendChild(live); t.scrollTop=t.scrollHeight; ta.value="";
-  var revealed=p.nodes.filter(function(n){return state.revealed.has(n.id);}).map(function(n){return n.name;}).join(", ");
-  var ctx="Problem \""+p.title+"\". Focus "+scopeName+". Board: "+revealed+". Difficulty "+state.diff+".";
-  try{ fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id,q:txt,ctx:ctx})}).catch(function(){}); }catch(e){}
-  var ans=localAnswer(scopeId,txt);
-  setTimeout(function(){ var el=document.getElementById("live-"+id); if(el){ el.querySelector(".body").innerHTML=ans; el.classList.remove("live"); document.getElementById("transcript").scrollTop=1e9; } },500);
+  ta.value="";
+  answerBubble(scopeId, txt, studyCtx(scopeName));
 }
 function pollAnswer(id,tries){
   if(tries>90){ const el=document.getElementById('live-'+id); if(el)el.querySelector('.body').innerHTML="<em>Still thinking — the answer will appear here shortly. (If it doesn't, Claude may not be actively watching this session.)</em>"; return; }
@@ -1072,6 +1125,151 @@ function renderAnswerBox(onSubmit){
   ta.addEventListener('keydown',e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') onSubmit(); });
 }
 function removeAnswerBox(){ const e=document.getElementById('answerbox'); if(e)e.remove(); }
+
+/* ==================================================================
+   LIVE DEEP ANSWERS + INTERACTIVE DEEP-DIVE FLOW
+   Ask boxes are answered by a real LLM through the local server
+   (POST /answer), with the offline study-notes engine as a fallback
+   when no key is set. Deep dives run an interactive, gated flow:
+   question -> clear doubts about the question -> reveal the detailed
+   answer -> follow-ups on the answer -> a quiz scoped to THIS Q&A.
+   ================================================================== */
+function probeLLM(){ fetch('/llm-status').then(function(r){return r.json();}).then(function(m){ state._llm=!!(m&&m.enabled); updateLiveBadge(); }).catch(function(){ state._llm=false; updateLiveBadge(); }); }
+function updateLiveBadge(){ document.querySelectorAll('.ask-live').forEach(function(el){ if(state._llm){ el.innerHTML='<i class="ti ti-sparkles"></i> live answers on'; el.className='ask-live on'; } else { el.innerHTML='<i class="ti ti-book"></i> offline notes'; el.className='ask-live'; } }); }
+function aiAnswer(q,ctx,system){
+  return fetch('/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q,ctx:ctx||'',system:system||''})})
+    .then(function(r){return r.json();})
+    .then(function(m){ if(m&&m.answer) return m.answer; throw new Error((m&&m.error)||'no-answer'); });
+}
+function stripTags(s){ return String(s||'').replace(/<[^>]+>/g,' ').replace(/\*\*/g,'').replace(/`/g,'')
+  .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&rarr;/g,'->').replace(/&larr;/g,'<-')
+  .replace(/&le;/g,'<=').replace(/&ge;/g,'>=').replace(/&mdash;/g,'--').replace(/&ndash;/g,'-').replace(/&asymp;/g,'~')
+  .replace(/&bull;/g,'-').replace(/&middot;/g,'-').replace(/&nbsp;/g,' ').replace(/&rsquo;/g,"'").replace(/&times;/g,'x')
+  .replace(/\s+/g,' ').trim(); }
+function mdToHtml(s){ return String(s||'')
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+  .replace(/`([^`]+?)`/g,'<code>$1</code>')
+  .replace(/\n\s*\n/g,'<br><br>').replace(/\n/g,'<br>'); }
+function studyCtx(scopeName,extra){
+  var p=DATA[state.prob];
+  var board=(p.nodes||[]).filter(function(n){return state.revealed.has(n.id);}).map(function(n){return n.name;}).join(', ');
+  var s='Problem: "'+(p.title||state.prob)+'". Focus: '+scopeName+'. Components currently on the board: '+(board||'(none yet)')+'. Interview difficulty: '+state.diff+'.';
+  if(extra) s+='\n'+extra;
+  return s;
+}
+/* Create a live "Tutor" answer bubble and fill it: LLM-first, offline fallback. */
+function answerBubble(scopeId,question,ctx){
+  var t=document.getElementById('transcript'); if(t.querySelector('.empty-t'))t.innerHTML='';
+  var b=document.createElement('div'); b.className='bubble cand live';
+  b.innerHTML='<div class="who"><span class="av">C</span>Tutor</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>';
+  t.appendChild(b); t.scrollTop=t.scrollHeight;
+  aiAnswer(question,ctx).then(function(txt){
+    b.querySelector('.body').innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> live answer</div>'+mdToHtml(txt);
+    b.classList.remove('live'); t.scrollTop=t.scrollHeight;
+  }).catch(function(){
+    b.querySelector('.body').innerHTML=localAnswer(scopeId,question);
+    b.classList.remove('live'); t.scrollTop=t.scrollHeight;
+  });
+}
+/* A doubt-clearing gate: prompt + ask box + advance buttons. */
+function ddGate(opts){
+  var t=document.getElementById('transcript'); removeGate();
+  var d=document.createElement('div'); d.className='dd-gate'; d.id='ddgate';
+  var btns=(opts.buttons||[]).map(function(bn,idx){ return '<button class="'+(bn.cls||'')+'" data-b="'+idx+'">'+bn.label+'</button>'; }).join('');
+  d.innerHTML='<div class="q">'+opts.prompt+'</div>'
+    +'<div class="row"><textarea id="ddText" placeholder="'+(opts.placeholder||'Type your doubt...')+'"></textarea><button class="go" id="ddAsk">Ask &#8599;</button></div>'
+    +'<div class="btns">'+btns+'</div>';
+  t.appendChild(d); t.scrollTop=t.scrollHeight;
+  var ta=d.querySelector('#ddText');
+  var fire=function(){ var v=(ta.value||'').trim(); if(!v)return; ta.value=''; addBubble('you','<span style="color:var(--muted);font-size:11px">[your doubt]</span><br>'+v); opts.onAsk(v); };
+  d.querySelector('#ddAsk').onclick=fire;
+  ta.addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') fire(); });
+  (opts.buttons||[]).forEach(function(bn,idx){ d.querySelector('[data-b="'+idx+'"]').onclick=function(){ removeGate(); bn.fn(); }; });
+}
+function removeGate(){ var e=document.getElementById('ddgate'); if(e)e.remove(); }
+function collapseAnswer(item){
+  if(item.answer) return item.answer;
+  var out=[]; (item.turns||[]).forEach(function(tn,i){
+    if(tn.who==='cand') out.push(tn.text);
+    else if(tn.who==='intv'&&i>0) out.push('**'+stripTags(tn.text)+'**');
+  });
+  return out.join('\n\n')||'See the study-notes tab for this component.';
+}
+function questionOf(item){
+  if(item.q) return item.q;
+  var first=(item.turns||[]).find(function(tn){return tn.who==='intv';});
+  return first?first.text:(item.title||'Walk me through this.');
+}
+/* The interactive gated flow. Only one runs at a time (state.playing). */
+function runInteractive(cfg){
+  state.playing=true; renderStepper(); renderPanel();
+  var t=document.getElementById('transcript'); if(t.querySelector('.empty-t'))t.innerHTML='';
+  showTyping('intv');
+  setTimeout(function(){ clearTyping();
+    addBubble('intv',(cfg.tagLabel?'<span style="color:var(--muted);font-size:11px">'+cfg.tagLabel+'</span><br>':'')+cfg.questionText);
+    ddGate({
+      prompt:'<i class="ti ti-help-hexagon"></i> Before the answer &mdash; <b>anything unclear about the question itself?</b> Ask and I&rsquo;ll clarify what&rsquo;s being tested. When you&rsquo;re ready, reveal how a strong senior candidate would answer.',
+      placeholder:'e.g. what exactly do they mean by "consistency" here?',
+      onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'The interviewer just asked:\n"'+stripTags(cfg.questionText)+'"\nThe learner has a doubt about what the QUESTION is asking (scope, terms, what a strong answer must cover). Clarify the question itself; do not yet hand them the full design answer.')); },
+      buttons:[{label:'Reveal the answer &rarr;',cls:'prim',fn:revealAnswer}]
+    });
+  },300);
+  function revealAnswer(){
+    applyReveal(cfg.reveal); renderDiagram();
+    var paras=String(cfg.answerText).split(/\n\s*\n/); var idx=0;
+    (function step(){
+      if(idx>=paras.length){
+        if(state.justRevealed&&state.justRevealed.size){ var names=[].slice.call(state.justRevealed).map(function(id){var n=DATA[state.prob].nodes.find(function(x){return x.id===id;});return n?n.name:id;}).join(', '); addReveal(names); state.justRevealed=new Set(); }
+        if(cfg.resources&&cfg.resources.length) addResources(cfg.resources);
+        gate2(); return;
+      }
+      showTyping('cand');
+      setTimeout(function(){ clearTyping(); addBubble('cand',(idx===0?'<span style="color:var(--muted);font-size:11px">[candidate answer]</span><br>':'')+paras[idx]); idx++; step(); }, idx===0?200:560);
+    })();
+  }
+  function gate2(){
+    ddGate({
+      prompt:'<i class="ti ti-messages"></i> <b>What didn&rsquo;t land?</b> Ask a follow-up about the answer and I&rsquo;ll go deeper &mdash; or test yourself with a quick quiz on exactly this.',
+      placeholder:'e.g. why async replication and not sync here?',
+      onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'Question:\n"'+stripTags(cfg.questionText)+'"\nReference answer given:\n"'+stripTags(cfg.answerText)+'"\nThe learner is asking a follow-up about this answer. Go deeper with concrete detail and numbers.')); },
+      buttons:[{label:'<i class="ti ti-help-circle"></i> Quiz me on this &rarr;',cls:'prim',fn:runQuiz},{label:'Done &check;',cls:'ghost',fn:finish}]
+    });
+  }
+  function runQuiz(){
+    if(cfg.quiz&&cfg.quiz.length){ askQuiz(cfg.quiz[state._qz||0]||cfg.quiz[0]); return; }
+    var sys='You are a senior interviewer. Read the Q&A and write ONE short, probing quiz question that checks whether the learner truly understood THIS specific answer (a number, a mechanism, an edge case, or a trade-off from it). Output ONLY the question, one sentence, no preamble.';
+    var ctx='Question:\n"'+stripTags(cfg.questionText)+'"\nAnswer:\n"'+stripTags(cfg.answerText)+'"';
+    showTyping('intv');
+    aiAnswer('Write the quiz question.',ctx,sys).then(function(qq){ clearTyping(); askQuiz({q:qq.replace(/^["'\s]+|["'\s]+$/g,''),a:null}); })
+      .catch(function(){ clearTyping(); askQuiz({q:'In your own words, walk through the single most important mechanism in that answer &mdash; and explain what breaks if you remove it.',a:null}); });
+  }
+  function askQuiz(item){
+    addBubble('intv','<span style="color:var(--muted);font-size:11px">[quiz &middot; this Q&amp;A]</span><br>'+item.q);
+    renderAnswerBox(function(){
+      var ta=document.getElementById('ansText'); var v=(ta.value||'').trim(); if(!v)return;
+      removeAnswerBox(); addBubble('you',v);
+      var t2=document.getElementById('transcript');
+      var b=document.createElement('div'); b.className='bubble intv live';
+      b.innerHTML='<div class="who"><span class="av">I</span>Interviewer</div><div class="body"><div class="typing"><span></span><span></span><span></span></div></div>';
+      t2.appendChild(b); t2.scrollTop=1e9;
+      var sys='You are grading the learner&rsquo;s answer to a quiz question from a senior system-design study session. Compare it to the reference material. Open with a bold verdict (**Correct**, **Partially correct**, or **Needs work**), then 2-4 sentences: what they got right, what is missing or wrong, and the one key point to remember. Precise and encouraging.';
+      var ctx='Quiz question:\n"'+stripTags(item.q)+'"\n'+(item.a?('Reference answer:\n"'+stripTags(item.a)+'"\n'):'')+'Source Q&A:\nQ: '+stripTags(cfg.questionText)+'\nA: '+stripTags(cfg.answerText)+'\n\nThe learner answered:\n"'+v+'"';
+      aiAnswer('Grade it.',ctx,sys).then(function(g){ b.querySelector('.body').innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> graded live</div>'+mdToHtml(g); b.classList.remove('live'); t2.scrollTop=1e9; state._qz=(state._qz||0)+1; finishAfterQuiz(); })
+        .catch(function(){ var body=item.a?('<div style="margin-bottom:9px">'+localGrade(item.a,v)+'</div><div style="color:var(--muted);font-size:11px;margin-bottom:4px">Model answer</div>'+item.a):localGrade(stripTags(cfg.answerText),v); b.querySelector('.body').innerHTML=body; b.classList.remove('live'); t2.scrollTop=1e9; state._qz=(state._qz||0)+1; finishAfterQuiz(); });
+    });
+  }
+  function finishAfterQuiz(){
+    ddGate({
+      prompt:'<i class="ti ti-circle-check"></i> Nice. Ask one more follow-up, try another angle, or wrap up this thread.',
+      placeholder:'e.g. how would this change at 10x the traffic?',
+      onAsk:function(v){ answerBubble(cfg.scopeId,v,studyCtx(cfg.scopeName,'Question:\n"'+stripTags(cfg.questionText)+'"\nAnswer:\n"'+stripTags(cfg.answerText)+'"\nLearner follow-up after the quiz. Go deep.')); },
+      buttons:[{label:'Another quiz &#8635;',cls:'',fn:runQuiz},{label:'Done &check;',cls:'prim',fn:finish}]
+    });
+  }
+  function finish(){ state.playing=false; state._qz=0; state.justRevealed=new Set(); if(cfg.onDone)cfg.onDone(); renderStepper(); renderDiagram(); renderPanel();
+    var t3=document.getElementById('transcript'); var d=document.createElement('div'); d.className='reveal-note'; d.innerHTML='<i class="ti ti-check"></i> Thread complete &mdash; pick another question, component, or open the scaling journey.'; t3.appendChild(d); t3.scrollTop=1e9; }
+}
 
 /* ---------------- quiz-me (test yourself on a topic) ---------------- */
 /* Token-lean: questions + model answers are pre-authored (0 tokens). Only the
@@ -1156,6 +1354,7 @@ document.getElementById('resetBtn').onclick=()=>{ if(state.prob)startInterview(s
 document.getElementById('changeBtn').onclick=()=>{ renderSetup(); };
 document.getElementById('mockBtn').onclick=()=>{ if(state.prob&&!state.playing) startMockTest(); };
 renderSetup();
+probeLLM();
 </script>
 </body>
 </html>
