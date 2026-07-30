@@ -237,6 +237,17 @@
   .wt-card.gotcha{border-left-color:#ff8fb0}.wt-card.gotcha>.h{color:#ff8fb0}
   .wt-card.queue{border-left-color:#54c8d8}.wt-card.queue>.h{color:#54c8d8}
   .wt-card .pill{margin-left:auto;font-size:10px;font-weight:700;color:#fff;background:#2a3342;border-radius:20px;padding:2px 8px;letter-spacing:.3px}
+  .wt-card.scale{border-left-color:#f0c46b}.wt-card.scale>.h{color:#f0c46b}
+  .wt-card.pain{border-left-color:#ff6b6b}.wt-card.pain>.h{color:#ff6b6b}
+  .wt-card.fix{border-left-color:#4fd1c7}.wt-card.fix>.h{color:#4fd1c7}
+  .wt-card.win{border-left-color:#67d98b}.wt-card.win>.h{color:#67d98b}
+  .wt-card.key{border-left-color:#c9a6ff}.wt-card.key>.h{color:#c9a6ff}
+  .wt-card.host{border-left-color:#8aa0b6}.wt-card.host>.h{color:#8aa0b6}
+  .difftools button.wtbtn.scalebtn{border-color:#6a5626;background:linear-gradient(180deg,#241f12,#191510);color:#f0d79a}
+  .difftools button.wtbtn.scalebtn:hover{border-color:#f0c46b;background:linear-gradient(180deg,#2e2716,#221c10)}
+  .difftools .lab.scalelab{color:#f0c46b;font-weight:600}
+  .wt-badge.stage{background:#241f12;border-color:#6a5626;color:#f0c46b}
+  .wt-modal.scale .wt-diag .cap{color:#e4c77f}
   .wt-nav{display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid var(--line);background:#121822}
   .wt-nav button{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .wt-nav button:hover:not(:disabled){border-color:var(--accent)}
@@ -473,8 +484,16 @@ function renderDifftools(){
     p.flows.forEach(f=>{ html+=`<button class="flowbtn" data-flow="${f.id}" ${state.playing?'disabled':''}><i class="ti ti-player-play"></i> ${f.name}</button>`; });
   }
   if(p.deepFlows&&p.deepFlows.length){
-    html+=`<span class="lab" style="color:var(--accent2)"><i class="ti ti-zoom-scan"></i> End-to-end walkthrough:</span>`;
-    p.deepFlows.forEach(f=>{ html+=`<button class="flowbtn wtbtn" data-wt="${f.id}"><i class="ti ti-route"></i> ${f.name}</button>`; });
+    const scaleFlows=p.deepFlows.filter(f=>f.kind==='scale');
+    const reqFlows=p.deepFlows.filter(f=>f.kind!=='scale');
+    if(scaleFlows.length){
+      html+=`<span class="lab scalelab"><i class="ti ti-trending-up"></i> Scaling journey — why each upgrade:</span>`;
+      scaleFlows.forEach(f=>{ html+=`<button class="flowbtn wtbtn scalebtn" data-wt="${f.id}"><i class="ti ti-stairs-up"></i> ${f.name}</button>`; });
+    }
+    if(reqFlows.length){
+      html+=`<span class="lab" style="color:var(--accent2)"><i class="ti ti-zoom-scan"></i> Request walkthrough:</span>`;
+      reqFlows.forEach(f=>{ html+=`<button class="flowbtn wtbtn" data-wt="${f.id}"><i class="ti ti-route"></i> ${f.name}</button>`; });
+    }
   }
   if(!html) html=`<span class="lab">Click a component below to drill in.</span>`;
   el.innerHTML=html;
@@ -574,7 +593,7 @@ function travelPulse(fromId,toId,ms,done){
 }
 
 /* ---------------- request walkthrough (end-to-end) ---------------- */
-const WT_ICON={wire:'ti-arrow-bounce',query:'ti-database',route:'ti-route',repl:'ti-copy',note:'ti-info-circle',gotcha:'ti-alert-triangle',queue:'ti-stack-2'};
+const WT_ICON={wire:'ti-arrow-bounce',query:'ti-database',route:'ti-route',repl:'ti-copy',note:'ti-info-circle',gotcha:'ti-alert-triangle',queue:'ti-stack-2',scale:'ti-calculator',pain:'ti-flame',fix:'ti-tool',win:'ti-circle-check',key:'ti-key',host:'ti-server'};
 const WT_KW=/\b(SELECT|INSERT|INTO|VALUES|UPDATE|SET|DELETE|FROM|WHERE|AND|OR|ORDER BY|GROUP BY|LIMIT|OFFSET|RETURNING|ON CONFLICT|DO NOTHING|DO UPDATE|LEFT JOIN|INNER JOIN|JOIN|HAVING|USING|BEGIN|COMMIT|ROLLBACK|WITH|CASE|WHEN|THEN|ELSE|END|NOT|NULL|IS|IN|ASC|DESC|FOR UPDATE|SKIP LOCKED|COALESCE|NOW|EXISTS|BETWEEN|DISTINCT|COUNT|EXPLAIN|ANALYZE)\b/g;
 function wtEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function wtHi(code){
@@ -618,7 +637,8 @@ function wtStateHTML(snap){
   });
   if(!body) return '';
   const cap=snap.cap?`<div class="scap">${wtInline(snap.cap)}</div>`:'';
-  return `<div class="wt-state"><div class="sh"><i class="ti ti-layout-grid"></i>State after this step</div>${cap}<div class="sbody">${body}</div></div>`;
+  const sh=snap.title?wtInline(snap.title):'State after this step';
+  return `<div class="wt-state"><div class="sh"><i class="ti ti-layout-grid"></i>${sh}</div>${cap}<div class="sbody">${body}</div></div>`;
 }
 
 function openWalk(flowId){
@@ -669,13 +689,14 @@ function wtPulse(fromId,toId){
   loop();
 }
 // focused diagram: all nodes shown, active node highlighted, active hop edge hot
-function flowDiagramSVG(p,activeId,fromId,doneSet){
+function flowDiagramSVG(p,activeId,fromId,doneSet,opts){
+  opts=opts||{}; const visible=opts.visible||null; const vok=id=>!visible||visible.has(id);
   const cellW=134, cellH=56, hw=cellW/2, hh=cellH/2;
   const maxX=Math.max(...p.nodes.map(n=>n.x))+cellW+40, maxY=Math.max(...p.nodes.map(n=>n.y))+cellH+30;
   const pos={}; p.nodes.forEach(n=>pos[n.id]={x:n.x,y:n.y});
   const isHot=(a,b)=>fromId&&activeId&&((a===fromId&&b===activeId)||(a===activeId&&b===fromId));
   let edges='', elabels='', hotFound=false;
-  p.edges.forEach(e=>{ const [a,b,label]=e; const A=pos[a],B=pos[b]; if(!A||!B)return;
+  (p.edges.concat(opts.extraEdges||[])).forEach(e=>{ const [a,b,label]=e; const A=pos[a],B=pos[b]; if(!A||!B)return; if(!vok(a)||!vok(b))return;
     const s=borderPt(A.x+hw,A.y+hh,B.x+hw,B.y+hh,hw,hh,2), t=borderPt(B.x+hw,B.y+hh,A.x+hw,A.y+hh,hw,hh,5);
     const hot=isHot(a,b); if(hot)hotFound=true;
     edges+=`<line class="edge ${hot?'wt-hot':''}" x1="${s.x.toFixed(1)}" y1="${s.y.toFixed(1)}" x2="${t.x.toFixed(1)}" y2="${t.y.toFixed(1)}"></line>`;
@@ -687,7 +708,7 @@ function flowDiagramSVG(p,activeId,fromId,doneSet){
     if(A&&B){ const s=borderPt(A.x+hw,A.y+hh,B.x+hw,B.y+hh,hw,hh,2), t=borderPt(B.x+hw,B.y+hh,A.x+hw,A.y+hh,hw,hh,5);
       edges+=`<line class="edge wt-hot" stroke-dasharray="4 4" x1="${s.x.toFixed(1)}" y1="${s.y.toFixed(1)}" x2="${t.x.toFixed(1)}" y2="${t.y.toFixed(1)}"></line>`; } }
   let nodes='';
-  p.nodes.forEach(n=>{ const kind=kindOf(n);
+  p.nodes.forEach(n=>{ if(!vok(n.id))return; const kind=kindOf(n);
     const cls=[(n.id===activeId?'on':''),(doneSet&&doneSet.has(n.id)&&n.id!==activeId?'done':'')].join(' ');
     nodes+=`<g class="node ${cls}" data-node="${n.id}">`+
       `<rect class="box" x="${n.x}" y="${n.y}" width="${cellW}" height="${cellH}" rx="11"></rect>`+
@@ -710,6 +731,11 @@ function wtRender(){
   const fromId=step.from||(i>0?(f.steps[i-1].node||f.steps[i-1].to):null)||null;
   const doneSet=new Set(); for(let k=0;k<i;k++){ const st=f.steps[k]; if(st.node)doneSet.add(st.node); if(st.to)doneSet.add(st.to); }
   const compName=activeId?((p.nodes.find(x=>x.id===activeId)||{}).name||''):'';
+  const isScale=f.kind==='scale';
+  const visible=step.live?new Set(step.live):(f.live?new Set(f.live):null);
+  const extraEdges=(f.edges||[]).concat(step.edges||[]);
+  if(visible){ [...doneSet].forEach(id=>{ if(!visible.has(id)) doneSet.delete(id); }); }
+  const badge=step.stage||compName||(isScale?'Stage':'Flow');
   let cards='';
   (step.details||[]).forEach(d=>{
     const k=d.k||'note';
@@ -719,9 +745,9 @@ function wtRender(){
     cards+=`</div>`;
   });
   const dots=f.steps.map((s,k)=>`<button class="dot ${k===i?'on':(state.wt.seen.has(k)?'seen':'')}" data-k="${k}" title="${(s.title||('Step '+(k+1))).replace(/"/g,'')}"></button>`).join('');
-  const html=`<div class="wt-modal" onclick="event.stopPropagation()">
+  const html=`<div class="wt-modal${isScale?' scale':''}" onclick="event.stopPropagation()">
     <div class="wt-head">
-      <h3><i class="ti ti-route"></i>${f.name}</h3>
+      <h3><i class="ti ${isScale?'ti-trending-up':'ti-route'}"></i>${f.name}</h3>
       <span class="sub">${p.title||''}</span>
       <span class="sp"></span>
       <span class="stepn">Step ${i+1} / ${n}</span>
@@ -729,12 +755,12 @@ function wtRender(){
     </div>
     <div class="wt-body">
       <div class="wt-diag">
-        <div class="d" id="wtdiagram">${flowDiagramSVG(p,activeId,fromId,doneSet)}</div>
+        <div class="d" id="wtdiagram">${flowDiagramSVG(p,activeId,fromId,doneSet,{visible,extraEdges})}</div>
         <div class="cap">${f.summary?wtInline(f.summary):'End-to-end request path — follow the glowing request as it moves between components.'}</div>
       </div>
       <div class="wt-side">
         <div class="wt-scroll">
-          <span class="wt-badge"><i class="ti ti-friends"></i>${compName||'Flow'}</span>
+          <span class="wt-badge${isScale?' stage':''}"><i class="ti ${isScale?'ti-stairs-up':'ti-friends'}"></i>${badge}</span>
           <h2 class="wt-title">${step.title||''}</h2>
           <div class="wt-narr">${wtInline(step.narrate||'')}</div>
           ${cards}

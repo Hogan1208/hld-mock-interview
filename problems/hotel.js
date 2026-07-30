@@ -394,7 +394,7 @@ window.DATA['hotel'].deepDive = {
   },
 };
 window.DATA['hotel'].deepFlows = [
-  {id:"search-e2e",name:"Search a 3-night stay (min-over-nights, cached)",summary:"Follow one availability query from a channel through the search service and the ARI cache: why a stay's availability is the <strong>minimum across every night</strong>, how the quote is composed, and why it is served slightly stale from cache without ever risking oversell.",steps:[
+  {id:"search-e2e",name:"Search · with the ARI cache (hit path)",kind:"request",live:["channel","api","search","ari","avail","booking"],summary:"The read path <strong>after</strong> you have added the ARI cache (see the Scaling journey for why). Follow one availability query from a channel through the search service and the ARI cache: why a stay's availability is the <strong>minimum across every night</strong>, how the quote is composed, and why it is served slightly stale from cache without ever risking oversell. For the very first design, run <em>Search · baseline (DB only)</em>; for what happens on a cold key, run <em>Search · cache miss → populate</em>.",steps:[
     {node:"channel",title:"Channel asks: any King room, Fri→Mon?",
       narrate:"Booking.com's app asks the central service whether hotel 7731 has a King room for a Fri→Mon stay (nights of Aug 14, 15, 16) and what it would cost. This is a read — it must be cheap at a million per second.",
       details:[
@@ -989,3 +989,250 @@ window.DATA['hotel'].mockTest = [
   {q:"How do you support deliberate overbooking without special-casing the reserve path?",
     a:"One column. Availability is <code>available = total_rooms + overbook_limit − booked</code>, with <code>overbook_limit</code> set per <code>(hotel, room_type, date)</code> by revenue management. The reserve statement is unchanged (<code>WHERE available ≥ 1</code>), so overbooking is pure data/policy — no branch in the hot path. Realized cancellation rates feed back to tune the limit, and over-committed nights are flagged so a rare 'walk' can be handled operationally."},
 ];
+
+/* ---- scale-driven flows: baseline (DB-only), cache populate, and the scaling journey ---- */
+(function(){
+var d = window.DATA['hotel'];
+var byId = {}; d.deepFlows.forEach(function(f){ byId[f.id]=f; });
+
+var searchDb = {id:"search-db",name:"Search · baseline (DB only)",kind:"request",
+  live:["channel","api","avail","booking"],
+  summary:"The first design you would actually draw: <strong>no cache, no search service</strong> — the Reservation API runs one SQL range-scan straight against the availability table. Correct and simple. The <em>Scaling journey</em> shows exactly when this stops coping and why you then add replicas and the ARI cache on top.",
+  steps:[
+    {node:"channel",stage:"Baseline read",title:"Channel asks: any King room, Fri&rarr;Mon?",
+      edges:[["api","avail","reads + writes"]],
+      narrate:"Booking.com asks hotel 7731 for a King room across the nights Aug 14, 15, 16. In the baseline there is nowhere to hide: this read hits the one database everybody also writes to.",
+      details:[
+        {k:"wire",label:"GET /availability",code:"GET /availability?hotel=7731&type=2\n     &checkin=2026-08-14&checkout=2026-08-17\n-- nights [checkin, checkout): Aug 14, 15, 16"},
+        {k:"note",label:"One datastore, every path",text:"On day one there is exactly one Postgres. Searches, reserves and confirms all hit it. That is fine — until it isn't (see the Scaling journey)."},
+      ],
+      snap:{title:"Availability table (single primary)",cap:"The source of truth — and right now the <em>only</em> place a read can go.",
+        tables:[{name:"availability",note:"hotel 7731 · King (room_type 2) · one DB, no shards yet",cols:["night","total","booked","avail","rate"],rows:[
+          {c:["2026-08-14 (Fri)","12","11","1","$280"],hi:1},
+          {c:["2026-08-15 (Sat)","12","11","1","$300"],hi:1},
+          {c:["2026-08-16 (Sun)","12","10","2","$260"],hi:1},
+        ]}]}},
+    {node:"api",stage:"Baseline read",title:"API validates, then queries the DB itself",
+      edges:[["api","avail","range scan"]],
+      narrate:"No read/write split exists yet, so the API just opens a connection to the primary and runs the availability query inline. Every browse is a real SQL query on the write database.",
+      details:[
+        {k:"route",label:"No split (yet)",text:"There is no search tier and no replica. A browse and a booking compete for the **same** connection pool and CPU. Hold that thought — it is the Stage 2 trigger."},
+      ],
+      snap:{title:"Availability table (single primary)",cap:"Gateway forwards the range to the primary. A read mutates nothing.",
+        tables:[{name:"availability",note:"hotel 7731 · King · about to be range-scanned",cols:["night","total","booked","avail","rate"],rows:[
+          {c:["2026-08-14 (Fri)","12","11","1","$280"]},
+          {c:["2026-08-15 (Sat)","12","11","1","$300"]},
+          {c:["2026-08-16 (Sun)","12","10","2","$260"]},
+        ]}]}},
+    {node:"avail",stage:"Baseline read",title:"One SQL range-scan: min available, sum of rates",
+      edges:[["api","avail","range scan"]],
+      narrate:"The whole quote is a single query over the three nights. Availability for the stay is the MIN across nights (you need a room every night); price is the SUM of nightly rates.",
+      details:[
+        {k:"query",label:"The actual baseline query",code:"SELECT min(available) AS bookable,\n       sum(rate)      AS total\n  FROM availability\n WHERE hotel_id = 7731 AND room_type_id = 2\n   AND stay_date >= '2026-08-14'\n   AND stay_date <  '2026-08-17';\n-- bookable = min(1,1,2) = 1     total = 280+300+260 = 840"},
+        {k:"gotcha",label:"Why min, not sum",text:"Saturday is the bottleneck with 1 room. Sunday having 2 does not help — the **scarcest night caps the whole stay** at 1 bookable room."},
+        {k:"note",label:"The index that matters",text:"This is a range scan on the primary key `(hotel_id, room_type_id, stay_date)` — three rows, a few ms. Cheap in isolation, deadly at a million per second."},
+      ],
+      snap:{title:"Availability table (single primary)",cap:"Computed on the primary: <strong>bookable = min(1,1,2) = 1</strong>, <strong>total = $840</strong>. Rows untouched.",
+        tables:[{name:"availability",note:"Saturday is the scarce night",cols:["night","total","booked","avail","rate"],rows:[
+          {c:["2026-08-14 (Fri)","12","11","1","$280"]},
+          {c:["2026-08-15 (Sat)","12","11","1","$300"],hi:1,tag:"min"},
+          {c:["2026-08-16 (Sun)","12","10","2","$260"]},
+        ]}]}},
+    {node:"api",stage:"Baseline read",title:"Compose the quote + a short-lived rate token",
+      edges:[["api","avail","range scan"]],
+      narrate:"The API wraps the result into a quote and a signed rate_token pinning $840 for a minute or two, so a later reserve charges the price the guest saw.",
+      details:[
+        {k:"note",label:"rate_token",text:"A signed, short-TTL token binding (hotel, type, range) &rarr; $840. Reserve validates it; if expired, the channel must re-quote rather than silently reprice."},
+      ],
+      snap:{title:"Response assembled",cap:"<strong>1 room bookable · $840</strong> + rate token (~2 min). No state changed anywhere.",
+        tables:[{name:"quote (ephemeral)",note:"returned to the channel, not persisted",cols:["field","value"],rows:[
+          {c:["bookable","1"],hi:1},
+          {c:["total","$840"]},
+          {c:["rate_token","rt_2f9…exp+120s"]},
+        ]}]}},
+    {node:"channel",stage:"Baseline read",title:"Guest sees \"1 room left · $840\" — and the ceiling appears",
+      edges:[["api","avail","reads + writes"]],
+      narrate:"Fine at launch traffic. But this exact query, uncached, is what melts the primary once every OTA points its search box at you — which is precisely where the Scaling journey picks up.",
+      details:[
+        {k:"win",label:"What baseline gets right",text:"It is **correct**: min-over-nights is exact, reserve re-validates before charging, and there are zero moving parts to fall out of sync. Always start here in an interview, then earn the optimizations."},
+        {k:"scale",label:"Where it breaks",text:"At ~500 searches/s the single primary is comfortable. At tens of thousands/s of range scans it saturates — and because reads and writes share the box, **reserves start timing out too.** Continue in the Scaling journey.",pill:"next"},
+      ],
+      snap:{title:"Load today vs. the wall",cap:"The design is right; the <em>numbers</em> are what force the next moves.",
+        tables:[{name:"capacity check",cols:["signal","today","one-primary ceiling"],rows:[
+          {c:["Search rate","**~500 /s**","~10–15K range-scans/s"],hi:1},
+          {c:["Reserve rate","~5 /s","shares the same box"],hi:1,tag:"risk"},
+          {c:["Read p99","12 ms","climbs sharply past ~8K/s"]},
+        ]}]}},
+  ]};
+
+var searchMiss = {id:"search-miss",name:"Search · cache miss &rarr; populate",kind:"request",
+  live:["channel","api","search","ari","avail","booking"],
+  summary:"What happens the first time a (hotel, room-type, date-range) is asked for — or after its ARI entry expires. The cache <strong>misses</strong>, a single loader reads a replica, computes the quote, writes it back with a TTL, and every later read is a hit. This is how the cache in the <em>hit path</em> flow got populated.",
+  steps:[
+    {node:"channel",stage:"Cache miss",title:"Channel asks for a cold (hotel, type, range)",
+      narrate:"Same GET /availability as the hit path, but this key has never been cached (or its TTL just lapsed). Someone has to pay the DB cost to fill it.",
+      details:[
+        {k:"wire",label:"GET /availability",code:"GET /availability?hotel=7731&type=2\n     &checkin=2026-08-14&checkout=2026-08-17"},
+      ],
+      snap:{title:"ARI cache — cold",cap:"The three per-night keys are absent. A read cannot be served from here yet.",
+        tables:[{name:"ari_cache (Redis)",note:"key = ari:{hotel}:{type}:{night}",cols:["key","value","state"],rows:[
+          {c:["ari:7731:2:2026-08-14","—","**miss**"],hi:1,tag:"miss"},
+          {c:["ari:7731:2:2026-08-15","—","**miss**"],hi:1,tag:"miss"},
+          {c:["ari:7731:2:2026-08-16","—","**miss**"],hi:1,tag:"miss"},
+        ]}]}},
+    {node:"ari",stage:"Cache miss",title:"Look up the three keys — all miss",
+      narrate:"Search asks Redis for the three night keys. All absent. To stop a thundering herd, one loader per key wins the right to fill it; concurrent callers for the same key wait for that single load.",
+      details:[
+        {k:"key",label:"Single-flight",text:"A per-key lock (request-coalescing) means **one** loader hits the DB for `ari:7731:2:2026-08-15`; thousands of other searchers for the same night block briefly, then read the filled value. A cold hot-key cannot stampede the replicas."},
+        {k:"gotcha",label:"Why not always read the DB",text:"Because the same handful of hot hotels are searched thousands of times a second. Uncached, each is a fresh range scan — the exact load Stage 3 of the journey exists to remove."},
+      ],
+      snap:{title:"ARI cache — miss, loader elected",cap:"One loader will read the DB; duplicate loaders are suppressed.",
+        tables:[{name:"ari_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["ari:7731:2:2026-08-14","—","loading"],hi:1,tag:"load"},
+          {c:["ari:7731:2:2026-08-15","—","loading"],hi:1,tag:"load"},
+          {c:["ari:7731:2:2026-08-16","—","loading"],hi:1,tag:"load"},
+        ]}]}},
+    {node:"avail",stage:"Cache miss",title:"Single-flight loader reads a replica",
+      edges:[["search","avail","read replica"]],
+      narrate:"The loader runs the availability range scan against a read replica, not the write primary, so filling the cache never competes with reserves.",
+      details:[
+        {k:"query",label:"Loader query (on a replica)",code:"SELECT stay_date, available, rate\n  FROM availability            -- read replica\n WHERE hotel_id = 7731 AND room_type_id = 2\n   AND stay_date >= '2026-08-14'\n   AND stay_date <  '2026-08-17';"},
+        {k:"repl",label:"Replica, by design",text:"Reads come from replicas that trail the primary by a few ms. Slight staleness is safe because **reserve re-checks the primary** before charging."},
+      ],
+      snap:{title:"Availability replica — source values",cap:"Three rows come back; these become the cache entries.",
+        tables:[{name:"availability (replica)",note:"hotel 7731 · King",cols:["night","available","rate","ver"],rows:[
+          {c:["2026-08-14 (Fri)","1","$280","v812"],hi:1},
+          {c:["2026-08-15 (Sat)","1","$300","v905"],hi:1},
+          {c:["2026-08-16 (Sun)","2","$260","v774"],hi:1},
+        ]}]}},
+    {node:"search",stage:"Cache miss",title:"Compute min/sum, then SET the keys with a TTL",
+      edges:[["search","avail","read replica"]],
+      narrate:"Search collapses the rows (min avail, sum rate), returns the quote, and writes each night back into Redis with a short TTL and its version. The cache is now warm for everyone.",
+      details:[
+        {k:"query",label:"Write-back (populate)",code:"-- one SET per night, version-stamped, short TTL\nSET ari:7731:2:2026-08-14  {avail:1,rate:280,ver:812}  EX 5\nSET ari:7731:2:2026-08-15  {avail:1,rate:300,ver:905}  EX 5\nSET ari:7731:2:2026-08-16  {avail:2,rate:260,ver:774}  EX 5"},
+        {k:"note",label:"Write-if-newer",text:"Each entry carries the row `ver`. A late fan-out update with a lower version is dropped, so an out-of-order populate can never resurrect a sold room. The ~5s TTL bounds staleness even if an update is missed entirely."},
+      ],
+      snap:{title:"ARI cache — populated",cap:"Keys filled and version-stamped. <strong>bookable = min(1,1,2) = 1 · $840.</strong> The next read is a hit.",
+        tables:[{name:"ari_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["ari:7731:2:2026-08-14","avail 1 · $280 · v812","**hit** · ttl 5s"],hi:1,tag:"filled"},
+          {c:["ari:7731:2:2026-08-15","avail 1 · $300 · v905","**hit** · ttl 5s"],hi:1,tag:"filled"},
+          {c:["ari:7731:2:2026-08-16","avail 2 · $260 · v774","**hit** · ttl 5s"],hi:1,tag:"filled"},
+        ]}]}},
+    {node:"channel",stage:"Cache miss",title:"Quote returned — now it's a hit for everyone",
+      narrate:"The guest sees '1 room left · $840'. The very next search for these nights — from any channel — is served entirely from Redis with zero DB work, until the TTL lapses or a booking invalidates the key.",
+      details:[
+        {k:"win",label:"Payoff",text:"One DB read filled a key that now absorbs thousands of reads/s. Across all hot hotels this is the **~92% hit rate** that lets a few replicas serve a global search firehose."},
+        {k:"route",label:"How it gets invalidated",text:"When a reserve decrements a night, the outbox &rarr; fan-out pushes a version-stamped update (journey Stage 5). A higher `ver` overwrites the key; the room leaves search in ~1–2s."},
+      ],
+      snap:{title:"ARI cache — warm",cap:"Subsequent searches for these nights are pure cache hits.",
+        tables:[{name:"ari_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["ari:7731:2:2026-08-14","avail 1 · $280 · v812","hit"]},
+          {c:["ari:7731:2:2026-08-15","avail 1 · $300 · v905","hit"]},
+          {c:["ari:7731:2:2026-08-16","avail 2 · $260 · v774","hit"]},
+        ]}]}},
+  ]};
+
+var scaling = {id:"scaling",name:"From one DB to web-scale",kind:"scale",
+  live:["channel","api","avail","booking"],
+  summary:"Start from the simplest correct design and let <strong>real numbers</strong> force each upgrade. Every stage names the signal that triggers it, what breaks if you skip it, and the fix — the diagram grows one motivated component at a time.",
+  steps:[
+    {node:"avail",stage:"Stage 0 · Baseline",title:"One Postgres — every API hits it directly",
+      live:["channel","api","avail","booking"],
+      edges:[["api","avail","reads + writes"]],
+      narrate:"Draw the honest MVP first: channels call the Reservation API; the API reads and writes a single availability database; confirmed stays land in the booking store. Search is a SQL range-scan; reserve is the atomic per-night decrement. Correct, and plenty for launch traffic.",
+      details:[
+        {k:"win",label:"Why start here",text:"It is **correct and legible**: no caches to invalidate, no replicas to lag, no shards to route. In an interview, *earn* the optimizations — don't pre-draw them."},
+        {k:"query",label:"Both paths, one box",code:"-- search: one range scan\nSELECT min(available), sum(rate) FROM availability\n WHERE hotel_id=? AND room_type_id=? AND stay_date >= ? AND stay_date < ?;\n-- reserve: one atomic decrement (all-or-nothing across nights)\nUPDATE availability SET booked=booked+1\n WHERE hotel_id=? AND room_type_id=? AND stay_date IN (?) AND available>=1;"},
+        {k:"scale",label:"Working numbers",text:"~**500 searches/s**, ~5 reserves/s. One primary handles this at ~12 ms p99 with headroom to spare."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"Everything green. Each later stage is triggered strictly by a signal crossing a ceiling.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Search rate","~500 /s","ok"]},
+          {c:["Reserve rate","~5 /s","ok"]},
+          {c:["Datastore","1 primary · reads+writes","ok"]},
+          {c:["Read p99","12 ms","ok"]},
+        ]}]}},
+    {node:"holds",stage:"Stage 1 · Two-phase holds",title:"Payment can't hold a row lock &rarr; hold, then confirm",
+      live:["channel","api","avail","booking","holds","reaper"],
+      edges:[["api","avail","search reads"]],
+      narrate:"The first upgrade is not about QPS at all. If a booking decrements and then waits for the card to clear inside one transaction, it holds the night's row lock for seconds — serializing every other buyer on a hot night behind one slow payment.",
+      details:[
+        {k:"pain",label:"What breaks without it",text:"A book-and-pay transaction holds the write lock for the **entire** payment (2–30 s). Throughput on a hot room collapses to ~1 / payment-time; buyers pile up and time out. Correctness-safe, but unusable under contention."},
+        {k:"fix",label:"The fix — two phases",text:"**Hold**: atomic decrement + write a TTL'd hold row, commit in ~5 ms, release the lock. **Confirm**: after payment clears out-of-band, flip hold&rarr;confirmed and write the booking. The room is protected by *data* (the decrement), not by a long-held lock."},
+        {k:"note",label:"Why the reaper",text:"~half of holds never confirm (abandoned checkout). A sweeper releases expired holds (`booked - 1`) so abandoned rooms don't strand inventory. Release is idempotent."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The lock is now held for milliseconds, not seconds. Hot-night throughput is unblocked.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Lock hold time","**2–30 s** (payment)","~5 ms (decrement)"],hi:1,tag:"fixed"},
+          {c:["Hot-room throughput","~0.03 /s","bounded by DB, not payment"],hi:1},
+          {c:["Abandoned holds","stranded forever","reaped on TTL"]},
+        ]}]}},
+    {node:"search",stage:"Stage 2 · Read replicas",title:"Searches drown out reserves &rarr; split reads onto replicas",
+      live:["channel","api","avail","booking","holds","reaper","search"],
+      edges:[["search","avail","reads (replica)"]],
+      narrate:"Browse:book runs ~100:1. As every OTA points its search box at you, range-scans saturate the primary's CPU — and because writes share that box, reserves start timing out. Move reads off the primary.",
+      details:[
+        {k:"pain",label:"What breaks without it",text:"At ~8K searches/s of multi-row range scans the single primary is CPU-bound. Reads and writes contend, so **reserve latency spikes and holds fail** even though write volume is tiny. Reads are starving writes."},
+        {k:"fix",label:"The fix — read/write split",text:"A dedicated **search service** reads from N asynchronous **replicas**; the primary now takes writes only (holds, confirms, reaper). Searches scale horizontally by adding replicas; reserves get their box back."},
+        {k:"gotcha",label:"The catch you must name",text:"Replicas lag the primary by ms–seconds. Search can now show a room a beat after it sold — acceptable **only because reserve re-validates on the primary** before charging. Staleness in search, never in the decrement."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Reads scale out; the primary is writes-only. But replicas still re-scan the same hot hotels.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Search rate","~8K /s","served by replicas"],hi:1},
+          {c:["Primary role","writes only","reserves safe"],hi:1,tag:"fixed"},
+          {c:["Replica reads","~8K range-scans/s","hot keys re-scanned"],tag:"waste"},
+          {c:["Reserve p99","back to ~15 ms","ok"]},
+        ]}]}},
+    {node:"ari",stage:"Stage 3 · ARI cache",title:"Replicas can't take the firehose &rarr; add the ARI cache",
+      live:["channel","api","avail","booking","holds","reaper","search","ari"],
+      edges:[["search","avail","cache miss → replica"]],
+      narrate:"Now the motivated cache. The same few hundred hot hotels are searched thousands of times a second, each a fresh range scan plus rate math on a lagging replica. Put a Redis read model — Availability, Rates, Inventory — in front and serve repeated reads from memory.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak ~**50K searches/s**, heavily skewed: the top hotels are re-queried constantly. Add replicas forever and you still recompute the *same* answers. Reads want **memory**, not more SQL."},
+        {k:"pain",label:"What breaks without it",text:"To hold 50K/s of range-scans you'd need 10+ replicas fighting replication lag, and p99 stays in the tens of ms — while you burn cost recomputing identical quotes."},
+        {k:"fix",label:"The fix — cache the read model",text:"Search checks **ARI (Redis)** first; a ~**92% hit** cuts DB reads ~12x. On a miss, one single-flight loader fills the key from a replica with a short TTL (see *Search · cache miss &rarr; populate*). p99 drops from ~20 ms to ~2 ms.",pill:"the cache"},
+        {k:"gotcha",label:"Does a stale cache oversell?",text:"No. The cache sits **outside** the write path — a reserve never trusts it; it decrements the primary. A stale ARI can only make search optimistic (&rarr; clean 409 at reserve) or pessimistic (a lost sale). Correctness lives in the decrement, not the cache."},
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"92% of reads never touch the DB. This is why the read-path flows go through ARI.",
+        tables:[{name:"signals",cols:["signal","before ARI","after ARI"],rows:[
+          {c:["Search rate","50K /s","50K /s"]},
+          {c:["DB read QPS","~50K","~4K (**-92%**)"],hi:1,tag:"fixed"},
+          {c:["Read p99","~20 ms","~2 ms"],hi:1},
+          {c:["Replicas needed","10+","2–3 + cache"]},
+        ]}]}},
+    {node:"avail",stage:"Stage 4 · Shard by hotel_id",title:"Writes & data outgrow one primary &rarr; shard by hotel_id",
+      live:["channel","api","avail","booking","holds","reaper","search","ari"],
+      edges:[["search","avail","cache miss → replica"]],
+      narrate:"Reads are handled; now the write side and the sheer row count grow past one primary. Millions of hotels x ~500 nights x room types is billions of availability rows, and holds+confirms+reaper writes exceed a single box. Shard.",
+      details:[
+        {k:"pain",label:"What breaks without it",text:"One primary has a ceiling on write IOPS and on how many billions of rows it can index and vacuum. Push past it and reserve latency and compaction pain grow without bound."},
+        {k:"fix",label:"The fix — shard on hotel_id",text:"Partition availability, holds and bookings by **hotel_id**. Each shard is its own primary + replicas. Crucially, **all of a hotel's nights live on one shard**, so a reserve across a date range stays a **single-shard ACID transaction** — no distributed commit.",pill:"key choice"},
+        {k:"key",label:"Why hotel_id specifically",text:"The atomic multi-night decrement must be one transaction. Shard by hotel_id and every night of any stay is co-located, so the no-oversell guarantee survives sharding untouched. Sharding by date or room_type would split a single reserve across shards. Locking nights in ascending date order keeps a consistent lock order — no deadlock."},
+      ],
+      snap:{title:"Load & capacity — Stage 4",cap:"Writes scale linearly with shards; each reserve is still one local transaction.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Shard key","**hotel_id**","reserve = single-shard"],hi:1,tag:"fixed"},
+          {c:["Rows","billions across shards","each shard bounded"]},
+          {c:["Reserve txn","1 shard · ACID","no 2PC"],hi:1},
+          {c:["Cross-shard reserve","never happens","nights co-located"]},
+        ]}]}},
+    {node:"sync",stage:"Stage 5 · Outbox &rarr; fan-out",title:"Keep channels & caches consistent &rarr; transactional outbox + Kafka",
+      live:["channel","api","avail","booking","holds","reaper","search","ari","sync"],
+      edges:[["search","avail","cache miss → replica"]],
+      narrate:"Last problem: when a room sells, every channel's search and every ARI cache must learn quickly — without a dual-write that can diverge. Don't write the DB and the cache/channels separately; emit one event from the same transaction.",
+      details:[
+        {k:"pain",label:"What breaks without it",text:"If confirm writes the DB and then separately pushes the cache/channels, a crash between the two leaves them **inconsistent** — a room sold in the store but still for sale on Expedia. Dual writes have no atomicity."},
+        {k:"fix",label:"The fix — outbox + partitioned log",text:"Inside the booking transaction, append a row to a **booking_events** outbox. A relay tails it into **Kafka partitioned by hotel_id** (per-hotel ordering). The **channel manager** consumes and pushes version-stamped ARI updates to every channel and the cache. One durable source, fanned out.",pill:"consistency"},
+        {k:"note",label:"Convergence & idempotency",text:"Updates carry the row `ver` and are write-if-newer, so redelivery and out-of-order messages are safe. Channels converge in ~1–2 s; the atomic decrement stays the hard backstop if one is briefly behind. A channel's own push-in goes through the same idempotent /reserve — no back door."},
+      ],
+      snap:{title:"Load & capacity — Stage 5 (full design)",cap:"Every mutation flows out through one ordered, idempotent path. This is the complete architecture.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["DB↔cache↔channels","transactional outbox","no dual-write drift"],hi:1,tag:"fixed"},
+          {c:["Ordering","Kafka by hotel_id","per-hotel, in order"]},
+          {c:["Convergence","fan-out to ARI","~1–2 s"],hi:1},
+          {c:["Oversell backstop","atomic decrement","always exact"]},
+        ]}]}},
+  ]};
+
+d.deepFlows = [ scaling, searchDb, byId['search-e2e'], searchMiss, byId['reserve-e2e'], byId['race-e2e'] ];
+})();
