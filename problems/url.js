@@ -899,3 +899,139 @@ var scaling = {id:"scaling",name:"From one mapping table to viral redirects",kin
   ]};
 d.deepFlows = [scaling].concat(d.deepFlows);
 })();
+
+/* ---- cache read flows: baseline, hit path, miss populate ---- */
+(function(){
+var d = window.DATA["url"];
+var byId = {}; d.deepFlows.forEach(function(f){ byId[f.id]=f; });
+
+var redirectDb = {id:"redirect-db",name:"Redirect · baseline (DB only)",kind:"request",
+  live:["client","lb","svc","db"],
+  summary:"The first read design: no Redis, no replica, no analytics fan-out in the critical teaching path. The shortener service does one primary-key lookup against the mapping store, checks expiry, and returns the redirect. Correct and simple; the Scaling journey shows why **116K redirects/s** later forces the Redis hit path.",
+  steps:[
+    {node:"client",stage:"Baseline read",title:"Browser asks for a short key",
+      edges:[["svc","db","point lookup"]],
+      narrate:"A user clicks `sho.rt/15ftgG`. In the baseline there is no cache tier to absorb the read: every visible redirect has to reach the mapping store.",
+      details:[
+        {k:"wire",label:"GET redirect",code:"GET /15ftgG HTTP/1.1\nHost: sho.rt\nAccept: text/html,*/*"},
+        {k:"note",label:"Start here in the interview",text:"This is the smallest correct read path. It proves the mapping table shape before adding Redis, replicas, edge caching, or analytics."}
+      ],
+      snap:{title:"urls table (single source)",cap:"The mapping exists in the source table. No cache entry exists because the baseline has no cache.",
+        tables:[{name:"urls",note:"hash(15ftgG) routes to shard p17",cols:["short_key","long_url","user_id","expires_at","is_custom"],rows:[
+          {c:["15ftgG","https://example.com/very/long/path?ref=x","42","null","false"],hi:1,tag:"target"},
+          {c:["my-sale","https://shop.example.com/summer-sale","7","2026-08-01 00:00:00","true"]}
+        ]}]}},
+    {node:"lb",stage:"Baseline read",title:"Gateway forwards the anonymous read",
+      edges:[["lb","svc","route"],["svc","db","read"]],
+      narrate:"The gateway only validates that the path is a plausible key and forwards it to any healthy shortener instance. There is no edge hit and no Redis hit in this version.",
+      details:[
+        {k:"route",label:"One origin path",text:"Creates and redirects both reach the service fleet. Redirects are cheap individually, but the product has roughly **100 reads per write**, so this choice puts storage on the hot path."}
+      ],
+      snap:{title:"Read routing",cap:"Every redirect is routed to origin and then to the mapping store.",
+        tables:[{name:"routing",cols:["request","served by","cache?","mutation?"],rows:[
+          {c:["GET /15ftgG","shortener svc &rarr; urls","none","no"],hi:1},
+          {c:["POST /shorten","shortener svc &rarr; urls","none","yes"]}
+        ]}]}},
+    {node:"db",stage:"Baseline read",title:"One point lookup in the mapping store",
+      edges:[["svc","db","primary-key lookup"]],
+      narrate:"The service reads by `short_key`. There is no join, no range scan, and no synchronous click counter update. The row itself is the source of truth.",
+      details:[
+        {k:"query",label:"The actual baseline query",code:"SELECT short_key, long_url, expires_at, is_custom\n  FROM urls\n WHERE short_key = '15ftgG';\n-- one partition, one row"},
+        {k:"note",label:"Why this is fast at first",text:"A primary-key lookup is a few milliseconds when traffic is small. The problem is not query complexity; it is doing the same read **116K/s** before cache."}
+      ],
+      snap:{title:"urls table (source of truth)",cap:"The lookup returns one unexpired immutable mapping. The row is not modified.",
+        tables:[{name:"urls",cols:["short_key","long_url","expires_at","redirect_code"],rows:[
+          {c:["15ftgG","https://example.com/very/long/path?ref=x","null","302"],hi:1,tag:"read"}
+        ]}]}},
+    {node:"svc",stage:"Baseline read",title:"Check expiry and compose the redirect",
+      edges:[["svc","db","read"]],
+      narrate:"The service checks `expires_at` after the point read. This permanent generated mapping is still valid, so it can return the destination immediately.",
+      details:[
+        {k:"query",label:"Expiry check",code:"if row.expires_at is not null and row.expires_at <= now():\n    return 410\nreturn redirect(row.long_url, code=302)"}
+      ],
+      snap:{title:"Response assembled",cap:"A redirect response is ready. The mapping table remains unchanged.",
+        tables:[{name:"response",cols:["field","value"],rows:[
+          {c:["status","302 Found"],hi:1},
+          {c:["Location","https://example.com/very/long/path?ref=x"]},
+          {c:["source","urls table"]}
+        ]}]}},
+    {node:"client",stage:"Baseline read",title:"Redirect works — and the read ceiling is visible",
+      edges:[["svc","db","reads + writes"]],
+      narrate:"The browser follows the destination. Correctness is fine, but every click used the storage tier. That is exactly the load the Redis hit path removes.",
+      details:[
+        {k:"win",label:"What baseline gets right",text:"It is **correct and easy to reason about**: one key maps to one URL, expiry is checked in one place, and there is no cache to invalidate."},
+        {k:"scale",label:"Where it breaks",text:"At roughly **116K redirects/s** sustained and 3−5x viral peaks, repeating a DB read for every click wastes the source of truth. Continue in the Scaling journey, then compare with the Redis **hit path**.",pill:"next"}
+      ],
+      snap:{title:"Load today vs. the wall",cap:"The read path is simple; the numbers force the cache.",
+        tables:[{name:"capacity check",cols:["signal","baseline","cache target"],rows:[
+          {c:["Redirect rate","~116K /s to DB","mostly Redis"],hi:1},
+          {c:["Viral peak","~500K /s","edge/cache absorbed"],hi:1,tag:"risk"},
+          {c:["DB read QPS","same as redirect QPS","~1.2K /s at 99% hit"]}
+        ]}]}}
+  ]};
+
+var redirectMiss = {id:"redirect-miss",name:"Redirect · cache miss &rarr; populate",kind:"request",
+  live:["client","lb","svc","cache","replica","db"],
+  summary:"What happens when `url:15ftgG` is cold: Redis misses, one single-flight loader reads a replica, the immutable mapping is written back with a long jittered TTL, and the next redirect becomes the hit path. No version stamp is needed for generated immutable mappings.",
+  steps:[
+    {node:"client",stage:"Cache miss",title:"Browser asks for a cold short key",
+      narrate:"Same redirect as the hit path, but the Redis entry is absent because this is the first click after an eviction, cold start, or new region warm-up.",
+      details:[
+        {k:"wire",label:"GET redirect",code:"GET /15ftgG HTTP/1.1\nHost: sho.rt"}
+      ],
+      snap:{title:"Redirect cache — cold",cap:"The cache key is absent. This read cannot be served from Redis yet.",
+        tables:[{name:"redirect_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["url:15ftgG","—","**miss**"],hi:1,tag:"miss"}
+        ]}]}},
+    {node:"cache",stage:"Cache miss",title:"Redis miss elects one loader",
+      narrate:"The service checks Redis and sees a miss. A per-key single-flight guard lets one request load the mapping; concurrent clicks for the same short key wait for that result.",
+      details:[
+        {k:"key",label:"Single-flight",text:"Only one loader for `url:15ftgG` hits storage. Thousands of concurrent misses coalesce behind it, then read the filled value. A cold hot-key cannot stampede the DB."},
+        {k:"gotcha",label:"Negative cache random scans",text:"For keys that truly do not exist, store a short negative entry. Otherwise a scanner can request random codes and turn every 404 into a fresh DB lookup."}
+      ],
+      snap:{title:"Redirect cache — miss, loader elected",cap:"The key is marked loading while the single loader reads storage.",
+        tables:[{name:"redirect_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["url:15ftgG","—","loading"],hi:1,tag:"load"}
+        ]}]}},
+    {node:"replica",stage:"Cache miss",title:"Loader reads a DB replica",
+      edges:[["svc","replica","point lookup"],["db","replica","replicate"]],
+      narrate:"The loader reads a local replica instead of the write primary. Immutable mappings make replica lag safe, except for brand-new keys that can fall back to primary before returning 404.",
+      details:[
+        {k:"query",label:"Loader query (on a replica)",code:"SELECT short_key, long_url, expires_at, is_custom\n  FROM urls            -- read replica for shard p17\n WHERE short_key = '15ftgG';"},
+        {k:"repl",label:"Why lag is okay",text:"Generated mappings do not change after create. A slightly stale replica can only miss a just-created key; cache warm or primary fallback covers read-your-writes."}
+      ],
+      snap:{title:"urls replica — source value",cap:"The replica returns the immutable mapping that will populate Redis.",
+        tables:[{name:"urls (p17 replica)",cols:["short_key","long_url","expires_at","redirect_code"],rows:[
+          {c:["15ftgG","https://example.com/very/long/path?ref=x","null","302"],hi:1,tag:"read"}
+        ]}]}},
+    {node:"svc",stage:"Cache miss",title:"Write back with a long TTL",
+      edges:[["svc","cache","SET ttl"]],
+      narrate:"The loader copies the mapping into Redis with a long jittered TTL. Because this generated mapping is immutable, there is no version field and no normal invalidation path.",
+      details:[
+        {k:"query",label:"Write-back (populate)",code:"SET url:15ftgG '{\"long_url\":\"https://example.com/very/long/path?ref=x\",\"expires_at\":null,\"redirect_code\":302}' EX 2592000\n-- long TTL + jitter; no version needed for immutable mappings"},
+        {k:"gotcha",label:"Mutable links change the cache rule",text:"If a link can be deleted, retargeted, expire, or be malware-flagged, keep TTL bounded and support purge. The no-version, long-TTL rule is for immutable generated mappings."}
+      ],
+      snap:{title:"Redirect cache — populated",cap:"The cache is now warm. The current request can redirect, and the next read is a pure cache hit.",
+        tables:[{name:"redirect_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["url:15ftgG","long_url · expires null · code 302","**hit** · ttl 30d+jitter"],hi:1,tag:"filled"}
+        ]}]}},
+    {node:"client",stage:"Cache miss",title:"Redirect returned — next read is the hit path",
+      narrate:"The browser receives the 302. The very next click for `15ftgG` skips the DB entirely and follows the retitled hit-path flow.",
+      details:[
+        {k:"win",label:"Payoff",text:"One replica read filled a key that may absorb thousands of clicks/s. This is the **~99% hit ratio** that keeps redirect latency memory-bound and protects the mapping store."},
+        {k:"route",label:"Hit path after populate",text:"Next request: gateway &rarr; service &rarr; Redis `GET url:15ftgG` &rarr; 302. No DB read unless TTL expires or the key is evicted."}
+      ],
+      snap:{title:"Redirect cache — warm",cap:"Subsequent redirects for this key are served from Redis.",
+        tables:[{name:"redirect_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["url:15ftgG","https://example.com/very/long/path?ref=x","hit"]}
+        ]}]}}
+  ]};
+
+byId["redirect-e2e"].name = "Redirect click · with Redis cache (hit path)";
+byId["redirect-e2e"].kind = "request";
+byId["redirect-e2e"].live = ["client","lb","svc","cache","replica","db","analytics"];
+byId["redirect-e2e"].summary = "The read path **after** the Redis redirect cache exists. A hot key is served from cache, expiry is checked, analytics is emitted off-path, and the browser gets a 302 or 301. For the first design, run *Redirect · baseline (DB only)*; for a cold key, run *Redirect · cache miss &rarr; populate*.";
+
+var rest = d.deepFlows.filter(function(f){ return f.id !== "scaling" && f.id !== "redirect-e2e"; });
+d.deepFlows = [byId["scaling"], redirectDb, byId["redirect-e2e"], redirectMiss].concat(rest);
+})();

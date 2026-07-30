@@ -370,7 +370,7 @@ window.DATA['inventory'] = {
         {k:"note",label:"Rollup across FCs",text:"The badge answers \"can this region get one?\", which is the **sum across FCs that serve us-east**, not a single row. The rollup is maintained by the CDC consumer folding movement events, so reading it is O(1) and never touches the store."},
         {k:"gotcha",label:"Stale is acceptable here",text:"The entry may lag reality by a beat — a unit could sell out between refreshes. That's fine: the badge is **advisory**. The reserve's atomic decrement is the real guard, and it flips the SKU to out-of-stock the instant a reserve returns insufficient."},
       ]},
-      {node:"invdb",from:"api",title:"Cache miss: single-flight fill from a replica",snap:{cap:"Cache miss branch: one single-flight filler reads a replica and writes the cache; other shoppers wait on that fill. Still no mutation to inventory.",tables:[{name:"inventory replica (read-only fill)",cols:["sku_id","fc_id","available","replica_lag"],rows:[{c:["88021","7","115","<1s"],hi:1,tag:"read"},{c:["88021","12","0","<1s"]}]},{name:"availability_cache (after fill)",cols:["sku_id","region","available","in_stock","updated_at"],rows:[{c:["88021","us-east","115","true","12:00:05"],hi:1,tag:"filled"}]}]},narrate:"If the entry is cold (evicted, or a newly-viral SKU), exactly one filler reads the count — from a read replica, not the primary — and repopulates the cache. Everyone else waits on that single fill.",details:[
+      {node:"invdb",from:"api",title:"Cache miss: single-flight fill from a replica",snap:{cap:"Cache miss branch: one single-flight filler reads a replica and writes the cache; other shoppers wait on that fill. Still no mutation to inventory.",tables:[{name:"inventory replica (read-only fill)",cols:["sku_id","fc_id","available","replica_lag"],rows:[{c:["88021","7","115","&lt;1s"],hi:1,tag:"read"},{c:["88021","12","0","&lt;1s"]}]},{name:"availability_cache (after fill)",cols:["sku_id","region","available","in_stock","updated_at"],rows:[{c:["88021","us-east","115","true","12:00:05"],hi:1,tag:"filled"}]}]},narrate:"If the entry is cold (evicted, or a newly-viral SKU), exactly one filler reads the count — from a read replica, not the primary — and repopulates the cache. Everyone else waits on that single fill.",details:[
         {k:"query",label:"Rollup read (replica)",lang:"sql",code:"SELECT SUM(available) AS available\n  FROM inventory\n WHERE sku_id = 88021\n   AND fc_id IN (7, 12, 15);   -- FCs serving us-east\n-- served by a read replica; eventual consistency is OK for the badge"},
         {k:"gotcha",label:"Single-flight stops the stampede",text:"A viral SKU whose cache key just expired could send a **thundering herd** of misses to the store. Guard with per-key single-flight (one fill in progress, others coalesce onto it) + jittered TTL + a short negative cache for out-of-stock. The store sees one read, not a million."},
         {k:"repl",label:"Why replica, not primary",text:"The primary is reserved for the write path. Serving fills from **read replicas** keeps the availability path from stealing capacity the decrement needs. The slight replica lag is invisible against a badge that's already allowed to be stale."},
@@ -740,4 +740,143 @@ var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"
         ]}]}},
   ]};
 d.deepFlows=[scaling].concat(d.deepFlows);
+})();
+
+/* ---- cache read flows: baseline, hit path, miss populate ---- */
+(function(){
+var d = window.DATA["inventory"];
+var byId = {}; d.deepFlows.forEach(function(f){ byId[f.id]=f; });
+
+var availabilityDb = {id:"availability-db",name:"Availability · baseline (DB only)",kind:"request",
+  live:["client","api","invdb"],
+  summary:"The first read design: the Inventory API answers a product-page availability badge by querying the inventory store directly and rolling up the FC rows itself. Correct and simple, but it puts the **1M/s** browse firehose on the same source of truth that reserves need for no-oversell.",
+  steps:[
+    {node:"client",stage:"Baseline read",title:"Product page asks for one SKU badge",
+      edges:[["api","invdb","read + write"]],
+      narrate:"A shopper views SKU 88021 in us-east. In the baseline there is no Redis availability read model, so the read goes to the authoritative inventory rows.",
+      details:[
+        {k:"wire",label:"GET availability",code:"GET /v1/availability?sku_id=88021&region=us-east"},
+        {k:"note",label:"Badge, not promise",text:"Even in the baseline, availability is advisory. Checkout correctness still comes from the atomic reserve update, not from the badge the shopper saw seconds earlier."}
+      ],
+      snap:{title:"Inventory rows (single source)",cap:"The source table has per-FC rows. The API must roll them up to answer a regional badge.",
+        tables:[{name:"inventory",note:"FCs serving us-east",cols:["sku_id","fc_id","on_hand","reserved","available","version"],rows:[
+          {c:["88021","7","120","5","115","1903"],hi:1},
+          {c:["88021","12","40","40","0","880"],hi:1},
+          {c:["88021","15","100","1","99","451"],hi:1}
+        ]}]}},
+    {node:"api",stage:"Baseline read",title:"API validates, then reads the store",
+      edges:[["api","invdb","rollup read"]],
+      narrate:"The API routes by `sku_id` and asks the inventory store for all fulfillment centers that can serve the region. This is a read, but it competes with the write path in the baseline.",
+      details:[
+        {k:"route",label:"No split yet",text:"Availability reads and reserve writes share the same store capacity. That is fine for launch, but it becomes dangerous once browse traffic reaches **1M/s**."}
+      ],
+      snap:{title:"Read routing",cap:"The same authoritative store serves browse and checkout in the baseline.",
+        tables:[{name:"routing",cols:["path","served by","consistency","mutation?"],rows:[
+          {c:["availability badge","inventory store","fresh read","no"],hi:1},
+          {c:["reserve checkout","inventory store","strong write","yes"],hi:1,tag:"must protect"}
+        ]}]}},
+    {node:"invdb",stage:"Baseline read",title:"One rollup query sums availability",
+      edges:[["api","invdb","SUM available"]],
+      narrate:"The baseline query sums available units across FCs that can ship to us-east, then converts the number into a coarse badge.",
+      details:[
+        {k:"query",label:"The actual baseline query",code:"SELECT SUM(on_hand - reserved) AS available\n  FROM inventory\n WHERE sku_id = 88021\n   AND fc_id IN (7, 12, 15);\n-- available = 115 + 0 + 99 = 214"},
+        {k:"gotcha",label:"Rollup unit of truth",text:"The product badge answers a regional question: can some FC serve this shopper? That is the **sum across eligible FCs**, not one arbitrary row."}
+      ],
+      snap:{title:"Inventory table (source of truth)",cap:"Computed on the store: **available = 214**, so the coarse badge is **in stock**. Rows are untouched.",
+        tables:[{name:"inventory",cols:["sku_id","fc_id","available","version"],rows:[
+          {c:["88021","7","115","1903"],hi:1},
+          {c:["88021","12","0","880"]},
+          {c:["88021","15","99","451"],hi:1}
+        ]}]}},
+    {node:"api",stage:"Baseline read",title:"API returns a coarse badge",
+      edges:[["api","invdb","rollup read"]],
+      narrate:"The API maps the exact rollup into a product-page answer. The shopper sees a badge, not an invariant; a reserve can still fail if stock changes before checkout.",
+      details:[
+        {k:"note",label:"Why coarse",text:"Showing exact live counts makes every tiny movement visible and forces fresher reads. A bucket such as `in_stock`, `low`, or `out` is stable enough for cache and honest enough for UX."}
+      ],
+      snap:{title:"Response assembled",cap:"No mutation happened; the exact count is converted into a cacheable badge shape.",
+        tables:[{name:"availability response",cols:["sku_id","region","available_rollup","bucket"],rows:[
+          {c:["88021","us-east","214","in_stock"],hi:1}
+        ]}]}},
+    {node:"client",stage:"Baseline read",title:"Badge renders — and the read wall appears",
+      edges:[["api","invdb","reads + writes"]],
+      narrate:"The product page can render. But this same query at browse scale would starve the store capacity that reserves need for the atomic decrement.",
+      details:[
+        {k:"win",label:"What baseline gets right",text:"It is **correct and legible**: the badge is a real rollup of authoritative rows, and checkout still has the exact no-oversell guard."},
+        {k:"scale",label:"Where it breaks",text:"Peak availability reads are about **1M/s** versus **10K/s** reserve writes. Serving that from the source of truth lets stale-tolerant reads compete with the only path that prevents oversell.",pill:"next"}
+      ],
+      snap:{title:"Load today vs. the wall",cap:"The design is right; the read volume forces the derived cache.",
+        tables:[{name:"capacity check",cols:["signal","baseline","cache target"],rows:[
+          {c:["Availability reads","~1M /s to store","mostly Redis"],hi:1,tag:"risk"},
+          {c:["Reserve writes","~10K /s steady","primary protected"]},
+          {c:["Read:write skew","~100:1","absorbed by cache"]}
+        ]}]}}
+  ]};
+
+var availabilityMiss = {id:"availability-miss",name:"Availability · cache miss &rarr; populate",kind:"request",
+  live:["client","api","cache","invdb","ledger"],
+  summary:"What happens when `avail:88021:us-east` is cold: Redis misses, a single-flight loader reads a replica, computes the regional rollup, writes it back with a short TTL and version, and the next product-page read is a hit. Because this is mutable inventory, decrement events invalidate or overwrite the entry.",
+  steps:[
+    {node:"client",stage:"Cache miss",title:"Product page asks for a cold SKU",
+      narrate:"Same availability read as the hit path, but the derived Redis entry is absent because the SKU just went viral, was evicted, or its short TTL expired.",
+      details:[
+        {k:"wire",label:"GET availability",code:"GET /v1/availability?sku_id=88021&region=us-east"}
+      ],
+      snap:{title:"Availability cache — cold",cap:"The regional rollup key is absent. The read cannot be served from Redis yet.",
+        tables:[{name:"availability_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["avail:88021:us-east","—","**miss**"],hi:1,tag:"miss"}
+        ]}]}},
+    {node:"cache",stage:"Cache miss",title:"Redis miss elects one rollup loader",
+      narrate:"The API sees a miss. A per-SKU single-flight guard chooses one loader to rebuild the rollup while all concurrent product-page reads wait briefly.",
+      details:[
+        {k:"key",label:"Single-flight",text:"Only one loader for `avail:88021:us-east` reads the store. A viral SKU with a cold key produces one fill, not **1M/s** duplicate rollup queries."},
+        {k:"gotcha",label:"Out-of-stock negative cache",text:"If the rollup is zero, cache `out` briefly too. Otherwise a sold-out hot SKU repeatedly misses and probes the store just to rediscover zero."}
+      ],
+      snap:{title:"Availability cache — miss, loader elected",cap:"The key is marked loading so duplicate loaders are suppressed.",
+        tables:[{name:"availability_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["avail:88021:us-east","—","loading"],hi:1,tag:"load"}
+        ]}]}},
+    {node:"invdb",stage:"Cache miss",title:"Loader reads a replica and computes the rollup",
+      edges:[["api","invdb","read replica"]],
+      narrate:"The loader reads replica rows for the FCs serving us-east, then sums available and carries the maximum version into the cache value.",
+      details:[
+        {k:"query",label:"Loader query (on a replica)",code:"SELECT fc_id, on_hand - reserved AS available, version\n  FROM inventory            -- read replica\n WHERE sku_id = 88021\n   AND fc_id IN (7, 12, 15);"},
+        {k:"repl",label:"Why replica, not primary",text:"The primary is reserved for conditional decrements. A badge can tolerate replica lag because checkout re-checks the primary before holding stock."}
+      ],
+      snap:{title:"Inventory replica — source rows",cap:"The loader reads three FC rows and computes **available = 214**, `bucket = in_stock`, `ver = 1903`.",
+        tables:[{name:"inventory (replica)",cols:["sku_id","fc_id","available","version"],rows:[
+          {c:["88021","7","115","1903"],hi:1},
+          {c:["88021","12","0","880"]},
+          {c:["88021","15","99","451"],hi:1}
+        ]}]}},
+    {node:"api",stage:"Cache miss",title:"Write back a short-TTL, versioned entry",
+      edges:[["api","cache","SET ttl"]],
+      narrate:"The loader writes the derived badge to Redis. Inventory is mutable, so the value carries a version and a short TTL; later movement events can overwrite or invalidate it.",
+      details:[
+        {k:"query",label:"Write-back (populate)",code:"SET avail:88021:us-east '{\"available\":214,\"bucket\":\"in_stock\",\"ver\":1903,\"ts\":\"12:00:05\"}' EX 5\n-- short TTL + version because inventory changes constantly"},
+        {k:"gotcha",label:"Invalidation on decrement",text:"A reserve, release, commit, or restock writes a movement event. The cache consumer updates this key write-if-newer by `ver`, or deletes it on uncertainty. A stale badge can cause a clean 409 at reserve, but it cannot oversell."}
+      ],
+      snap:{title:"Availability cache — populated",cap:"The derived entry is warm, short-lived, and version-stamped. The next read is a hit.",
+        tables:[{name:"availability_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["avail:88021:us-east","available 214 · in_stock · v1903","**hit** · ttl 5s"],hi:1,tag:"filled"}
+        ]}]}},
+    {node:"client",stage:"Cache miss",title:"Badge returned — next read is the hit path",
+      narrate:"The shopper sees `in stock`. The next product-page read for SKU 88021 in us-east is served directly from Redis until TTL expiry or a movement event refreshes the key.",
+      details:[
+        {k:"win",label:"Payoff",text:"One replica rollup fills a key that can absorb a huge browse spike. The store stays focused on strongly-consistent reserve writes."},
+        {k:"route",label:"Mutation refresh path",text:"Reserve decrements append movement events through the ledger. Consumers update or invalidate the Redis rollup asynchronously, keeping cache work off the decrement latency path."}
+      ],
+      snap:{title:"Availability cache — warm",cap:"Subsequent reads are O(1) cache hits and remain advisory.",
+        tables:[{name:"availability_cache (Redis)",cols:["key","available","bucket","state"],rows:[
+          {c:["avail:88021:us-east","214","in_stock","hit"]}
+        ]}]}}
+  ]};
+
+byId["availability-e2e"].name = "Read availability · with cache (hit path)";
+byId["availability-e2e"].kind = "request";
+byId["availability-e2e"].live = ["client","api","cache","invdb"];
+byId["availability-e2e"].summary = "The read path **after** the availability cache exists. A hot SKU badge is served from a rolled-up Redis entry, with staleness kept outside the no-oversell decrement path. For the first design, run *Availability · baseline (DB only)*; for a cold key, run *Availability · cache miss &rarr; populate*.";
+
+var rest = d.deepFlows.filter(function(f){ return f.id !== "scaling" && f.id !== "availability-e2e"; });
+d.deepFlows = [byId["scaling"], availabilityDb, byId["availability-e2e"], availabilityMiss].concat(rest);
 })();

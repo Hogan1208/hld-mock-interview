@@ -860,6 +860,141 @@ window.DATA['feed'] = {
 /* ---- scaling journey ---- */
 (function(){
 var d = window.DATA["feed"];
+var byId = {}; d.deepFlows.forEach(function(f){ byId[f.id]=f; });
+
+var timelineDb = {id:"timeline-db",name:"Timeline read · baseline (DB only)",kind:"request",
+  live:d.basic,
+  summary:"The first correct design: no feed cache and no fan-out cache list. The Feed service queries the follow graph and posts directly, then returns a ranked page. The <em>Scaling journey</em> explains why this DB-only read path gives way to cached timelines and the hit path.",
+  steps:[
+    {node:"client",stage:"Baseline read",title:"Client opens the home timeline",
+      edges:[["lb","feed","route"],["feed","db","read graph + posts"]],
+      narrate:"User 42 opens the app and asks for the first page. In the baseline there is no Redis timeline, no prebuilt candidate list, and no async delivery view to read from.",
+      details:[
+        {k:"wire",label:"GET /timeline",code:"GET /v1/timeline?user_id=42&limit=25\nX-Session: user-42-session"},
+        {k:"note",label:"One store, every read",text:"Day one is deliberately plain: the durable post and graph store answers both writes and timeline reads. Correct first, then optimize when the numbers force it."},
+      ],
+      snap:{title:"Post + graph DB (single read source)",cap:"The source of truth is also the only read model. Nothing is cached yet.",
+        tables:[{name:"follows",note:"user 42 follows a normal author and a celebrity",cols:["follower_id","followee_id","kind"],rows:[
+          {c:["42","7","normal"],hi:1},
+          {c:["42","901","celebrity"],hi:1},
+        ]},{name:"posts",cols:["post_id","author_id","created_at"],rows:[
+          {c:["1487200000002","7","2026-07-22 10:01:12"],hi:1},
+          {c:["1487200000003","901","2026-07-22 10:02:30"],hi:1},
+        ]}]}},
+    {node:"lb",stage:"Baseline read",title:"Gateway sends the read to Feed service",
+      edges:[["lb","feed","route"]],
+      narrate:"The gateway authenticates and routes to any healthy feed-service instance in the user's home region. With no cache tier, every app open still becomes database work behind the service.",
+      details:[
+        {k:"route",label:"Stateless routing",text:"No session affinity is needed: the feed service owns no durable per-request state. The cost sits downstream in the DB query."},
+      ],
+      snap:{title:"Routing context",cap:"A read has been admitted, but no cache key can absorb it.",
+        tables:[{name:"users",cols:["user_id","handle","home_region","follows"],rows:[
+          {c:["42","@ada","us-east","~300"],hi:1,tag:"reader"},
+        ]}]}},
+    {node:"db",stage:"Baseline read",title:"One query fans in followees' recent posts",
+      edges:[["feed","db","timeline query"]],
+      narrate:"The Feed service asks the DB for the people user 42 follows, joins to their recent posts, sorts, and returns the top page. This is fan-out-on-read: correct, but repeated on every feed open.",
+      details:[
+        {k:"query",label:"The actual baseline query",code:"SELECT p.post_id, p.author_id, p.created_at\n  FROM follows f\n  JOIN posts p ON p.author_id = f.followee_id\n WHERE f.follower_id = 42\n ORDER BY p.created_at DESC\n LIMIT 25;"},
+        {k:"gotcha",label:"Why this hurts later",text:"A user following ~300 accounts makes this a join, sort, and hydration setup on every read. At social-network read rates, repeating that work is the bottleneck."},
+      ],
+      snap:{title:"DB result set",cap:"The DB computes the candidate order directly from source tables. No timeline list is populated.",
+        tables:[{name:"query result",cols:["rank","post_id","author_id","reason"],rows:[
+          {c:["1","1487200000003","901","recent followed celebrity"],hi:1},
+          {c:["2","1487200000002","7","recent followed normal author"],hi:1},
+          {c:["3","1487200000001","42","self post"],hi:1},
+        ]}]}},
+    {node:"feed",stage:"Baseline read",title:"Hydrate and assemble the response",
+      edges:[["feed","db","hydrate posts"]],
+      narrate:"After the DB returns ids, the service still hydrates canonical post bodies and author metadata. The response is correct, but latency scales with DB fan-in and hydration scatter.",
+      details:[
+        {k:"query",label:"Hydration",code:"SELECT post_id, author_id, text, media_ids, created_at\n  FROM posts\n WHERE post_id IN (1487200000003, 1487200000002, 1487200000001);"},
+        {k:"note",label:"Still no mutation",text:"This baseline read changes no rows. It simply spends database CPU and IO for work that hot active users will ask for again and again."},
+      ],
+      snap:{title:"Response assembled",cap:"A ranked page and cursor are returned; all source tables remain unchanged.",
+        tables:[{name:"timeline page",cols:["position","post_id","cursor_score"],rows:[
+          {c:["1","1487200000003","1487200950"],hi:1},
+          {c:["2","1487200000002","1487200872"]},
+          {c:["3","1487200000001","1487200800"]},
+        ]}]}},
+    {node:"client",stage:"Baseline read",title:"The page renders — and the scaling wall is obvious",
+      edges:[["feed","db","read graph + posts"]],
+      narrate:"The user sees a valid timeline, so the baseline satisfies the product. The problem is volume: the same DB-only read path must survive billions of feed opens per day.",
+      details:[
+        {k:"win",label:"What baseline gets right",text:"It is **correct and rebuildable**: the DB remains the source of truth for posts and follows, and no cache invalidation policy can hide data."},
+        {k:"scale",label:"Where it breaks",text:"The file's capacity pass says **~70K reads/s sustained** and up to **~300K/s peak**. A join-and-sort per read cannot hold the under-200 ms p99 target, which forces cached timeline lists."},
+      ],
+      snap:{title:"Load today vs. the wall",cap:"The design is right; the read volume forces the cache in the next flow.",
+        tables:[{name:"capacity check",cols:["signal","value","baseline pressure"],rows:[
+          {c:["Timeline reads","~70K /s sustained","DB join repeated"],hi:1},
+          {c:["Peak reads","~300K /s","p99 risk"],hi:1,tag:"risk"},
+          {c:["Post writes","~3,500 /s","small by comparison"]},
+        ]}]}},
+  ]};
+
+var timelineMiss = {id:"timeline-miss",name:"Timeline read · cache miss &rarr; populate",kind:"request",
+  live:["client","lb","feed","cache","db","fanout"],
+  summary:"What happens when `timeline:42` is absent or expired. One single-flight loader rebuilds the derived list from posts + follows, writes it back with a TTL and version marker, and the next read becomes the hit path. This is how a cold feed avoids becoming a blank feed or a DB stampede.",
+  steps:[
+    {node:"client",stage:"Cache miss",title:"Client asks for a cold timeline key",
+      narrate:"The same `GET /timeline` reaches the system, but user 42's cached feed list is absent after a cold start or eviction. The service must rebuild from source instead of returning an empty feed.",
+      details:[
+        {k:"wire",label:"GET /timeline",code:"GET /v1/timeline?user_id=42&limit=25&cursor=head"},
+      ],
+      snap:{title:"Feed cache — cold",cap:"The per-user timeline key is absent. A read cannot be served from Redis yet.",
+        tables:[{name:"feed_cache (Redis)",note:"key = timeline:{user_id}",cols:["key","value","state"],rows:[
+          {c:["timeline:42","—","**miss**"],hi:1,tag:"miss"},
+          {c:["timeline:7","[1487200000001]","hit"]},
+        ]}]}},
+    {node:"cache",stage:"Cache miss",title:"Lookup misses, so one loader is elected",
+      narrate:"Feed service asks Redis for `timeline:42`. The key misses. Request coalescing gives one loader the right to rebuild while duplicate reads for the same user wait briefly.",
+      details:[
+        {k:"key",label:"Single-flight",text:"A per-key lock means **one** rebuild queries `follows` and `posts` for `timeline:42`; thousands of retries wait and then read the filled list. A cold key cannot stampede the DB."},
+        {k:"gotcha",label:"Never blank the feed",text:"The feed cache is derived, not authoritative. On a real miss, rebuild lazily from source; returning an empty list would turn cache loss into user-visible data loss."},
+      ],
+      snap:{title:"Feed cache — miss, loader elected",cap:"The key is marked loading so duplicate rebuilds are suppressed.",
+        tables:[{name:"feed_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["timeline:42","—","loading"],hi:1,tag:"load"},
+          {c:["lock:timeline:42","loader feed-17","ttl 3s"],hi:1},
+        ]}]}},
+    {node:"db",stage:"Cache miss",title:"Single-flight loader rebuilds from source",
+      edges:[["cache","db","miss rebuild"]],
+      narrate:"The loader reads the follow graph and recent posts from the durable store or a read replica. It does the same fan-out-on-read work as the baseline, but only once for this cold key.",
+      details:[
+        {k:"query",label:"Rebuild query",code:"SELECT p.post_id, p.author_id, p.created_at\n  FROM follows f\n  JOIN posts p ON p.author_id = f.followee_id\n WHERE f.follower_id = 42\n ORDER BY p.created_at DESC\n LIMIT 800;"},
+        {k:"repl",label:"Replica when possible",text:"The loader can read a replica because feed lists are eventually consistent. The author self-insert and post path still protect read-your-own-writes for the writer."},
+      ],
+      snap:{title:"Source tables — rebuild input",cap:"Durable rows come back; these ids become the cache entry.",
+        tables:[{name:"posts + follows",cols:["post_id","author_id","score","ver"],rows:[
+          {c:["1487200000003","901","1487200950","v77"],hi:1},
+          {c:["1487200000002","7","1487200872","v41"],hi:1},
+          {c:["1487200000001","42","1487200800","v40"],hi:1},
+        ]}]}},
+    {node:"feed",stage:"Cache miss",title:"Write back the rebuilt list with TTL + version",
+      edges:[["feed","cache","populate"]],
+      narrate:"Feed service writes the ordered ids back into Redis with a short TTL, trims to the hot window, and records a version or build watermark. The cache is now warm for user 42.",
+      details:[
+        {k:"query",label:"Write-back (populate)",code:"ZADD timeline:42 1487200950 1487200000003\nZADD timeline:42 1487200872 1487200000002\nZADD timeline:42 1487200800 1487200000001\nZREMRANGEBYRANK timeline:42 0 -801\nEXPIRE timeline:42 300\nSET timeline:42:ver v77 EX 300"},
+        {k:"note",label:"Invalidate or refresh on new post",text:"Fan-out-on-write appends new post ids to affected `timeline:userId` keys. For celebrity posts, the read path merges recent author posts; for normal authors, fan-out refreshes or invalidates follower timelines so the next read sees the new id."},
+      ],
+      snap:{title:"Feed cache — populated",cap:"The ordered list is filled and version-stamped. The next read is a hit.",
+        tables:[{name:"feed_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["timeline:42","[1487200000003,1487200000002,1487200000001]","**hit** · ttl 300s"],hi:1,tag:"filled"},
+          {c:["timeline:42:ver","v77","filled"],hi:1},
+        ]}]}},
+    {node:"client",stage:"Cache miss",title:"Timeline returned — future reads hit Redis",
+      narrate:"The user receives the page. The very next `GET /timeline` for user 42 reads the prebuilt ids from Redis, then hydrates posts exactly like the hit path flow.",
+      details:[
+        {k:"win",label:"Payoff",text:"One DB rebuild creates a cache entry that can absorb repeated app opens for the active user. Across the fleet, this is what keeps **~300K/s peak** reads within the p99 budget."},
+        {k:"route",label:"Derived view contract",text:"The cache can be lost, expired, or rebuilt because posts and follows remain canonical in the DB. Cache failure is latency, not data loss."},
+      ],
+      snap:{title:"Feed cache — warm",cap:"Subsequent reads for user 42 start with a Redis range read.",
+        tables:[{name:"feed_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["timeline:42","[1487200000003,1487200000002,1487200000001]","hit"]},
+          {c:["timeline:42:ver","v77","hit"]},
+        ]}]}},
+  ]};
+
 var scaling = {id:"scaling",name:"From query-time feed to hybrid fan-out",kind:"scale",
   live:["client","lb","feed","db"],
   summary:"Start with a feed service that queries the graph and posts directly, then let the social-network numbers force cached timelines, hybrid fan-out, and a separate media path.",
@@ -928,5 +1063,9 @@ var scaling = {id:"scaling",name:"From query-time feed to hybrid fan-out",kind:"
         {c:["Media outage","isolated path","text feed survives"]}
       ]}]}}
   ]};
-d.deepFlows = [scaling].concat(d.deepFlows);
+byId['timeline-read-e2e'].name = "Read timeline (hit path)";
+byId['timeline-read-e2e'].live = ["client","lb","feed","cache","db","media"];
+byId['timeline-read-e2e'].summary = "Hit path for a warm timeline: starts after <em>Timeline read · baseline (DB only)</em> has justified the cache and <em>Timeline read · cache miss &rarr; populate</em> has filled `timeline:userId`. Steps are unchanged: Redis id-list read, celebrity merge, hydration, media refs, cursor.";
+var rest = d.deepFlows.filter(function(f){ return f.id !== 'scaling' && f.id !== 'timeline-read-e2e'; });
+d.deepFlows = [scaling, timelineDb, byId['timeline-read-e2e'], timelineMiss].concat(rest);
 })();

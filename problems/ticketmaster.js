@@ -883,6 +883,143 @@ window.DATA['ticketmaster'] = {
 /* ---- scaling journey ---- */
 (function(){
 var d=window.DATA['ticketmaster'];
+var byId = {}; d.deepFlows.forEach(function(f){ byId[f.id]=f; });
+
+var browseDb = {id:"browse-db",name:"Browse seat map · baseline (DB only)",kind:"request",
+  live:d.basic,
+  summary:"The first correct event-page read: no seat-map cache, no search index, no CDN assumption. Booking reads event metadata and available seats directly from the inventory store. The <em>Scaling journey</em> then shows why hot on-sales force a derived seat-map cache and the hit path.",
+  steps:[
+    {node:"client",stage:"Baseline read",title:"Client opens the event page",
+      edges:[["gw","booking","browse"],["booking","db","read event + seats"]],
+      narrate:"A fan opens event `evt-501` and asks for the seat map. In the baseline, the booking service reads the same inventory database that later enforces the reserve write.",
+      details:[
+        {k:"wire",label:"GET event + seat map",code:"GET /v1/events/evt-501\nGET /v1/events/evt-501/seatmap"},
+        {k:"note",label:"One source early",text:"At launch, event metadata and seat state can live in one relational inventory store. The read is simple and correct before any cache exists."},
+      ],
+      snap:{title:"Inventory DB (single read source)",cap:"The source of truth is also the only place the event page can read.",
+        tables:[{name:"events",cols:["event_id","name","venue_id","on_sale_at"],rows:[
+          {c:["evt-501","Taylor Swift - Eras Tour","ven-11","2026-07-22 10:00:00"],hi:1},
+        ]},{name:"seats",cols:["seat_id","section","row","num","status"],rows:[
+          {c:["s-101","Floor A","1","14","sold"]},
+          {c:["s-102","Floor A","1","15","held"]},
+          {c:["s-103","Floor A","1","16","available"],hi:1},
+        ]}]}},
+    {node:"gw",stage:"Baseline read",title:"Gateway routes a plain browse read",
+      edges:[["gw","booking","browse"]],
+      narrate:"The gateway authenticates if needed, validates the event id, and forwards the browse request. There is no cache key or edge object to serve yet, so origin sees every event-page refresh.",
+      details:[
+        {k:"route",label:"Read and write still share origin",text:"`GET /seatmap` and `POST /reserve` are different contracts, but in the baseline they both ultimately depend on the same inventory store capacity."},
+      ],
+      snap:{title:"Route table — baseline",cap:"All browse reads fall through to booking and the DB.",
+        tables:[{name:"edge routes",cols:["request","served_by","mutation"],rows:[
+          {c:["GET /events/evt-501","booking + DB","no"],hi:1},
+          {c:["GET /seatmap evt-501","booking + DB","no"],hi:1},
+          {c:["POST /reserve","booking + DB","yes"]},
+        ]}]}},
+    {node:"db",stage:"Baseline read",title:"One query returns sections and available seats",
+      edges:[["booking","db","read seats"]],
+      narrate:"Booking asks the DB for event metadata plus a section-level availability view. This is enough to render an event page before users choose exact seats.",
+      details:[
+        {k:"query",label:"The actual baseline query",code:"SELECT e.event_id, e.name, s.section,\n       count(*) FILTER (WHERE s.status = 'available') AS available_seats\n  FROM events e\n  JOIN seats s ON s.event_id = e.event_id\n WHERE e.event_id = 'evt-501'\n GROUP BY e.event_id, e.name, s.section\n ORDER BY s.section;"},
+        {k:"gotcha",label:"Read is not authority to buy",text:"This query can say Floor A has seats, but only the reserve transaction can claim a specific row. Browse is a hint; reserve is truth."},
+      ],
+      snap:{title:"Section availability from DB",cap:"The database computes the display counts directly from seat rows. No cache is populated.",
+        tables:[{name:"section availability",cols:["event_id","section","available_seats"],rows:[
+          {c:["evt-501","Floor A","1"],hi:1,tag:"scarce"},
+          {c:["evt-501","Lower Bowl","482"]},
+          {c:["evt-501","Upper Bowl","1904"]},
+        ]}]}},
+    {node:"booking",stage:"Baseline read",title:"Booking assembles the display model",
+      edges:[["booking","db","read event + seats"]],
+      narrate:"The service formats event metadata, venue data, and seat availability into a page response. It mutates nothing and holds no lock, but it still consumes DB read capacity.",
+      details:[
+        {k:"query",label:"Exact-seat variant",code:"SELECT seat_id, section, row, num, status, hold_expires_at\n  FROM seats\n WHERE event_id = 'evt-501'\n ORDER BY section, row, num;"},
+        {k:"note",label:"Correct but uncached",text:"The response is exact at the instant of the read. Under an on-sale, it becomes stale almost immediately, and repeating it for every viewer is waste."},
+      ],
+      snap:{title:"Seat-map response",cap:"The client gets a live-ish view, but the DB paid for every row read.",
+        tables:[{name:"seat-map page",cols:["seat_id","section","status","meaning"],rows:[
+          {c:["s-101","Floor A","sold","display red"]},
+          {c:["s-102","Floor A","held","display gray"]},
+          {c:["s-103","Floor A","available","display green"],hi:1},
+        ]}]}},
+    {node:"client",stage:"Baseline read",title:"Fan sees the map — and the read ceiling appears",
+      edges:[["booking","db","read seats"]],
+      narrate:"The fan can browse, so the baseline satisfies the feature. But during a hot on-sale, hundreds of thousands of viewers repeatedly ask for the same volatile map while the DB must protect reserve writes.",
+      details:[
+        {k:"win",label:"What baseline gets right",text:"It is **correct and legible**: event data, seat rows, and the reserve invariant all live in one place. No stale cache can hide a sold seat from the source of truth."},
+        {k:"scale",label:"Where it breaks",text:"The file's capacity pass names **~500K seat-map reads/s** at peak and a hot event around **~450K reads/s**. Those display reads must move to cache so reserve writes keep their DB headroom."},
+      ],
+      snap:{title:"Load today vs. the wall",cap:"The baseline read works until on-sale polling competes with inventory writes.",
+        tables:[{name:"capacity check",cols:["signal","value","baseline pressure"],rows:[
+          {c:["Steady browse","~10K req/s","ok early"]},
+          {c:["Seat-map polling","~500K/s peak","DB read firehose"],hi:1,tag:"risk"},
+          {c:["Inventory writes","~5-10K/s ceiling","must be protected"],hi:1},
+        ]}]}},
+  ]};
+
+var browseMiss = {id:"browse-miss",name:"Browse seat map · cache miss &rarr; populate",kind:"request",
+  live:["client","gw","booking","cache","db","queue","search"],
+  summary:"What happens when `seatmap:evt-501` is absent or expired. One single-flight loader reads a replica, writes a short-TTL seat-map snapshot with a version, and later readers hit cache. The snapshot is advisory: reserve still re-checks the DB authoritatively.",
+  steps:[
+    {node:"client",stage:"Cache miss",title:"Client asks for a cold seat-map key",
+      narrate:"The same event-page read arrives, but `seatmap:evt-501` is missing after expiry or a cache restart. The system needs one fill, not a half-million DB reads.",
+      details:[
+        {k:"wire",label:"GET seat map",code:"GET /v1/events/evt-501/seatmap"},
+      ],
+      snap:{title:"Seat-map cache — cold",cap:"The hot event key is absent. A read cannot be served from Redis yet.",
+        tables:[{name:"seatmap_cache (Redis)",note:"hot key is replicated as seatmap:evt-501#0..#15 after fill",cols:["key","value","state"],rows:[
+          {c:["seatmap:evt-501#7","—","**miss**"],hi:1,tag:"miss"},
+          {c:["seatmap:evt-501:ver","—","miss"],hi:1},
+        ]}]}},
+    {node:"cache",stage:"Cache miss",title:"Cache miss elects a single loader",
+      narrate:"Booking or the read service checks Redis and finds the key absent. A per-event single-flight lock lets one loader fill the map while duplicate viewers wait or receive a last-known snapshot.",
+      details:[
+        {k:"key",label:"Single-flight",text:"A per-event lock means **one** loader hits the read replica for `seatmap:evt-501`; concurrent viewers wait briefly or get stale-last-good. A cold hot event cannot stampede inventory."},
+        {k:"gotcha",label:"Protect reserve first",text:"If the cache is cold during the on-sale, shed or stale-serve seat-map reads before letting display traffic consume the DB capacity needed by reserve."},
+      ],
+      snap:{title:"Seat-map cache — miss, loader elected",cap:"The key is marked loading and duplicate fills are suppressed.",
+        tables:[{name:"seatmap_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["seatmap:evt-501#7","—","loading"],hi:1,tag:"load"},
+          {c:["lock:seatmap:evt-501","loader booking-4","ttl 2s"],hi:1},
+        ]}]}},
+    {node:"db",stage:"Cache miss",title:"Loader reads a replica or snapshot",
+      edges:[["cache","db","fill from replica"]],
+      narrate:"The loader reads event and seat availability from a replica or read-optimized snapshot, not the write leader. Slight staleness is acceptable because this map cannot reserve a seat.",
+      details:[
+        {k:"query",label:"Loader query",code:"SELECT e.event_id, e.name, s.section,\n       count(*) FILTER (WHERE s.status = 'available') AS available_seats,\n       max(s.version) AS version\n  FROM events e\n  JOIN seats s ON s.event_id = e.event_id\n WHERE e.event_id = 'evt-501'\n GROUP BY e.event_id, e.name, s.section;"},
+        {k:"repl",label:"Replica, by design",text:"Seat-map freshness can lag by 1-2 seconds. Exact seat ownership is decided later by the strongly-consistent reserve transaction."},
+      ],
+      snap:{title:"Inventory replica — source values",cap:"Section counts and a version watermark come back; these become the cache snapshot.",
+        tables:[{name:"section availability (replica)",cols:["event_id","section","available_seats","ver"],rows:[
+          {c:["evt-501","Floor A","1","v901"],hi:1},
+          {c:["evt-501","Lower Bowl","482","v901"]},
+          {c:["evt-501","Upper Bowl","1904","v901"]},
+        ]}]}},
+    {node:"booking",stage:"Cache miss",title:"Write back snapshot with short TTL + version",
+      edges:[["booking","cache","populate"]],
+      narrate:"The loader writes the seat-map snapshot into Redis replicas with a 1-2 second TTL, jitter, and the DB version watermark. The hot read key is now filled.",
+      details:[
+        {k:"query",label:"Write-back (populate)",code:"SET seatmap:evt-501#7  {as_of:'2026-07-22T10:02:56Z',ver:901,sections:[...]}  EX 2\nSET seatmap:evt-501#8  {as_of:'2026-07-22T10:02:56Z',ver:901,sections:[...]}  EX 2\nSET seatmap:evt-501:ver v901 EX 2"},
+        {k:"note",label:"Invalidate on reserve",text:"Every hold, release, or sale publishes a seat-state event. Cache updates are write-if-newer by version, and reserve can also delete the affected event key so the next read fills fresh."},
+      ],
+      snap:{title:"Seat-map cache — populated",cap:"The event snapshot is filled and version-stamped. The next read is a hit.",
+        tables:[{name:"seatmap_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["seatmap:evt-501#7","sections · as_of 10:02:56 · v901","**hit** · ttl 2s"],hi:1,tag:"filled"},
+          {c:["seatmap:evt-501:ver","v901","filled"],hi:1},
+        ]}]}},
+    {node:"client",stage:"Cache miss",title:"Map returned — later reads are cache hits",
+      narrate:"The client receives a live-ish map. The next viewer for the same event reads the Redis snapshot or CDN object instead of touching the inventory DB.",
+      details:[
+        {k:"win",label:"Payoff",text:"One replica read fills an event key that can absorb the hot read herd. This is what lets **~500K/s** seat-map polling coexist with a protected reserve write path."},
+        {k:"gotcha",label:"Advisory cache",text:"The map is a display hint only. Clicking a green seat switches to reserve, which re-checks the DB row and returns `409` if the cached snapshot was stale."},
+      ],
+      snap:{title:"Seat-map cache — warm",cap:"Subsequent event-page reads are pure cache hits until TTL, invalidation, or version update.",
+        tables:[{name:"seatmap_cache (Redis)",cols:["key","value","state"],rows:[
+          {c:["seatmap:evt-501#7","sections · as_of 10:02:56 · v901","hit"]},
+          {c:["seatmap:evt-501:ver","v901","hit"]},
+        ]}]}},
+  ]};
+
 var scaling={id:"scaling",name:"From row locks to on-sale scale",kind:"scale",
   live:["client","gw","booking","db"],
   summary:"Start with the one-seat-one-order database invariant, then let checkout time, on-sale stampedes, read firehoses, and discovery traffic force each additional tier.",
@@ -967,5 +1104,9 @@ var scaling={id:"scaling",name:"From row locks to on-sale scale",kind:"scale",
           {c:["Buying invariant","conditional DB write","no double-sell"]},
         ]}]}},
   ]};
-d.deepFlows=[scaling].concat(d.deepFlows);
+byId['browse-onsale-e2e'].name = "Browse at on-sale (hit path)";
+byId['browse-onsale-e2e'].live = ["client","gw","queue","search","booking","cache","db"];
+byId['browse-onsale-e2e'].summary = "Hit path for a warm on-sale browse: starts after <em>Browse seat map · baseline (DB only)</em> has justified the cache and <em>Browse seat map · cache miss &rarr; populate</em> has filled `seatmap:evt-501`. Steps are unchanged: edge routing, waiting room, stale search, cache hit, eventual updates, and DB-protected miss fallback.";
+var rest = d.deepFlows.filter(function(f){ return f.id !== 'scaling' && f.id !== 'browse-onsale-e2e'; });
+d.deepFlows=[scaling, browseDb, byId['browse-onsale-e2e'], browseMiss].concat(rest);
 })();
