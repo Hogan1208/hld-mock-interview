@@ -848,3 +848,81 @@ window.DATA['video'] = {
     {q:"Does the displayed view count need to be exact, and how do you count at 5B increments/day without a hot row?",a:"The displayed number can be approximate and eventually consistent — it is already fuzzy, delayed, and bot-filtered, so nobody notices small lag. That freedom is what lets it scale. Never UPDATE one row per view: a hot title at tens of thousands/s serializes on one lock and melts its partition. Instead push increments through Kafka with windowed aggregation (roll up per-video in ~1-min windows) and store as a sharded counter (N sub-rows, increment a random salted shard, sum on read) plus per-server local pre-aggregation that flushes a single +N every ~1s. Detect hot keys with a count-min sketch and promote them to more shards. Exact counts for monetization are reconciled offline from the raw Kafka event log with dedup and fraud rules."},
   ]
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['video'];
+var scaling={id:"scaling",name:"From raw file delivery to adaptive streaming",kind:"scale",
+  live:["client","upload","storage","cdn"],
+  summary:"Start with the smallest video service that can upload bytes and serve them from the edge, then let real playback and ingest numbers force transcoding, metadata, and an adaptive player. Each stage adds one component only when the previous picture has a measurable ceiling.",
+  steps:[
+    {node:"storage",stage:"Stage 0 · Baseline",title:"Upload raw bytes, serve the original through CDN",
+      live:["client","upload","storage","cdn"],
+      edges:[["upload","storage","raw master"],["storage","cdn","origin fetch"]],
+      narrate:"The launch design is intentionally plain: the client uploads a master, object storage keeps it durably, and CDN edges serve that same file close to viewers. For one codec, one device class, and forgiving networks, this works and keeps application servers out of the byte path.",
+      details:[
+        {k:"win",label:"Why start here",text:"It separates control plane from data plane immediately. The upload service issues and tracks the session; the ~300Gbps sustained ingest stream goes direct to object storage, not through the app fleet."},
+        {k:"wire",label:"Baseline objects",code:"POST /uploads -> upload_id\nPUT s3://masters/v_9kQ2aZ/source.mov\nGET https://cdn.example/masters/v_9kQ2aZ/source.mov"},
+        {k:"scale",label:"Working numbers",text:"~**500 hours/min** arrive, but upload control calls are only low-thousands/s. On reads, ~**5B views/day** means the edge must serve static bytes; origin cannot be the playback path."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"Bytes are durable and cacheable, but playback quality is one-size-fits-all.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Raw ingest","~300Gbps sustained · ~1Tbps peak","bypasses app tier"],hi:1},
+          {c:["Upload control plane","~50 initiates/s + completes","small fleet"]},
+          {c:["Playback artifact","one original file","fragile"],tag:"risk"},
+          {c:["CDN role","cache static file","ok for MVP"]},
+        ]}]}},
+    {node:"transcode",stage:"Stage 1 · Transcode pipeline",title:"One huge file buffers &rarr; add renditions and segments",
+      live:["client","upload","storage","cdn","transcode"],
+      edges:[["upload","transcode","enqueue"],["transcode","storage","renditions"]],
+      narrate:"The first real viewer problem is not storage durability; it is playback. A single 4K source file cannot adapt to weak networks or small devices, and seeking inside one giant object is painful. The file has to become a ladder of short, cacheable segments.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Each source hour fans out to roughly **6–8 renditions**. At 500 hours/min, the encode fleet needs about **300K cores steady** and can approach **1M cores** at peak, so processing must be asynchronous and queue-fed."},
+        {k:"pain",label:"What breaks without it",text:"Weak networks stall on the original bitrate, devices receive codecs they cannot decode, and a worker crash during processing would force redoing an entire movie if work is not chunked."},
+        {k:"fix",label:"The fix — async ladder generation",text:"Add **Transcoding**: enqueue jobs after upload, split masters into GOP-aligned chunks, encode chunk × rendition in parallel, and write deterministic HLS/DASH segments back to storage.",pill:"watchable"},
+        {k:"gotcha",label:"Exactly-once effect",text:"The queue is at-least-once, so output keys must be deterministic by `(video_id, chunk, rendition)`. A duplicate job overwrites the same segment instead of creating a second copy."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Processing moves out of the upload request and becomes elastic queue work.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Playback quality","one raw bitrate","6–8-rung ladder"],hi:1,tag:"fixed"},
+          {c:["Seek/startup","large file fetch","short segments"]},
+          {c:["Encode work","inline impossible","~300K cores steady"],hi:1},
+          {c:["Retry scope","whole file","one ~2-min chunk"]},
+        ]}]}},
+    {node:"meta",stage:"Stage 2 · Metadata service",title:"Bytes alone are not a product &rarr; add catalog metadata",
+      live:["client","upload","storage","cdn","transcode","meta"],
+      edges:[["upload","meta","video row"],["transcode","meta","rendition map"]],
+      narrate:"Once renditions exist, somebody has to know which title is ready, which segment manifest belongs to which video, and how an upload resumes after a crash. Object storage holds bytes; the product needs structured state keyed by `video_id`.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Core metadata is about **8B rows × ~2KB = ~16TB** over years: small by video standards. The pressure is ~**58K playback reads/s** average, a few hundred K/s at peak, plus only ~50 new-video writes/s."},
+        {k:"pain",label:"What breaks without it",text:"Without a metadata service, upload sessions are not resumable, the player cannot build a manifest, and a ready/not-ready state is inferred by scanning object storage — exactly the wrong access path."},
+        {k:"fix",label:"The fix — video_id metadata",text:"Add **Metadata DB** for upload sessions, `videos.status`, and the rendition map. Playback does an O(1) point read by `video_id`; list-by-uploader gets its own table or index; view counts stay off this hot row path.",pill:"catalog"},
+        {k:"query",label:"Rendition lookup",code:"SELECT resolution, bitrate, codec, segment_manifest_url\nFROM renditions\nWHERE video_id = 'v_9kQ2aZ';"},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"The database stores knowledge about bytes, not the bytes themselves.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Core metadata","~16TB","modest"]},
+          {c:["Playback reads","~58K/s avg · few hundred K/s peak","point-read + cache"],hi:1},
+          {c:["Video writes","~4M/day = ~50/s","easy"]},
+          {c:["View increments","5B/day = ~58K/s","separate path"],tag:"risk"},
+        ]}]}},
+    {node:"player",stage:"Stage 3 · Adaptive player",title:"Static files need client decisions &rarr; add ABR player",
+      live:["client","upload","storage","cdn","transcode","meta","player"],
+      edges:[["cdn","player","segments"],["meta","player","manifest"]],
+      narrate:"The final scaling move is at the edge of the system: only the client sees real throughput, buffer level, device codec support, and CDN health. Keep servers dumb and cacheable; let the player choose the next segment and steer around failure.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak delivery can be ~**100–150M concurrent streams × ~5Mbps = ~500Tbps**. A server-side per-session stream manager would be the bottleneck; static segment GETs plus client ABR let the CDN carry the load."},
+        {k:"pain",label:"What breaks without it",text:"Without ABR, everyone gets the same quality, so weak networks stall, strong networks are under-served, and a single CDN/PoP failure shows up as a spinner instead of a segment-boundary retry."},
+        {k:"fix",label:"The fix — ABR and client telemetry",text:"Add the **Adaptive player**. It starts after 1–2 low-rung segments, builds a ~20–30s buffer, chooses each rendition from measured throughput and buffer occupancy, and emits QoE beacons for CDN/rendition steering.",pill:"edge control"},
+        {k:"note",label:"Why the server stays simple",text:"Segments are immutable, content-addressed, and cacheable with long TTLs. A quality change is just the next GET choosing a different URL, so CDN edges do not hold playback session state."},
+      ],
+      snap:{title:"Load & capacity — Stage 3 (full design)",cap:"The complete design turns playback into stateless cache hits plus local client decisions.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Peak egress","~500Tbps","served from edge"],hi:1},
+          {c:["Edge hit ratio","~95–99%","origin protected"],hi:1,tag:"fixed"},
+          {c:["Startup","1–2 low-rung segments","sub-2s target"]},
+          {c:["Buffer","~20–30s","rides out dips"]},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

@@ -629,3 +629,115 @@ window.DATA['inventory'] = {
   ],
 };
 
+
+
+(function(){
+var d=window.DATA['inventory'];
+var scaling={id:"scaling",name:"From one counter to flash-sale inventory",kind:"scale",
+  live:["client","api","invdb"],
+  summary:"Start with the atomic no-oversell counter, then add the operational pieces that make it usable at commerce scale: holds, expiry, cached availability, an audit ledger, and inbound replenishment. Inventory mirrors the hotel problem: correctness is the decrement; reads and fan-out are derived.",
+  steps:[
+    {node:"invdb",stage:"Stage 0 · Baseline",title:"One inventory store — atomic conditional decrement",
+      live:["client","api","invdb"],
+      edges:[["client","api","browse / buy"],["api","invdb","read / commit"]],
+      narrate:"Draw the smallest correct design: the client asks the API, and the API reads or decrements a strongly-consistent inventory row for `(sku, fc)`. The core invariant is already present: subtract only if enough is available, so two buyers cannot both take the last unit.",
+      details:[
+        {k:"win",label:"Why start here",text:"Oversell prevention lives in one atomic write. Everything later can be stale or replayed, but the decrement path must remain strongly consistent and durable."},
+        {k:"scale",label:"Working numbers",text:"~**100M SKUs** across ~**1,000 FCs**, ~**1M availability reads/s**, ~**10K reserve writes/s** steady, and a flash sale can push ~**100K/s** onto one SKU."},
+        {k:"query",label:"The invariant",code:"UPDATE inventory\n   SET reserved = reserved + :qty\n WHERE sku_id=:sku AND fc_id=:fc\n   AND on_hand - reserved >= :qty;\n-- rows affected = 1 means held; 0 means out of stock"}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"Correct for one counter, but checkout, abandoned carts and read load are not solved yet.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Availability reads","~1M /s","not offloaded"],hi:1,tag:"risk"},
+          {c:["Reserve writes","~10K /s steady","source of truth"]},
+          {c:["Flash-sale SKU","~100K /s","hot-row risk"]},
+          {c:["No-oversell guard","conditional update","correct"],hi:1}
+        ]}]}},
+    {node:"holds",stage:"Stage 1 · Reservation holds",title:"Checkout cannot be a long transaction &rarr; create holds",
+      live:["client","api","invdb","holds"],
+      edges:[["client","api","browse / buy"],["api","holds","reserve"],["holds","invdb","atomic decrement"]],
+      narrate:"The first upgrade is not raw QPS; it is checkout shape. A customer can take minutes to pay. Holding a DB lock during that time would serialize everyone behind one slow checkout on a hot SKU.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Reserve traffic is ~**10K/s** steady and can spike to **100K/s** on a flash-sale SKU. Lock time must be milliseconds, not payment-duration."},
+        {k:"pain",label:"What breaks without it",text:"A book-and-pay transaction holds the inventory row while the user or payment processor stalls for seconds or minutes. Hot SKU throughput collapses and buyers time out behind abandoned carts."},
+        {k:"fix",label:"The fix — time-limited hold",text:"Reserve does the atomic decrement plus a reservation row in one short transaction, then returns a reservation_id. Commit after payment flips held&rarr;committed; release flips held&rarr;released."},
+        {k:"key",label:"Idempotency",text:"A retry with the same cart-line idempotency key returns the same hold. It never creates a second reservation for one click."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The row lock is held for the decrement only; checkout latency leaves the write path.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Lock hold time","payment duration","single decrement txn"],hi:1,tag:"fixed"},
+          {c:["Reserve retry","could double-hold","same reservation_id"]},
+          {c:["Live holds","none","millions possible"]},
+          {c:["Hold TTL","not present","~10–15 min"]}
+        ]}]}},
+    {node:"reaper",stage:"Stage 2 · Hold reaper",title:"Abandoned carts leak stock &rarr; expire and release holds",
+      live:["client","api","invdb","holds","reaper"],
+      edges:[["api","holds","reserve"],["holds","invdb","atomic decrement"],["reaper","holds","expire"]],
+      narrate:"Once holds exist, every abandoned checkout is a potential phantom stock-out. The system needs a background path that turns expired leases back into available stock without racing real commits.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"With **millions of live holds** and expiries in the **thousands/s**, a delayed or missing reaper can make popular SKUs look sold out despite stock not being purchased."},
+        {k:"pain",label:"What breaks without it",text:"Reserved-but-never-bought units stay locked. A hot SKU can be functionally sold out because carts were abandoned, not because orders were placed."},
+        {k:"fix",label:"The fix — bounded expiry scan",text:"Index reservations by `(status, expires_at)`. Reaper scans due held rows every few seconds and performs an idempotent conditional release: held&rarr;released plus `reserved - qty`."},
+        {k:"gotcha",label:"Race with commit",text:"Commit and release are both conditional state flips. If commit wins first, reaper sees committed and skips; if reaper wins, commit fails cleanly and the customer must retry."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Holds are now leases, not leaks.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Abandoned checkout","stock stranded","released after TTL"],hi:1,tag:"fixed"},
+          {c:["Scan shape","table scan risk","status + expires_at index"]},
+          {c:["Expiry volume","1000s/s","partitioned sweep"]},
+          {c:["Commit race","double-release risk","conditional flip"]}
+        ]}]}},
+    {node:"cache",stage:"Stage 3 · Availability cache",title:"1M reads/s should not hit truth &rarr; cache availability",
+      live:["client","api","invdb","holds","reaper","cache"],
+      edges:[["client","api","browse / buy"],["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["reaper","holds","expire"]],
+      narrate:"The write path is safe, but product pages and search results outnumber checkouts by about 100:1. Availability is advisory, so it should be served from a derived cache while reserve still decrements the authoritative row.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak availability reads are ~**1M/s** versus ~**10K/s** reserves. Serving exact counts from the primary would let reads starve the only path that prevents oversell."},
+        {k:"pain",label:"What breaks without it",text:"Every product-page refresh hits the inventory store. Under browse traffic, the primary's CPU and connections are spent on stale-tolerant reads while real reserves wait."},
+        {k:"fix",label:"The fix — derived cache",text:"Cache a coarse per-SKU or per-region availability badge in Redis. Use request coalescing on miss and short TTLs or async refresh. A stale in-stock result can only lead to a clean reserve failure, not oversell."},
+        {k:"gotcha",label:"Do not trust cache on reserve",text:"Reserve never decrements the cache. It always executes the conditional update in the store; the cache is a hint for browse UX."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"Read pressure moves off the source of truth.",
+        tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
+          {c:["Availability reads","~1M /s to store","mostly Redis"],hi:1,tag:"fixed"},
+          {c:["Read:write skew","~100:1","absorbed by cache"]},
+          {c:["Reserve path","primary contended by reads","primary reserved for writes"]},
+          {c:["Staleness","not explicit","acceptable advisory"]}
+        ]}]}},
+    {node:"ledger",stage:"Stage 4 · Movement ledger",title:"Cache and audit need one truth stream &rarr; add ledger/outbox",
+      live:["client","api","invdb","holds","reaper","cache","ledger"],
+      edges:[["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["invdb","ledger","movement event"],["ledger","cache","CDC refresh"],["reaper","holds","expire"]],
+      narrate:"Now there are derived views: cache, analytics, reconciliation. Updating the count and then separately updating those views is a dual write. Inventory needs one durable event for every movement, emitted with the count change.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Movement events run around **50–100K/s** across reserves, commits, releases and restocks. That is the natural fan-out stream for cache refresh and audit."},
+        {k:"pain",label:"What breaks without it",text:"A reserve can commit in the store and crash before the cache update, leaving product pages optimistic. Worse, audits cannot explain why physical stock and system count drifted."},
+        {k:"fix",label:"The fix — transactional outbox ledger",text:"Write the stock movement event in the same transaction as the count change, then relay it to a log partitioned by sku_id. Cache consumers are idempotent and write-if-newer by version."},
+        {k:"note",label:"Reconciliation",text:"Folding the ledger reconstructs on_hand and reserved. If a cache consumer falls behind, it replays from its offset; the store remains the authority while it catches up."}
+      ],
+      snap:{title:"Load & capacity — Stage 4",cap:"Every mutation now has an ordered, replayable audit and cache-refresh event.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["DB↔cache drift","transactional outbox","no dual-write gap"],hi:1,tag:"fixed"},
+          {c:["Event rate","~50–100K /s","log by sku_id"]},
+          {c:["Cache refresh","CDC consumer","sub-second to few s"]},
+          {c:["Audit","append-only ledger","reconstructable"]}
+        ]}]}},
+    {node:"replenish",stage:"Stage 5 · Replenishment",title:"Stock also comes in &rarr; route receipts through same ledger",
+      live:["client","api","invdb","holds","reaper","cache","ledger","replenish"],
+      edges:[["api","cache","availability"],["api","holds","reserve"],["holds","invdb","atomic decrement"],["invdb","ledger","movement event"],["ledger","cache","CDC refresh"],["reaper","holds","expire"],["replenish","invdb","restock / adjust"]],
+      narrate:"A commerce inventory system is not only checkout decrements. Trucks arrive, returns happen, units are damaged, and cycle counts correct reality. Inbound stock must use the same idempotent, auditable path as checkout so it cannot inflate counts or race live reserves.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Receipts are bursty by fulfillment center: a truckload may add thousands of units at once, while live reserves continue. The write path must compose increments and decrements safely."},
+        {k:"pain",label:"What breaks without it",text:"A duplicate receipt message can double-add stock, and a blind absolute count can erase concurrent reserves. Either bug creates oversell or dead inventory that takes days to reconcile."},
+        {k:"fix",label:"The fix — idempotent signed movements",text:"Apply receipts and adjustments as signed deltas keyed by receipt_id or adjustment_id, in the inventory store transaction, with a matching ledger event. Batch per `(sku, fc)` so large inbound loads are a few big increments."},
+        {k:"gotcha",label:"Never silent overwrite",text:"Cycle-count corrections should write a reasoned adjustment event, not set the row to a magic number. The discrepancy must remain auditable."}
+      ],
+      snap:{title:"Load & capacity — Stage 5 (full design)",cap:"The complete design protects decrements, reclaims holds, offloads reads, fans out changes and admits new stock safely.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Inbound duplicate","receipt_id idempotency","no double-add"],hi:1,tag:"fixed"},
+          {c:["Cycle count","signed adjustment","auditable"]},
+          {c:["Concurrent reserves","atomic delta","composes safely"],hi:1},
+          {c:["Cache update","same ledger stream","eventual convergence"]}
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

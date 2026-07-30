@@ -795,3 +795,81 @@ window.DATA['proximity'] = {
     {q:"How do you keep an offline or disconnected driver from lingering forever in a cell, and keep the index fresh as drivers move?",a:"Every entry carries a TTL of ~10-15s (about 2-3x the report interval): presence is a lease that must be renewed by the next update, so a driver who loses signal or shuts off simply ages out of both index and store — no explicit delete. For movement, on each update compute the driver's current cell and compare to the last one: if unchanged (the common case, since a driver rarely crosses a boundary within 4s) just refresh position and TTL; only on a cell change remove from the old bucket and add to the new. That makes index writes conditional — ~1 in 15 updates — and bounds freshness by construction to the TTL."},
   ]
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['proximity'];
+var scaling={id:"scaling",name:"From bounding-box scan to real-time dispatch",kind:"scale",
+  live:["client","gw","match","db"],
+  summary:"Start with the query everyone understands — scan current positions inside a bounding box — then let query cost, write volume, and dispatch semantics force a geo index, a write-hot ingest tier, and notifications. The diagram grows only when the numbers make the current shape fail.",
+  steps:[
+    {node:"db",stage:"Stage 0 · Baseline",title:"Bounding-box query over current positions",
+      live:["client","gw","match","db"],
+      edges:[["match","db","lat/lng scan"]],
+      narrate:"The MVP is correct: drivers write their latest lat/lng to a location store, and the match service asks for positions inside a rider's bounding box, then filters by exact distance. It proves the product behavior before adding spatial machinery.",
+      details:[
+        {k:"win",label:"Why start here",text:"It is easy to reason about: one current row per driver, latest-wins updates, and a nearby query that can be verified with plain SQL plus haversine filtering."},
+        {k:"query",label:"Baseline nearby query",code:"SELECT driver_id, lat, lng\nFROM driver_locations\nWHERE lat BETWEEN :min_lat AND :max_lat\n  AND lng BETWEEN :min_lng AND :max_lng\n  AND ts >= now() - interval '15 seconds';"},
+        {k:"scale",label:"Working numbers",text:"The working set is tiny — ~**1M drivers × ~150 bytes = ~150MB** — but the workload is not: rider queries average ~20K/s and peak near ~80K/s, while drivers update every ~4s."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"Correct at small scale, but query cost still tracks the fleet rather than nearby density.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Current drivers","~1M","fits in memory"]},
+          {c:["Nearby queries","~20K/s avg · ~80K/s peak","scan risk"],hi:1,tag:"risk"},
+          {c:["Driver updates","~250K/s","coming next"],tag:"risk"},
+          {c:["Freshness target","~10–15s TTL","ok"]},
+        ]}]}},
+    {node:"index",stage:"Stage 1 · Geo index",title:"Full scans cannot meet p99 &rarr; add spatial buckets",
+      live:["client","gw","match","db","index"],
+      edges:[["match","index","cell ring"],["index","db","candidate ids"]],
+      narrate:"A bounding-box scan over a million moving rows is the wrong primitive for 80K/s surge queries. Proximity has locality: a rider only needs the cells around them, not the entire fleet. Add an index that makes cost track nearby density.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A 2km query over ~1km cells needs roughly **9 cell lookups** and returns a few dozen candidates. Scanning ~1M rows per query at ~80K/s peak is not a system; it is a CPU bonfire."},
+        {k:"pain",label:"What breaks without it",text:"Latency climbs with total fleet size, dense cells drag back thousands of candidates, and shard boundaries silently miss the nearest drivers unless the query understands neighboring regions."},
+        {k:"fix",label:"The fix — geohash / H3 / quadtree index",text:"Add a **Geo index** mapping `cell &rarr; driverIds`. Match queries the rider's cell plus neighbor rings, unions candidates, then runs exact haversine and caps nearest N.",pill:"spatial"},
+        {k:"gotcha",label:"Density is the real shard key",text:"Fixed land-area cells fail in Times Square and waste space in Wyoming. Use adaptive resolution or density-based sharding so hot metros split finer while sparse regions stay coarse."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Queries now scale with cells touched, not drivers in the world.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Candidate source","~1M-row scan","~9 cell lookups"],hi:1,tag:"fixed"},
+          {c:["Peak lookups","~80K expensive scans/s","~80K cell-ring reads/s"]},
+          {c:["Index footprint","none","~50–100MB derived"]},
+          {c:["Dense hotspot","unbounded candidates","adaptive cells + cap"],hi:1},
+        ]}]}},
+    {node:"location",stage:"Stage 2 · Location ingest",title:"Moving drivers swamp the store &rarr; split the write firehose",
+      live:["client","gw","match","db","index","location"],
+      edges:[["gw","location","location updates"],["location","index","cell moves"],["location","db","latest position"]],
+      narrate:"The read path is now sane, but moving objects create a separate problem: the write stream is continuous, high-rate, and disposable. Treating every GPS sample like a durable database update burns the primary and writes the index far too often.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"~**1M active drivers** reporting every ~4s produce ~**250K location updates/s**. Only about **1 in 15** updates crosses a cell boundary, so naive re-indexing wastes most of its work."},
+        {k:"pain",label:"What breaks without it",text:"The primary store and geo index take 250K/s latest-wins writes, read queries contend with the firehose, and if ingest queues stale samples for 30s, riders see drivers who already left."},
+        {k:"fix",label:"The fix — dedicated ingest + hot memory store",text:"Add **Location ingest**. It batches for ~50–100ms, collapses to latest per driver, writes the in-memory current-position store, and touches the index only when the driver's cell changes.",pill:"write path"},
+        {k:"key",label:"Ephemeral by design",text:"Current position is a lease, not a ledger. If an update is lost, the next report arrives in ~4s; durability belongs to the async history/billing fork, not the match-hot store."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Writes stop competing with queries, and index updates are proportional to movement across cells.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Location writes","~250K/s into shared store","dedicated ingest path"],hi:1,tag:"fixed"},
+          {c:["Index writes","~250K/s naive","~17K/s cell moves"],hi:1},
+          {c:["Batch window","none","~50–100ms"]},
+          {c:["Stale backlog","processed late","shed old samples"],tag:"fixed"},
+        ]}]}},
+    {node:"notify",stage:"Stage 3 · Dispatch notify",title:"Nearby list is not assignment &rarr; add dispatch and push",
+      live:["client","gw","match","db","index","location","notify"],
+      edges:[["match","notify","offer"],["notify","client","push"]],
+      narrate:"The query can now find nearby drivers, but a ride is not complete until exactly one driver receives, accepts, and claims the trip. That is a different component: it manages offer timeouts, retries, push delivery, and the one strongly consistent assignment write.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Surge can drive ~**50K ride requests/s** and ~100–150K live offers at once. Broadcasting every request to every candidate multiplies that into a thundering accept race."},
+        {k:"pain",label:"What breaks without it",text:"Without dispatch state, a match node crash loses in-flight offers, two drivers can accept the same ride, and offline drivers never receive the request or linger until manual timeout."},
+        {k:"fix",label:"The fix — dispatch / notify service",text:"Add **Dispatch / notify**. It offers sequentially or in tiny parallel batches, stores short-TTL offer state externally, wakes devices through push when needed, and uses an atomic compare-and-set to assign exactly one driver.",pill:"assignment"},
+        {k:"gotcha",label:"Strong consistency only where it matters",text:"Location and index data can be fresh-ish and eventually consistent. The trip claim cannot: `assignedDriver == null &rarr; driverId` must be a linearizable CAS so duplicate accepts collapse to one winner."},
+      ],
+      snap:{title:"Load & capacity — Stage 3 (full design)",cap:"The full design separates approximate proximity from exact assignment.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Ride requests","~50K/s surge","regional dispatch shards"],hi:1},
+          {c:["Live offers","~100–150K","short-TTL external state"]},
+          {c:["Double accept","atomic CAS","one winner"],hi:1,tag:"fixed"},
+          {c:["Offline driver","push + timeout","no stuck rider"]},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

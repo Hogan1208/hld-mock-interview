@@ -854,3 +854,78 @@ window.DATA['chat'] = {
     {q:"With end-to-end encryption, what survives and what breaks server-side?",a:"Clients hold the keys; the server stores and routes only ciphertext plus routing metadata (senderId, conversationId, seq, timestamps). Everything structural survives — persist-then-deliver, seq ordering, client_msg_id dedupe, cursors, offline pull, fan-out all operate on an opaque blob. What breaks is anything reading content: server-side search moves client-side, spam/abuse detection leans on metadata and user reports, and push previews are gone. Durability and ordering are untouched; you add key management (encrypted, user-controlled key backup) as a new concern."},
   ]
 };
+
+
+/* ---- scaling journey ---- */
+(function(){
+var d = window.DATA["chat"];
+var scaling = {id:"scaling",name:"From one socket path to global delivery",kind:"scale",
+  live:["client","gw","chat","store"],
+  summary:"Start with one durable 1:1 send path, then let connection count, offline delivery, group fan-out, and device wakeups force presence, a durable queue, and push notifications.",
+  steps:[
+    {node:"store",stage:"Stage 0 · Baseline",title:"Persist a 1:1 message, then push if the recipient is local",
+      live:["client","gw","chat","store"],
+      edges:[["chat","store","persist before ack"]],
+      narrate:"The MVP accepts a WebSocket frame, dedupes by client message id, assigns a per-conversation sequence number, writes the message to durable history, then tries to push over the recipient socket if this gateway happens to hold it. Durability comes before delivery.",
+      details:[
+        {k:"win",label:"Why start here",text:"It preserves the most important promise: once the sender sees an ack, the ciphertext is in the store and can be recovered by every device. A dropped live push can be retried; a lost stored message cannot."},
+        {k:"query",label:"Baseline write",code:"-- partition = conversation_id, clustering = seq\nINSERT INTO messages\n  (conversation_id, seq, message_id, client_msg_id, sender_id, ciphertext)\nVALUES\n  ('c-9f2a', 4472, 'm-04', 'b3f1-bc', 42, 0xa5d91c);\n-- ack sender only after quorum persistence"},
+        {k:"scale",label:"Working numbers",text:"The target workload is **~1.16M messages/s average** and **~5M/s peak**, with **~500M concurrent sockets**. A one-node socket assumption will fail before the storage model does."}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The send path is correct for one gateway locality; global routing is the looming gap.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Peak sends","~5M /s","store must shard"]},
+        {c:["Concurrent sockets","~500M","cannot be one gateway"],hi:1,tag:"risk"},
+        {c:["Delivery rule","recipient on same node only","not enough"]},
+        {c:["Ordering","per-conversation seq","correct base"]}
+      ]}]}},
+    {node:"presence",stage:"Stage 1 · Presence registry",title:"Recipients live on different gateways &rarr; record user to gateway",
+      live:["client","gw","chat","store","presence"],
+      edges:[["gw","presence","heartbeat"],["chat","presence","route lookup"]],
+      narrate:"At real scale, connections are spread across hundreds or thousands of gateway nodes. The sender's gateway almost never holds the recipient's socket, so delivery needs a fast routing hint from user id to gateway node.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"With **~500M live connections** and **~500K−1M sockets per node**, the fleet is hundreds of gateway nodes. A message for B must find the one node holding B's current socket."},
+        {k:"pain",label:"What breaks without it",text:"The chat service either broadcasts delivery attempts to gateways or treats online users as offline. Broadcast is impossible at this connection count, and false-offline delivery ruins realtime feel."},
+        {k:"fix",label:"The fix — soft presence registry",text:"Gateways refresh `presence:userId` with gateway node and connection id in a sharded Redis-style registry. Chat looks it up, forwards to that node, and falls back to offline flow if the entry is stale.",pill:"routing hint"},
+        {k:"gotcha",label:"Presence is not truth",text:"A registry entry can be stale after a gateway crash. Delivered receipts require a real device ack; otherwise the store plus cursor remains authoritative."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Routing is now a lookup, not a broadcast, and stale entries are safe.",tables:[{name:"signals",cols:["signal","before","after"],rows:[
+        {c:["Find recipient socket","local guess or broadcast","presence lookup"],hi:1,tag:"fixed"},
+        {c:["Gateway fleet","500−1000 nodes","explicit node id"]},
+        {c:["Raw heartbeats","~17M /s naive","batched by gateway"]},
+        {c:["Stale route","delivery timeout","offline fallback"]}
+      ]}]}},
+    {node:"queue",stage:"Stage 2 · Durable delivery queue",title:"Offline and group delivery need buffering &rarr; enqueue ordered tasks",
+      live:["client","gw","chat","store","presence","queue"],
+      edges:[["chat","queue","delivery task"]],
+      narrate:"Presence solves online routing, but delivery is still not a single RPC. Recipients disconnect, devices reconnect by cursor, and groups can turn one accepted message into many delivery tasks. The accept path must stay one persist plus one enqueue.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak accept is **~5M messages/s**, while group delivery can lift effective queue traffic toward **~10−20M events/s**. A durable log with thousands of partitions absorbs bursts and retries."},
+        {k:"pain",label:"What breaks without it",text:"Without a queue, chat workers block on offline users, slow gateways, and group fan-out. A worker crash loses in-memory delivery state or duplicates pushes with no replay boundary."},
+        {k:"fix",label:"The fix — partitioned durable log",text:"After persistence, chat enqueues delivery and fan-out tasks partitioned by conversation id. Consumers deliver at least once, advance cursors on ack, and rely on message id plus seq for idempotency and order.",pill:"buffer"},
+        {k:"key",label:"Ordering lives in seq",text:"The queue preserves common-case per-conversation order, but the server-assigned sequence number is the display truth. Hot conversations can be bucketed without scrambling clients because clients sort by seq."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Accept stays fast while delivery becomes retryable, buffered, and independently scalable.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Accept path","1 store write + 1 enqueue","bounded"],hi:1,tag:"fixed"},
+        {c:["Queue throughput","~10−20M events/s peak","partitioned log"]},
+        {c:["Partitions","~400 floor, ~2000 provisioned","headroom"]},
+        {c:["Delivery semantics","at least once + dedupe","safe redelivery"]}
+      ]}]}},
+    {node:"push",stage:"Stage 3 · Push notifications",title:"Offline devices need a wakeup &rarr; send APNs and FCM alerts",
+      live:["client","gw","chat","store","presence","queue","push"],
+      edges:[["queue","push","offline alert"],["chat","push","notify"]],
+      narrate:"A stored message is durable, and the queue can remember delivery work, but an offline phone will not pull until the app wakes. Push is the out-of-band nudge that tells the device to reconnect and fetch by cursor.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A morning recovery can create **~2M push events/s** before coalescing. The push tier must meter provider calls and collapse bursts, not spray one notification per message."},
+        {k:"pain",label:"What breaks without it",text:"Offline users receive messages only when they manually open the app. If push is mixed into the send path, APNs or FCM throttling can slow message acceptance for everyone."},
+        {k:"fix",label:"The fix — best-effort wakeups",text:"A notification service consumes offline tasks, coalesces per device and conversation, calls APNs or FCM at the provider-accepted rate, and lets the app pull real messages from the store.",pill:"wake up"},
+        {k:"gotcha",label:"Push is not delivery",text:"Under E2EE the payload is generic and may be dropped or delayed. The authoritative message is already in the store; push only improves timeliness."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"The full design separates acceptance, durable delivery, realtime routing, and offline wakeups.",tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+        {c:["Offline wakeup","APNs or FCM","device reconnects"]},
+        {c:["Morning burst","2M /s raw","~200K /s after coalescing"],hi:1,tag:"fixed"},
+        {c:["Provider outage","durable retry queue","messages safe"]},
+        {c:["E2EE payload","generic alert","content stays on clients"]}
+      ]}]}}
+  ]};
+d.deepFlows = [scaling].concat(d.deepFlows);
+})();

@@ -808,3 +808,94 @@ window.DATA['url'] = {
     {q:"A primary crashes and you promote a replica; the old primary rejoins thinking it is still primary. What breaks and how do you prevent it?",a:"That is split-brain — two primaries taking writes cause divergent, corrupt data on the same key. Prevent it with consensus/leader-election (Raft/Paxos or a fencing coordinator) that grants a monotonically increasing epoch. The new primary writes under a higher epoch; the stale old primary's writes are rejected via the fencing token and it demotes and re-syncs. Writes pause briefly during election (consistency over availability); reads stay available from replicas."},
   ]
 };
+
+
+/* ---- scaling journey ---- */
+(function(){
+var d = window.DATA["url"];
+var scaling = {id:"scaling",name:"From one mapping table to viral redirects",kind:"scale",
+  live:["client","lb","svc","db"],
+  summary:"Start with the honest mapping table, then let the URL shortener numbers force the upgrades: unique-key generation, a read cache, replicas, and async analytics. Each stage adds exactly one box only after the previous design hits a real ceiling.",
+  steps:[
+    {node:"db",stage:"Stage 0 · Baseline",title:"One KV table — create inserts, redirect looks up by key",
+      live:["client","lb","svc","db"],
+      edges:[["svc","db","reads + writes"]],
+      narrate:"The correct MVP is a stateless service in front of one hash-partitioned mapping store. A create writes `short_key` to `long_url`; a redirect does one primary-key lookup and returns a 302. This is legible and correct, but reads already outnumber writes by about 100:1.",
+      details:[
+        {k:"win",label:"Why start here",text:"It proves the core invariant first: every short code maps to one destination, custom aliases use a conditional insert, and expiry is an attribute on the row. No cache, replica, or click pipeline can compensate for a wrong mapping table."},
+        {k:"query",label:"Two paths, one table",code:"-- create\nINSERT INTO urls (short_key, long_url, user_id, expires_at)\nVALUES ('15ftgG', 'https://example.com/very/long/path?ref=x', 42, NULL)\nIF NOT EXISTS;\n\n-- redirect\nSELECT long_url, expires_at\nFROM urls\nWHERE short_key = '15ftgG';"},
+        {k:"scale",label:"Working numbers",text:"About **1,160 creates/s** and **116K redirects/s** sustained, with viral peaks 3−5x. At launch the DB can serve this, but every click is already a storage read."}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The baseline is correct; the read-heavy ratio is the first warning light.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Create rate","~1,160 /s","ok"]},
+        {c:["Redirect rate","~116K /s sustained","DB is on the hot path"],hi:1,tag:"risk"},
+        {c:["Storage horizon","~180B rows · ~90 TB raw","needs sharding over time"]},
+        {c:["Redirect work","1 DB primary-key lookup","simple but not cheap enough"]}
+      ]}]}},
+    {node:"key",stage:"Stage 1 · Key generation",title:"Random codes collide &rarr; pre-allocate unique key ranges",
+      live:["client","lb","svc","db","key"],
+      edges:[["svc","key","lease ids"]],
+      narrate:"If every create picks a random base62 string, the service must check uniqueness on every insert and retry on collision. That is tolerable when the keyspace is empty, but wasteful and unpredictable as the table grows toward hundreds of billions of rows.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"The design keeps **180B mappings** over five years. Six-character base62 is only ~56B possibilities, so the system must move to ~7 characters and avoid collision-check loops on the write path."},
+        {k:"pain",label:"What breaks without it",text:"Random generation turns create latency into a retry lottery: generate, conditional insert, collide, retry. Hot create bursts amplify writes exactly where the system wants creates to be boring and bounded."},
+        {k:"fix",label:"The fix — KGS ranges",text:"A **Key Generation Service** leases large integer ranges to shortener instances. Each instance base62-encodes local integers and skips unused ids on crash; uniqueness is guaranteed before the DB insert, so there is no collision loop.",pill:"unique ids"},
+        {k:"gotcha",label:"Gaps are fine",text:"A crashed instance may burn a half-used block. That is acceptable because short codes carry no order promise and the 62^7 space is ~3.5T keys."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Coordination moves from every create to one lease per large block.",tables:[{name:"signals",cols:["signal","before","after"],rows:[
+        {c:["Uniqueness work","check every insert","one lease per block"],hi:1,tag:"fixed"},
+        {c:["Create rate","~1,160 /s","local id burn"]},
+        {c:["Keyspace","62^7 ~3.5T","enough for ~180B rows"]},
+        {c:["Crash with unused ids","retry uncertainty","safe gaps"]}
+      ]}]}},
+    {node:"cache",stage:"Stage 2 · Redis redirect cache",title:"Reads swamp storage &rarr; serve hot mappings from memory",
+      live:["client","lb","svc","db","key","cache"],
+      edges:[["svc","cache","redirect lookup"],["cache","db","miss fill"]],
+      narrate:"Now the motivated cache. Redirects are tiny, immutable, and extremely skewed: a few links get most clicks. Keeping every redirect as a DB read wastes the most expensive tier on the simplest possible answer.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Sustained redirects are **~116K/s**, with viral peaks around **500K/s**. At **~99% cache hit**, DB reads fall to roughly 1.2K/s sustained while the user-facing p99 becomes a memory lookup."},
+        {k:"pain",label:"What breaks without it",text:"Without Redis, one viral link pins the DB and every ordinary redirect queues behind it. Storage nodes become the latency-critical read tier instead of the source of truth."},
+        {k:"fix",label:"The fix — read-through Redis",text:"Service checks **Redis code to URL** first; on miss it reads the DB or replica, populates with a long jittered TTL, and redirects. Immutable mappings mean cached values do not need complex invalidation.",pill:"the cache"},
+        {k:"gotcha",label:"Mutable links change the rule",text:"Deleted, expired, or malware-flagged links need bounded TTL and purge. Do not let a browser 301 or an infinite edge TTL preserve a bad destination forever."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"The hot path becomes memory-first; the DB now sees misses and writes.",tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
+        {c:["Redirect QPS","~116K /s","~116K /s"]},
+        {c:["DB read QPS","~116K /s","~1.2K /s at 99% hit"],hi:1,tag:"fixed"},
+        {c:["Hot-key p99","DB-bound","Redis-bound"],hi:1},
+        {c:["Stampede risk","unbounded misses","single-flight on miss"]}
+      ]}]}},
+    {node:"replica",stage:"Stage 3 · DB replicas",title:"Misses and failover still hit one primary &rarr; add replicas",
+      live:["client","lb","svc","db","key","cache","replica"],
+      edges:[["db","replica","replicate"],["svc","replica","miss reads"]],
+      narrate:"After caching, the primary is no longer drowning in hot redirects, but it still owns durability and every cold read. A cold-cache event, a new region, or a cache restart can push misses back to the primary right when writes also need it.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A cold cache can briefly expose the full **116K/s** redirect rate, and peak can be 3−5x higher. Replicas make that surge survivable without stealing write capacity from creates."},
+        {k:"pain",label:"What breaks without it",text:"Cache misses, new-key read-after-write fallbacks, and failover all funnel into one primary. The same box must accept writes, serve cold reads, and survive disk loss."},
+        {k:"fix",label:"The fix — read replicas plus quorum durability",text:"Replicate every shard across AZs. Redirect misses read from replicas; creates are acked after quorum; a failed primary can be promoted with fencing. The primary's normal job returns to writes and cache fills only."},
+        {k:"gotcha",label:"Replica lag is acceptable",text:"Mappings are immutable after create. A slightly stale replica can only miss a brand-new key; the service falls back to primary or the cache warmed during create for read-your-writes."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"Read capacity and durability come from the same replica groups.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Cache-miss reads","served by replicas","primary protected"],hi:1,tag:"fixed"},
+        {c:["Write ack","quorum across replicas","durable"]},
+        {c:["Replica lag","ms to seconds","safe for immutable rows"]},
+        {c:["Primary role","creates + leadership","not cold-read firehose"]}
+      ]}]}},
+    {node:"analytics",stage:"Stage 4 · Async analytics",title:"Counting clicks inline kills redirects &rarr; emit events asynchronously",
+      live:["client","lb","svc","db","key","cache","replica","analytics"],
+      edges:[["svc","analytics","click event"]],
+      narrate:"The redirect path must stay a pure read. If every click also synchronously updates counters, the system adds a write to the latency-critical path and turns a viral link into a hot counter problem.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A marketing blast can drive **~500K clicks/s**. Writing one counter row per click would be a larger write workload than creates and would sit directly on the user's redirect latency."},
+        {k:"pain",label:"What breaks without it",text:"Synchronous analytics makes a click wait on Kafka, OLAP, or a hot counter. During consumer lag or a provider blip, redirects slow down even though the mapping lookup is healthy."},
+        {k:"fix",label:"The fix — fire-and-forget events",text:"The service emits a bounded async click event and returns the 302 immediately. Stream processors aggregate by window and write rollups; dashboards can lag without breaking redirects.",pill:"off path"},
+        {k:"note",label:"Accuracy is a product choice",text:"Dashboard counts can be timely and approximate. Billing-grade counts need event ids, dedupe, and slower reconciliation — still not on the redirect path."}
+      ],
+      snap:{title:"Load & capacity — Stage 4",cap:"The full design keeps redirects read-only and makes analytics independently scalable.",tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+        {c:["Redirect p99","cache or replica read only","protected"],hi:1,tag:"fixed"},
+        {c:["Click spike","Kafka buffers","dashboard may lag"]},
+        {c:["Hot counter","windowed aggregation","no per-click DB write"],hi:1},
+        {c:["Analytics outage","drop or buffer bounded","redirect still works"]}
+      ]}]}}
+  ]};
+d.deepFlows = [scaling].concat(d.deepFlows);
+})();

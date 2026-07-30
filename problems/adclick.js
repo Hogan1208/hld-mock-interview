@@ -874,3 +874,98 @@ window.DATA['adclick'] = {
     {q:"How does the read path serve near-real-time dashboards at 50K QPS, and why do the dashboard and invoice numbers differ?",a:"A stateless query API exposes rollup queries (<code>GET /metrics?adId=..&from=..&to=..&granularity=..&groupBy=..</code>) that translate to range + group-by scans over multi-resolution rollups (minute→hour→day); the planner picks the coarsest rollup that answers the range. A result cache keyed by (query, time-bucket) with a 15-30s TTL absorbs ~90% of the repeated reads, so ~50K QPS collapses to ~5K scan QPS on the brokers (~13 API pods, a handful of brokers). The dashboard reads the provisional speed layer (may include un-deduped retries / miss in-grace clicks); the invoice reads finalized batch (exact, deduped, fraud-filtered). Recency from speed, money from batch — provisional buckets are labelled and visibly settle to final."},
   ]
 };
+
+
+(function(){
+var d=window.DATA['adclick'];
+var scaling={id:"scaling",name:"From click log to billable analytics",kind:"scale",
+  live:["client","gw","stream","agg"],
+  summary:"Start with the durable click pipeline, then add the boxes that make it queryable, billable, reconcilable, and safe for advertiser-facing reads. The shape follows the numbers: 10M clicks/s in, tiny minute rollups out.",
+  steps:[
+    {node:"stream",stage:"Stage 0 · Baseline",title:"Beacon &rarr; gateway &rarr; Kafka &rarr; windowed count",
+      live:["client","gw","stream","agg"],
+      edges:[["client","gw","click"],["gw","stream","ingest"],["stream","agg","consume"]],
+      narrate:"Draw the smallest reliable speed layer: the browser sends a click beacon, stateless gateways validate and produce it to Kafka, and a stateful aggregator counts one-minute windows. This captures the firehose, but the counts have nowhere durable and query-optimized to land yet.",
+      details:[
+        {k:"win",label:"Why start here",text:"The log is the shock absorber and replay source. It lets ingest survive bursts and lets a crashed aggregator restore state from checkpoints and replay offsets."},
+        {k:"scale",label:"Working numbers",text:"Average ~**1M clicks/s**, peak ~**10M/s**, about **86B events/day** or ~8.6TB/day raw before replication and retention."},
+        {k:"query",label:"Hot path",code:"click beacon -> gateway validate/enrich\nproducer.send(topic, key=adId, click)\naggregator.count(adId, event_minute)\ncheckpoint(window_state, kafka_offset)"}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The stream can absorb the firehose, but the product still lacks a serving store and billing guardrails.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Peak ingest","~10M /s","Kafka fronted"]},
+          {c:["Partitions","~120","headroom + salting"]},
+          {c:["Raw retention","~180TB hot RF3","replayable"]},
+          {c:["Queryable counts","not yet","missing"],tag:"risk"}
+        ]}]}},
+    {node:"olap",stage:"Stage 1 · OLAP store",title:"Counters need serving &rarr; write minute rollups to OLAP",
+      live:["client","gw","stream","agg","olap"],
+      edges:[["gw","stream","ingest"],["stream","agg","consume"],["agg","olap","rollup"]],
+      narrate:"Raw clicks are too large for dashboards, and in-memory window counts disappear as a product surface when the job restarts. The aggregator must emit compact, keyed minute rows into a store built for time-range scans.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Clicks arrive at up to **10M/s**, but aggregates collapse to roughly **17K upserts/s steady** for active ad-minute rows. Query systems should scan rollups, not raw beacons."},
+        {k:"pain",label:"What breaks without it",text:"Advertiser dashboards would either query Kafka/raw events or depend on volatile processor state. Both miss the ~1s p99 target and make recovery or backfill user-visible."},
+        {k:"fix",label:"The fix — time-partitioned rollups",text:"Write `(adId, minute)` rollups to a columnar OLAP store with immutable time segments, deep storage and idempotent versions. Old data rolls up to hour/day while recent minutes stay hot."},
+        {k:"gotcha",label:"Buffer writes",text:"Let OLAP pull from an aggregate topic at its sustainable rate. A spike becomes ingestion lag, not dropped or partially-written advertiser data."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The serving path now scans minute rows instead of raw click events.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Write shape","10M raw events/s","~17K rollup upserts/s"],hi:1,tag:"fixed"},
+          {c:["Rows/day","raw 86B","~1.44B minute rows"]},
+          {c:["Store size","not modeled","~20TB for 90d RF2"]},
+          {c:["Dashboard p99","raw scan impossible","sub-second target"]}
+        ]}]}},
+    {node:"dedup",stage:"Stage 2 · Dedup",title:"At-least-once retries over-count &rarr; add clickId seen-set",
+      live:["client","gw","stream","agg","olap","dedup"],
+      edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"]],
+      narrate:"The pipeline is intentionally at-least-once: clients retry, gateways retry, Kafka replays, and processors restore from checkpoints. For analytics that is acceptable; for billing it can charge the same click twice unless a stable clickId is remembered.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A 24h dedup window at **86B ids/day** is large but bounded: about **29GB per Kafka partition** with 120 partitions, plus a small exact recent set."},
+        {k:"pain",label:"What breaks without it",text:"A mobile retry or replay after a crash turns one real click into multiple counted clicks. Advertisers get over-billed, and replay becomes dangerous instead of a recovery tool."},
+        {k:"fix",label:"The fix — co-partitioned seen state",text:"Route each clickId to the same task, check-and-set in RocksDB, and checkpoint the seen-set with offsets. Keep the recent window exact; use a compact filter for the older TTL tail and let batch audit money."},
+        {k:"key",label:"SDK contract",text:"The client must mint clickId once per user action and reuse it on retry. If retries create fresh ids, no downstream system can infer they were the same click."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Counting is now idempotent inside the live window.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Duplicate retries","counted again","dropped by clickId"],hi:1,tag:"fixed"},
+          {c:["Dedup TTL","none","~24h"]},
+          {c:["State per partition","none","~29GB tail + hot exact"]},
+          {c:["Recovery replay","can over-count","state + offset aligned"]}
+        ]}]}},
+    {node:"batch",stage:"Stage 3 · Batch reconciliation",title:"Live bugs and late data need truth &rarr; recompute from raw",
+      live:["client","gw","stream","agg","olap","dedup","batch"],
+      edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"],["agg","batch","reconcile"]],
+      narrate:"The speed layer is fast, but billing cannot rely only on code that was live at the time. Late events, bad deploys, and dedup filter choices need an authoritative recompute path from retained raw clicks.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Hot Kafka retention is about **7 days RF3**, and older raw events tier to object storage. That is enough to replay the exact minute windows that billing finalizes."},
+        {k:"pain",label:"What breaks without it",text:"A one-hour aggregator bug or late-arriving mobile batch leaves wrong OLAP rows. Without recompute, the only fix is manual adjustment and advertisers lose trust."},
+        {k:"fix",label:"The fix — lambda correction",text:"Batch reads raw events, applies authoritative dedup and windowing, then writes a higher batch_version for `(adId, minute)`. OLAP segment swap or idempotent upsert makes the correction atomic to readers."},
+        {k:"note",label:"Live vs final",text:"Dashboards show near-real-time estimates within about a minute. Billing reads finalized batch-corrected windows after the lateness horizon."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"The live layer can be fast because the batch layer can correct it.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Late data","event-time replay","corrected windows"],hi:1},
+          {c:["Bad live deploy","raw recompute","overwrite version"]},
+          {c:["Billing source","finalized batch","money-safe"],hi:1,tag:"fixed"},
+          {c:["Raw history","tiered objects","replayable"]}
+        ]}]}},
+    {node:"query",stage:"Stage 4 · Query API",title:"Advertisers need safe reads &rarr; add query brokers and cache",
+      live:["client","gw","stream","agg","olap","dedup","batch","query"],
+      edges:[["gw","stream","ingest"],["stream","dedup","dedup"],["stream","agg","consume"],["agg","olap","rollup"],["olap","query","read"],["agg","batch","reconcile"]],
+      narrate:"The data is now durable and correctable, but exposing OLAP directly couples advertisers to shards, partial failures and expensive repeated dashboards. Put a query layer in front that knows coverage, caching and tenant limits.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Dashboard demand can be ~**50K QPS**, cut about **90%** by result caching to ~5K OLAP scans/s with p99 below 1s."},
+        {k:"pain",label:"What breaks without it",text:"A dashboard refresh storm fans directly into OLAP, one advertiser can monopolize brokers, and partial segment coverage can return a confidently wrong low number."},
+        {k:"fix",label:"The fix — query API",text:"Query brokers enforce auth, tenant limits, cached common ranges, coverage checks and freshness labels. If replicas cannot cover a range, fail or show last-good with a flag; never silently under-count."},
+        {k:"gotcha",label:"Freshness label",text:"Expose whether a row is live, late-corrected, or batch-final. Users tolerate a minute of lag; they do not tolerate invisible correctness changes."}
+      ],
+      snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The complete design separates ingest, counting, correction and serving.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Dashboard QPS","~50K","~90% cache hit"],hi:1},
+          {c:["OLAP scan QPS","~5K","bounded"]},
+          {c:["Query p99","under 1s","target"]},
+          {c:["Partial data","coverage checked","no silent under-count"],hi:1,tag:"fixed"}
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

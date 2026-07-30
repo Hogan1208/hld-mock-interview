@@ -854,3 +854,77 @@ window.DATA['filesync'] = {
     {q:"How do a user's other devices learn about a change without hammering the servers?",a:"A notification service turns constant polling into event-driven pokes. Devices hold a lightweight subscription (long-poll or WebSocket); when a namespace's version cursor advances, the service pushes a tiny you-are-behind poke carrying only the namespace and its new cursor, never content. The device then does the normal changes-since-cursor metadata sync and pulls only changed chunks. The poke is a best-effort hint, not the source of truth: a lost or duplicated poke is harmless because a background cursor-based poll is the correctness backstop, so worst case a change is found one poll cycle later."},
   ]
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['filesync'];
+var scaling={id:"scaling",name:"From whole-file upload to efficient sync",kind:"scale",
+  live:["client","gw","meta","db"],
+  summary:"Start with a tiny metadata control plane and whole-file uploads, then let bandwidth, storage, and device fan-out force chunking, a block store, and notifications.",
+  steps:[
+    {node:"db",stage:"Stage 0 · Baseline",title:"Whole-file upload — metadata and bytes stay simple",
+      live:["client","gw","meta","db"],
+      narrate:"Draw the honest MVP first: the sync agent detects a changed file, sends the whole file through the API, and the metadata service records path, size, and version in the database. It is correct and understandable. It is also the version that teaches why the byte path must leave the metadata path.",
+      details:[
+        {k:"win",label:"Why start here",text:"The core invariant is visible: server metadata is authoritative, each file has a current version, and devices sync by comparing their cursor to the namespace version. For small files and early users, whole-file upload is acceptable."},
+        {k:"query",label:"Naive version commit",code:"BEGIN;\nINSERT INTO file_versions(file_id, version, size, mtime, device_id)\nVALUES (:file_id, :next_version, :size, :mtime, :device_id);\nUPDATE files\n   SET current_version = :next_version\n WHERE file_id = :file_id\n   AND current_version = :base_version;\nCOMMIT;"},
+        {k:"scale",label:"Working numbers",text:"The app expects ~100M DAU and ~100 changed files/day each: ~10B change events/day, ~115K/s baseline and 3-5× peak. The metadata rows are tiny; the bytes are the danger."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The metadata control plane is clear, but one small edit still moves one whole file.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Change events","~115K/s baseline","ok with batching"]},
+          {c:["Peak commits","~460K/s","metadata must scale"],hi:1},
+          {c:["Upload unit","whole file","waste on tiny edits"],hi:1,tag:"risk"},
+          {c:["Conflict rule","version CAS","safe baseline"]},
+        ]}]}},
+    {node:"chunk",stage:"Stage 1 · Chunking",title:"One-byte edits re-upload files &rarr; add content-defined chunks",
+      live:["client","gw","meta","db","chunk"],
+      narrate:"The first forced upgrade is bandwidth. A one-line edit in a 100MB file should not send 100MB again. The client chunks and hashes locally, then offers a manifest so only missing or changed chunks move.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Average uploads may be ~1MB, but files range to tens of GB. At ~460K peak changes/s, whole-file retransmit turns small edits into a network and storage bill."},
+        {k:"pain",label:"What breaks without it",text:"Fixed whole-file upload wastes bandwidth, slows sync, and stores duplicate bytes for every version. A 1-byte insert at the front of a large file can look like a full replacement."},
+        {k:"fix",label:"The fix — CDC plus dedup",text:"Run content-defined chunking on the client with a ~4MB target and strong hashes. The server checks which hashes exist, uploads only misses, and commits a manifest. Inserts disturb one chunk and boundaries re-align after it.",pill:"delta sync"},
+        {k:"gotcha",label:"Do not trust the client",text:"Client hashes save bandwidth, but integrity is verified server-side before a chunk becomes referenceable. Dedup can also leak an existence side-channel, so reveal as little as possible about global hits."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The upload unit becomes changed chunks, not changed files.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Small edit in large file","full file uploaded","only touched chunks"],hi:1,tag:"fixed"},
+          {c:["Chunk target","not applicable","~4MB bounded chunks"]},
+          {c:["Client hashing","none","~500 MB/s locally"]},
+          {c:["Central CPU avoided","server byte crunching","~460 cores pushed to clients"],hi:1},
+        ]}]}},
+    {node:"block",stage:"Stage 2 · Block store",title:"Chunks outgrow the DB &rarr; move bytes to block storage",
+      live:["client","gw","meta","db","chunk","block"],
+      narrate:"Chunking creates the right byte unit, but those chunks do not belong in the strongly consistent metadata database. Metadata should hold file trees, versions, cursors, and chunk manifests. Immutable content-addressed bytes should live in a scalable block or object store reached directly by clients.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Capacity math in this file reaches ~25 EB raw, ~12 EB unique after dedup, and ~18 EB physical with erasure coding. That is a block-storage problem, not a metadata-table problem."},
+        {k:"pain",label:"What breaks without it",text:"Putting bytes in the metadata DB bloats indexes, couples slow uploads to tiny sync commits, and makes a few large files starve the hot control plane."},
+        {k:"fix",label:"The fix — split control and data planes",text:"Clients upload chunks directly to block storage with scoped URLs. The metadata DB commits only manifests and ref counts after chunks are durable. Bytes become immutable content-addressed objects; metadata stays small and transactional.",pill:"data plane"},
+        {k:"key",label:"Ordering that avoids data loss",text:"Make the chunk durable before the metadata version points at it. If commit fails, an orphan chunk is harmless and garbage-collected later. A visible file version pointing at missing bytes is the bug."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"The strong store now holds pointers; the block plane scales for exabytes.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Raw user bytes","~25 EB","block store"],hi:1},
+          {c:["Unique after dedup","~12 EB","content addressed"]},
+          {c:["Physical with EC","~18 EB","affordable durability"],hi:1},
+          {c:["Metadata DB role","manifests + cursors","small strong core"],tag:"fixed"},
+        ]}]}},
+    {node:"notif",stage:"Stage 3 · Notifications",title:"Devices poll for changes &rarr; push version pokes",
+      live:["client","gw","meta","db","chunk","block","notif"],
+      narrate:"The last forced upgrade is propagation. After one device commits a new namespace version, every other device should learn quickly without polling every minute forever. Notifications carry a tiny hint; devices still pull the authoritative delta from metadata by cursor.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"With ~100M devices, once-a-minute polling is ~1.6M sync reads/s even when nothing changed. Real commits are ~115K/s baseline, so event-driven pokes are the cheaper shape."},
+        {k:"pain",label:"What breaks without it",text:"Constant polling creates a read herd on metadata and still makes sync feel delayed. Shared folders amplify the herd because many devices ask the same changes-since question at once."},
+        {k:"fix",label:"The fix — best-effort poke, authoritative pull",text:"A notification service holds long-poll or WebSocket subscriptions and sends namespace-advanced hints. The device then calls changes-since its cursor and downloads only missing chunks. Lost or duplicate pokes are safe because cursor polling remains the backstop.",pill:"fan-out"},
+        {k:"gotcha",label:"Hint, not truth",text:"Never send file bytes or trust ordering through the notification tier. It only wakes clients. The metadata cursor and manifest read decide exactly what changed."},
+      ],
+      snap:{title:"Load & capacity — Stage 3 (full design)",cap:"Sync becomes event-driven while correctness remains cursor-based.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Cold polling","~1.6M reads/s","collapsed by pokes"],hi:1,tag:"fixed"},
+          {c:["Commit stream","~115K/s baseline","publish tiny hints"]},
+          {c:["Peak commits","~460K/s","stateless fan-out"]},
+          {c:["Correctness source","metadata cursor","lost poke self-heals"],hi:1},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

@@ -919,3 +919,98 @@ window.DATA['crawler'] = {
     {q:"News pages change every few minutes; an archived PDF has not changed in 3 years. A fixed 30-day recrawl makes news stale and wastes budget on dead pages. Design recrawl.",a:"Freshness must be adaptive per-page, not a global cycle. Estimate each page's change rate from history — track content hashes across fetches and measure how often they differ — and set the recrawl interval inversely: a page changing hourly is recrawled roughly hourly, a static PDF drifts out to monthly. Use cheap signals to avoid wasted fetches: HTTP conditional requests (If-Modified-Since / ETag) return a bodyless 304 for unchanged pages, and sitemaps with lastmod / changefreq hints tell you what moved without polling. To keep scheduler state small, bucket pages into a few change-rate tiers (hourly/daily/monthly) rather than a per-page timer, and keep only the due-soon window hot. The scheduler feeds due-for-recrawl URLs back into the frontier at the appropriate priority."},
   ]
 };
+
+
+(function(){
+var d=window.DATA['crawler'];
+var scaling={id:"scaling",name:"From seed loop to web-scale crawl",kind:"scale",
+  live:["seed","frontier","fetcher","parser"],
+  summary:"Start with the smallest crawler loop, then let the numbers force each box: DNS caching, per-domain politeness, dedup, and durable page storage. Each step adds exactly one component because one concrete ceiling was crossed.",
+  steps:[
+    {node:"frontier",stage:"Stage 0 · Baseline",title:"One crawl loop — schedule, queue, fetch, parse",
+      live:["seed","frontier","fetcher","parser"],
+      edges:[["seed","frontier","seed URLs"],["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","frontier","new links"]],
+      narrate:"Draw the honest MVP first: a scheduler seeds URLs, the frontier hands one to a fetcher, the parser extracts links, and those links go back into the frontier. It can crawl a demo slice correctly, but every external dependency is still hidden inside the fetcher and every new link is trusted.",
+      details:[
+        {k:"win",label:"Why start here",text:"It proves the loop and keeps the interview legible: priority queue, async fetch, parse, enqueue. Do not pre-draw the entire web; earn each extra box from a measured failure."},
+        {k:"scale",label:"Working numbers",text:"Target is ~**30B pages** refreshed monthly, or ~**12K pages/s** sustained. The baseline is fine for seeds and a small corpus, not for the public web."},
+        {k:"query",label:"The loop",code:"seed due URLs -> frontier.push(url)\nfrontier.pop() -> fetcher.download(url)\nparser.extract_links(html) -> frontier.push(canonical_links)\nparser.extract_text(html) -> index pipeline"}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The loop is correct, but all hidden costs still land on the fetcher and frontier.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Fetch budget","~12K pages/s","target"]},
+          {c:["New-link fan-out","~120K URLs/s","pressure building"],hi:1},
+          {c:["Known pages","30B","not yet modeled"]},
+          {c:["External controls","none","demo only"],tag:"risk"}
+        ]}]}},
+    {node:"dns",stage:"Stage 1 · DNS cache",title:"A lookup per fetch blocks slots &rarr; add cached DNS",
+      live:["seed","frontier","fetcher","parser","dns"],
+      edges:[["frontier","fetcher","next URL"],["fetcher","dns","resolve"],["fetcher","parser","raw HTML"]],
+      narrate:"At 12K pages/s, resolving a hostname on the hot path is no longer background noise. A blocking lookup per page burns fetch slots and can turn an upstream resolver hiccup into a crawler-wide stall.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"The fetch budget implies ~**12K DNS checks/s**, but the crawl revisits the same ~100M hosts. With locality, only ~**100 real misses/s** should hit recursive DNS."},
+        {k:"pain",label:"What breaks without it",text:"Every slow DNS answer pins an otherwise idle network slot. During resolver rate limiting, fetchers look busy but do no useful page work, and politeness timing becomes noisy because URLs cannot even resolve."},
+        {k:"fix",label:"The fix — resolver cache",text:"Add a partitioned DNS resolver cache keyed by host with TTLs, async refresh and single-flight on misses. Fetchers almost always hit memory; one worker refreshes an expired hot host while the rest wait."},
+        {k:"gotcha",label:"Stale IPs are recoverable",text:"Honor DNS TTLs, and on connect failure force a re-resolve. A stale address wastes one fetch attempt; it must not poison the host forever."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"DNS is now a cached lookup, not a per-page external dependency.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Lookups implied","~12K /s","~12K cache checks/s"]},
+          {c:["Real DNS misses","~12K /s worst case","~100 /s"],hi:1,tag:"fixed"},
+          {c:["Cache size","none","~10GB fleet"]},
+          {c:["Fetch slot blocked by DNS","common on miss","rare"]}
+        ]}]}},
+    {node:"politeness",stage:"Stage 2 · Politeness",title:"Parallel fetchers can hammer one host &rarr; enforce per-domain rate",
+      live:["seed","frontier","fetcher","parser","dns","politeness"],
+      edges:[["frontier","fetcher","next URL"],["fetcher","dns","resolve"],["fetcher","politeness","rate check"],["fetcher","parser","raw HTML"]],
+      narrate:"More fetchers raise global throughput, but they also make it easy to send many concurrent requests to one unlucky domain. A crawler that ignores robots.txt and crawl-delay gets blocked and can harm sites.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"~**200 workers** share the 12K pages/s budget. Without single-owner host state, two workers can each believe a domain is safe and violate a 1s or 10s crawl-delay."},
+        {k:"pain",label:"What breaks without it",text:"The crawler becomes impolite: one hot domain can receive bursts far beyond its allowed interval, leading to 429s, IP bans, bad data freshness, and a system-design miss on the non-functional requirement."},
+        {k:"fix",label:"The fix — host-affine rate state",text:"Co-locate each domain's back-queue, robots cache and last-hit timestamp on the same frontier shard. A URL is eligible only when that host's interval has elapsed; unknown robots defaults conservative."},
+        {k:"key",label:"Why co-locate with frontier",text:"The queue and rate decision need the same ordering. Domain affinity avoids a central rate-limit service and avoids cross-worker races on one host."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Global throughput can rise while every individual domain remains protected.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Workers","~200","parallel globally"]},
+          {c:["Timing state","~5GB fleet","small"]},
+          {c:["robots cache","~100GB fleet","partitioned"]},
+          {c:["Per-domain owner","hash(domain)%N","no race"],hi:1,tag:"fixed"}
+        ]}]}},
+    {node:"dedup",stage:"Stage 3 · Dedup",title:"120K discovered URLs/s explodes the frontier &rarr; add seen-set",
+      live:["seed","frontier","fetcher","parser","dns","politeness","dedup"],
+      edges:[["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","dedup","seen?"],["parser","frontier","new links"]],
+      narrate:"The parser emits about ten links per fetched page. At the target crawl rate that is 120K enqueue attempts every second, most of them duplicates, parameter variants, traps, or already-known URLs.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"At ~**120K URL discoveries/s** and **30B known URLs**, an exact in-memory hashset would be multi-terabyte. The frontier only stays finite if admission checks happen before enqueue."},
+        {k:"pain",label:"What breaks without it",text:"The queue grows without bound, spider traps dominate the budget, and the same page is fetched through many URL variants. Fetch capacity is spent rediscovering instead of refreshing."},
+        {k:"fix",label:"The fix — URL and content dedup",text:"Canonicalize first, then check a partitioned Bloom seen-set before enqueue. Use content SimHash later to collapse near-duplicate pages. The Bloom fleet is ~37GB versus 3TB+ for an exact hot set."},
+        {k:"gotcha",label:"False positives",text:"A Bloom false positive can skip a real URL. Tune it below ~1% and optionally exact-check high-value URLs; it slightly reduces coverage, but it never corrupts stored content."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"Dedup turns infinite discovery into bounded admission.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Enqueue attempts","~120K /s","checked before admit"],hi:1},
+          {c:["Seen memory","3TB+ exact","~37GB Bloom fleet"],hi:1,tag:"fixed"},
+          {c:["Per worker seen-set","unbounded","~190MB"]},
+          {c:["Trap domains","grow forever","capped + filtered"]}
+        ]}]}},
+    {node:"store",stage:"Stage 4 · Content store",title:"Bytes outgrow workers &rarr; split blob store from metadata",
+      live:["seed","frontier","fetcher","parser","dns","politeness","dedup","store"],
+      edges:[["frontier","fetcher","next URL"],["fetcher","parser","raw HTML"],["parser","dedup","seen?"],["parser","frontier","new links"],["parser","store","save page"]],
+      narrate:"Once the crawler is polite and bounded, the remaining scale is durable bytes. Parsed content and raw pages cannot live on worker disks; the system needs a write-once archive plus a small lookup index.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"30B pages at ~16KB compressed is ~**500TB** of blobs, written at ~**190MB/s** or ~1.6TB/day. Raw volume is ~3PB before compression."},
+        {k:"pain",label:"What breaks without it",text:"Writing billions of tiny files to a NameNode-style filesystem or a mutable row store creates metadata and compaction pain. Worker-local storage loses pages on failure and cannot feed later indexing or replay."},
+        {k:"fix",label:"The fix — WARC blobs + metadata index",text:"Pack many pages into WARC objects in managed object storage, and keep a narrow metadata index keyed by URL hash with content hash, fetch time and object pointer. Bytes and lookup state scale independently."},
+        {k:"note",label:"Rebuild path",text:"If the metadata index is corrupt, scan WARC headers to rebuild it. The immutable bytes are the durable source; the index is the fast map."}
+      ],
+      snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The final design has a bounded frontier, polite fetch, cheap DNS, dedup, and durable crawl output.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Blob volume","object storage + WARC","~500TB compressed"],hi:1},
+          {c:["Write rate","sharded prefixes","~190MB/s"]},
+          {c:["Metadata","wide-column index","~3TB"]},
+          {c:["Durability","object storage replication","pages survive worker loss"],hi:1,tag:"fixed"}
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

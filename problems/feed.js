@@ -855,3 +855,78 @@ window.DATA['feed'] = {
     {q:"The write-primary for a post shard crashes; you promote a replica and the old primary rejoins. What is the risk and how do you prevent it?",a:"The risk is split-brain: two primaries taking divergent writes to the same post and edge keys, corrupting the graph. Promotion goes through consensus-based leader election that issues a monotonically increasing epoch; the new primary writes under the higher epoch and the stale old primary's writes are rejected via the fencing token, after which it re-syncs. Writes to that shard pause for the few-second election (consistency chosen over availability for writes), but reads stay up from replicas so timelines keep loading, and because post ids are globally unique and fan-out is idempotent the paused writes simply retry with no duplicates."},
   ]
 };
+
+
+/* ---- scaling journey ---- */
+(function(){
+var d = window.DATA["feed"];
+var scaling = {id:"scaling",name:"From query-time feed to hybrid fan-out",kind:"scale",
+  live:["client","lb","feed","db"],
+  summary:"Start with a feed service that queries the graph and posts directly, then let the social-network numbers force cached timelines, hybrid fan-out, and a separate media path.",
+  steps:[
+    {node:"db",stage:"Stage 0 · Baseline",title:"Build the home feed by querying followees at read time",
+      live:["client","lb","feed","db"],
+      edges:[["feed","db","timeline query"]],
+      narrate:"The MVP is fan-out-on-read. Opening the app asks the DB for the user's followees, fetches their recent posts, sorts by time or rank, and returns the first page. Posting is just an insert into the canonical post store.",
+      details:[
+        {k:"win",label:"Why start here",text:"It is correct and easy to reason about: one canonical post row, one follow graph, no derived feed lists to rebuild. For small accounts and low traffic, it avoids the whole fan-out machinery."},
+        {k:"query",label:"Baseline timeline query",code:"SELECT p.post_id, p.author_id, p.created_at\nFROM follows f\nJOIN posts p ON p.author_id = f.followee_id\nWHERE f.follower_id = 42\nORDER BY p.created_at DESC\nLIMIT 50;"},
+        {k:"scale",label:"Working numbers",text:"The product target is **~70K reads/s** sustained, **~300K/s peak**, against only **~3,500 posts/s**. Reads dominate from the first capacity pass."}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The query is correct, but the join and sort sit on the read hot path.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Timeline reads","~70K /s sustained","rising toward ~300K /s peak"],hi:1,tag:"risk"},
+        {c:["Post writes","~3,500 /s","small by comparison"]},
+        {c:["Typical follows","~300 followees","join per read"]},
+        {c:["Celebrity followers","~50M","not touched yet"]}
+      ]}]}},
+    {node:"cache",stage:"Stage 1 · Feed cache",title:"Read-time joins get expensive &rarr; cache timelines and hot posts",
+      live:["client","lb","feed","db","cache"],
+      edges:[["feed","cache","read page"],["cache","db","miss rebuild"]],
+      narrate:"At hundreds of thousands of timeline opens per second, repeating the same graph lookup, post fetches, ranking, and hydration for active users is waste. The first scale move is to cache the assembled candidate list and hot post bodies.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak reads are **~300K/s**, with a **p99 target under 200 ms**. A feed read must become a cache list range plus bounded hydration, not a fresh graph join every time."},
+        {k:"pain",label:"What breaks without it",text:"The DB becomes a ranking engine: every app open scans followees, finds posts, sorts, hydrates, and repeats for the same active users. P99 grows with follow count and cache-cold post bodies."},
+        {k:"fix",label:"The fix — cached candidate lists",text:"Keep a Redis sorted set per active user with recent post ids and cache hot post objects for hydration. The durable DB remains source of truth; the cache is a recomputable read model.",pill:"read model"},
+        {k:"gotcha",label:"Derived means rebuildable",text:"A lost feed list is a latency event, not data loss. Rebuild lazily from posts plus graph with request coalescing so a cache restart does not become a DB stampede."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Reads become bounded cache operations; cold rebuilds are controlled.",tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
+        {c:["Timeline read","graph join + sort","Redis range + hydration"],hi:1,tag:"fixed"},
+        {c:["Read p99","grows with followees","under 200 ms target"]},
+        {c:["Working-set RAM","none","~6 TB for active timelines"]},
+        {c:["Cache loss","blank risk","lazy rebuild"]}
+      ]}]}},
+    {node:"fanout",stage:"Stage 2 · Hybrid fan-out",title:"Read-time fan-out still bends under skew &rarr; pre-push normal posts",
+      live:["client","lb","feed","db","cache","fanout"],
+      edges:[["feed","fanout","post event"],["fanout","cache","append ids"]],
+      narrate:"Caching the read helps, but now the question is how the cached lists get fresh. Pure fan-out-on-read makes each active read merge posts from every followee; users with thousands of followees and large accounts make that merge too expensive.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Average fan-out is **~300 followers** per post, so **~3,500 posts/s** becomes roughly **~1M feed-list writes/s**. One celebrity post can address **50M followers**, so the strategy must be hybrid."},
+        {k:"pain",label:"What breaks without it",text:"Without fan-out workers, every read pays the followee merge and rank cost. Heavy readers and celebrity follow sets turn a feed open into a wide scatter, blowing the 200 ms budget."},
+        {k:"fix",label:"The fix — hybrid delivery",text:"Normal authors fan out on write: workers push the post id into followers' cached timelines asynchronously. Celebrity accounts skip write fan-out and are merged at read time from their author index.",pill:"hybrid"},
+        {k:"gotcha",label:"The trade-off",text:"Write fan-out buys cheap reads by spending writes. The threshold is a dial: lower it under backlog to shed large accounts back to read-time merge; raise it when reads need to be cheaper."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"The system spends async writes to make the dominant read path cheap, while capping celebrity storms.",tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+        {c:["Feed-list writes","~1M /s average","async workers + cache"],hi:1},
+        {c:["Celebrity post","50M naive writes","skip and merge on read"],hi:1,tag:"fixed"},
+        {c:["Read path","prebuilt list","cheap page fetch"]},
+        {c:["Backlog control","threshold + active users","degrades gracefully"]}
+      ]}]}},
+    {node:"media",stage:"Stage 3 · Media and CDN",title:"Images and video bloat the feed &rarr; split bytes to object storage",
+      live:["client","lb","feed","db","cache","fanout","media"],
+      edges:[["feed","media","media refs"]],
+      narrate:"The text feed is now fast, but media can dwarf everything else. If app servers proxy uploads or DB rows carry image and video bytes, a few viral clips turn the feed architecture into a bandwidth system.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"If **~20% of 300M posts/day** include ~2 MB media, originals alone are about **120 TB/day**. Feed reads can request **~900 TB/day** of viewer bytes before CDN absorption."},
+        {k:"pain",label:"What breaks without it",text:"Putting media bytes in the DB or app path explodes storage, egress, and p99. Feed service instances become upload proxies and video servers instead of timeline assemblers."},
+        {k:"fix",label:"The fix — object store plus CDN",text:"Clients upload media directly to object storage using pre-signed URLs. The post row stores only media ids; an async pipeline creates renditions; viewers fetch from the CDN in parallel with feed rendering.",pill:"bytes off path"},
+        {k:"note",label:"Independent failure domain",text:"If transcode or a CDN region has trouble, text feeds and post metadata still load. Media degrades to processing thumbnails or retries instead of taking the timeline down."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"The complete design keeps feed reads about ids and metadata; heavy bytes flow through media infrastructure.",tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+        {c:["Original ingest","~120 TB/day","object storage direct upload"],hi:1,tag:"fixed"},
+        {c:["Viewer bytes","~900 TB/day","CDN absorbs ~95%"]},
+        {c:["Post row","media ids only","small hydration payload"]},
+        {c:["Media outage","isolated path","text feed survives"]}
+      ]}]}}
+  ]};
+d.deepFlows = [scaling].concat(d.deepFlows);
+})();

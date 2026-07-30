@@ -886,3 +886,98 @@ window.DATA['scheduler'] = {
     {q:"What is the dead-letter store for, and how do you distinguish a poison job from a transient failure?",a:"Jobs that exhaust their retry budget (e.g. 5 attempts with backoff) land in a separate dead-letter store carrying def, payload, execution id, attempt count, and last error &mdash; an explicit, monitorable surface you alert on by depth, kept out of the hot retry path. The retry policy is the filter: transient failures (timeouts, 503s, resets) are retried with backoff and usually succeed, so they never arrive; what survives all retries is likely poison (bad payload, 4xx/auth, code bug). Fail-fast to dead-letter on 4xx/validation, retry on 5xx/timeouts, so its depth is a meaningful signal. Replay after a fix is a rate-limited re-enqueue with a resumable replay-state so a crash mid-replay neither loses nor double-runs entries."},
   ]
 };
+
+
+(function(){
+var d=window.DATA['scheduler'];
+var scaling={id:"scaling",name:"From durable cron to scheduler at scale",kind:"scale",
+  live:["client","api","jobdb","worker"],
+  summary:"Start from a durable job table and workers, then add due discovery, a queue, coordination, and dead-letter handling only when the load or failure mode demands it. The invariant stays simple: never lose a submitted job, and make duplicates harmless.",
+  steps:[
+    {node:"jobdb",stage:"Stage 0 · Baseline",title:"One durable store — workers claim jobs directly",
+      live:["client","api","jobdb","worker"],
+      edges:[["client","api","submit"],["api","jobdb","persist"],["jobdb","worker","claim"]],
+      narrate:"Draw the smallest correct scheduler first: the API validates a job, durably writes it, and workers claim due rows from the job store. The design protects the core promise — a submitted job is not lost — but the due-scan and handoff are still coupled to the database.",
+      details:[
+        {k:"win",label:"Why start here",text:"Durability is earned before scale. Once the API acks only after a quorum-committed row, every later component can crash and the job still exists to be found again."},
+        {k:"scale",label:"Working numbers",text:"~**100M jobs** registered, ~**10K executions/s** steady, with round-time spikes where **1M jobs** may be due at midnight."},
+        {k:"query",label:"Naive but correct",code:"INSERT INTO jobs(job_id, spec, next_run_at, state) VALUES (..., 'pending');\n-- worker loop\nUPDATE jobs SET state='running'\n WHERE job_id=? AND state='pending' AND next_run_at <= now();"}
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The data is safe, but polling and execution are not yet independently scalable.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Registered jobs","~100M","durable"]},
+          {c:["Steady executions","~10K /s","target"]},
+          {c:["Midnight herd","~1M due","risk"],hi:1,tag:"risk"},
+          {c:["Handoff buffer","none","DB coupled"]}
+        ]}]}},
+    {node:"scheduler",stage:"Stage 1 · Due scanner",title:"Workers cannot scan 100M rows &rarr; add scheduler partitions",
+      live:["client","api","jobdb","worker","scheduler"],
+      edges:[["client","api","submit"],["api","jobdb","persist"],["scheduler","jobdb","poll due"],["jobdb","worker","claim"]],
+      narrate:"Letting every worker hunt for due jobs turns the hot table into a polling target. Due discovery needs its own bounded loop that scans only due partitions, claims rows atomically, and leaves workers focused on execution.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"The due loop ticks about every **1s** and must handle ~**10K/s** steady. A midnight spike is smeared by jitter to roughly **50K/s**, so about **6 scheduler partitions** give headroom."},
+        {k:"pain",label:"What breaks without it",text:"A naive `WHERE next_run_at &le; now` over 100M jobs each tick pins the database and starves state transitions. Workers waste capacity polling instead of running jobs."},
+        {k:"fix",label:"The fix — partitioned due discovery",text:"Add scheduler instances that own disjoint job_id partitions, read a time index or sorted set for due jobs, and perform the atomic pending&rarr;queued claim in the store. Work per tick is proportional to due jobs, not catalog size."},
+        {k:"key",label:"Still source-of-truth in DB",text:"The sorted set can accelerate the hot loop, but the conditional claim in the job store decides. If the cache is lost, an overdue DB scan rebuilds due work."}
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Due discovery is bounded and parallel, but dispatch still has no shock absorber.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Due scan","100M-row risk","range/sorted-set due only"],hi:1,tag:"fixed"},
+          {c:["Steady claims","~10K /s","partitioned"]},
+          {c:["Midnight rate","~50K /s after jitter","~6 partitions"]},
+          {c:["Tick target","can exceed 1s","finishes within tick"]}
+        ]}]}},
+    {node:"queue",stage:"Stage 2 · Task queue",title:"Execution bursts back up claims &rarr; decouple with a queue",
+      live:["client","api","jobdb","worker","scheduler","queue"],
+      edges:[["api","jobdb","persist"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"]],
+      narrate:"The scheduler should be fast at finding due work, not blocked by slow handlers or a temporarily undersized worker pool. A durable queue turns a spike into backlog and gives workers leases, visibility timeouts and ack semantics.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Workers need about **20K in-flight** slots for 10K/s at ~2s average duration, with **400–600 workers** as a practical floor. Midnight dispatch can hit **50K msgs/s**."},
+        {k:"pain",label:"What breaks without it",text:"Without a buffer, a worker slowdown makes schedulers hold DB claims longer or retry dispatch in place. Jobs fire late, and the database becomes the backpressure queue."},
+        {k:"fix",label:"The fix — durable at-least-once queue",text:"Schedulers enqueue due executions and move on. Workers lease messages under a visibility timeout, heartbeat long jobs, and ack only after success. No ack means redelivery, not loss."},
+        {k:"gotcha",label:"At-least-once means idempotency",text:"A re-delivered execution must be harmless. Pass `jobId + scheduledFireTime` as the execution id so downstream side effects can dedup."}
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"The queue absorbs scheduling spikes and lets workers scale on lag.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Queue throughput","10K steady · 50K peak","partitioned"]},
+          {c:["Partitions","~12–16","headroom"],hi:1},
+          {c:["In-flight workers","~20K tasks","Little's law"]},
+          {c:["Crash during execution","lease expires","redelivered"],hi:1,tag:"fixed"}
+        ]}]}},
+    {node:"coordinator",stage:"Stage 3 · Coordinator",title:"Multiple schedulers can double-own work &rarr; elect and fence",
+      live:["client","api","jobdb","worker","scheduler","queue","coordinator"],
+      edges:[["api","jobdb","persist"],["coordinator","scheduler","elect"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"]],
+      narrate:"Partitioned schedulers scale, but now ownership is a correctness problem. If two schedulers believe they own the same partition during a failover, both can claim or enqueue the same job window.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"At **6+ scheduler partitions** and frequent deploys/failovers, manual ownership is not safe. Every claim needs an owner epoch so stale schedulers are fenced."},
+        {k:"pain",label:"What breaks without it",text:"Split-brain schedulers double-fire jobs, or an abandoned partition stops firing until a human notices. Both violate the reliability contract: duplicates may be harmful, and silent drops are worse."},
+        {k:"fix",label:"The fix — leases, epochs and fencing",text:"A coordinator assigns partitions with short leases and monotonic epochs. The job store accepts claims only from the current epoch; a stale scheduler can keep running but its writes are rejected."},
+        {k:"note",label:"Late beats double",text:"On uncertainty, pause, elect, fence and resume. A job firing a few seconds late is recoverable by overdue scan; a double-fired billing job is not."}
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"Ownership is explicit, failover is automatic, and stale writers are fenced.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Partition ownership","coordinator lease","single active owner"],hi:1,tag:"fixed"},
+          {c:["Stale scheduler","epoch fenced","no double claim"]},
+          {c:["Scheduler crash","overdue scan","late not lost"],hi:1},
+          {c:["Clock skew","DB claim arbiter","bounded timing error"]}
+        ]}]}},
+    {node:"deadletter",stage:"Stage 4 · Dead-letter",title:"Retries can loop forever &rarr; isolate exhausted executions",
+      live:["client","api","jobdb","worker","scheduler","queue","coordinator","deadletter"],
+      edges:[["api","jobdb","persist"],["coordinator","scheduler","elect"],["scheduler","jobdb","poll due"],["scheduler","queue","enqueue"],["queue","worker","dispatch"],["worker","deadletter","on fail"]],
+      narrate:"The scheduler can now find and dispatch reliably, but a permanently failing handler can churn forever, hide the real error and starve healthy work. Failed executions need policy, visibility and a terminal place to land.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"At **10K executions/s**, even a 0.1% permanent failure rate is 10 poisoned jobs every second. Unbounded retries become a self-inflicted queue flood."},
+        {k:"pain",label:"What breaks without it",text:"A bad payload or downstream bug retries forever, burns worker slots, and buries the root cause in logs. Users see pending jobs with no clear final state."},
+        {k:"fix",label:"The fix — retry policy + dead-letter",text:"Track attempts in the job store, retry with exponential backoff and jitter, then move exhausted executions to a dead-letter table/topic with reason, payload pointer and replay controls. Operators can inspect and re-drive after a fix."},
+        {k:"gotcha",label:"Recurring jobs",text:"Dead-letter the failed execution, not the entire cron definition unless policy says to pause it. The next scheduled fire time can still be computed and run."}
+      ],
+      snap:{title:"Load & capacity — Stage 4 (full design)",cap:"The complete scheduler has durable intake, bounded due discovery, buffered dispatch, fenced ownership and visible terminal failures.",
+        tables:[{name:"signals",cols:["signal","mechanism","result"],rows:[
+          {c:["Permanent failures","max attempts + DLQ","no infinite loop"],hi:1,tag:"fixed"},
+          {c:["Retry burst","backoff + jitter","smoothed"]},
+          {c:["Operator action","inspect + replay","recoverable"]},
+          {c:["Core invariant","job store truth","never silently lost"],hi:1}
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

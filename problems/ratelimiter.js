@@ -814,3 +814,81 @@ window.DATA['ratelimiter'] = {
     {q:"One abusive api-key sends 400K req/s and hotspots a single shard. How do you fix the hot shard?",a:"Sharding by key balances keys, not load per key, so one scorching key pins its owner. First, <strong>detect</strong> it: a count-min sketch / heavy-hitters structure at the gateway flags a key crossing a rate threshold within a second or two. Then <strong>shed at the edge</strong> — once flagged over-limit, reject the key in-process at the gateway from a short-lived local denylist, without touching Redis, so the 400K/s dies at the front door and a denied request costs no store op. For the thin slice that slips through before detection, <strong>fan the counter out</strong> into key#1..#N sub-counters across shards and sum on read, spreading the write load. Reserve fan-out for genuinely hot keys, not all 10M."},
   ]
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['ratelimiter'];
+var scaling={id:"scaling",name:"From one Redis counter to fleet-scale",kind:"scale",
+  live:["client","gw","limiter","store"],
+  summary:"Start from the simplest correct limiter — one atomic Redis counter per key/window — then let latency, fairness, and operability force each extra box. Each stage names the number that breaks the previous design and the one component that earns its place.",
+  steps:[
+    {node:"store",stage:"Stage 0 · Baseline",title:"One central Redis counter — exact fixed-window limiting",
+      live:["client","gw","limiter","store"],
+      edges:[["limiter","store","INCR + EXPIRE"]],
+      narrate:"Draw the honest MVP first: every request reaches the gateway, the gateway asks the limiter, and the limiter performs one atomic Redis `INCR` on `rl:key:window`. It is globally correct because all nodes route a key to one owner shard, and it is small because counters expire after roughly two windows.",
+      details:[
+        {k:"win",label:"Why start here",text:"It is **correct and legible**: one owner per key, one atomic operation, no background reconciliation, and no per-node drift. You can explain exactly why request 1000 is allowed and 1001 is denied."},
+        {k:"query",label:"Baseline decision",code:"key = 'rl:api-key:{k_free_42}:1718000460'\ncount = INCR key\nif count == 1: EXPIRE key 120\nallowed = count <= 1000\nreturn allowed, 1000 - count"},
+        {k:"scale",label:"Working numbers",text:"At ~**1M requests/s** across ~50 gateway nodes, Redis needs ~1M atomic ops/s. With ~10–12 shards at ~100K ops/s each and ~10M hot counters, throughput — not memory — sets the fleet size."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The first version is exact, but it is a blunt fixed window and every decision pays one network hop.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Request rate","~1M /s","one Redis op each"],hi:1},
+          {c:["Counter store","~10–12 shards · ~24 nodes","ok"],hi:1},
+          {c:["Memory","~1–2GB live counters","not the limit"]},
+          {c:["Decision p99","inside 5 ms while Redis is healthy","ok"]},
+        ]}]}},
+    {node:"algo",stage:"Stage 1 · Smooth algorithm",title:"Fixed windows leak 2× bursts &rarr; add the algorithm engine",
+      live:["client","gw","limiter","store","algo"],
+      edges:[["limiter","algo","evaluate"],["limiter","store","Lua atomic op"]],
+      narrate:"The first failure is fairness, not fleet size. A fixed window lets a caller spend a full quota at the end of one minute and another full quota at the start of the next, so the backend sees twice the promised rate in seconds.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"For a free-tier `1000/min` rule, a fixed bucket admits **1000 at 12:00:59 plus 1000 at 12:01:00** — roughly 2× the intended load in a two-second burst."},
+        {k:"pain",label:"What breaks without it",text:"The limiter is technically enforcing each clock bucket, but it is not protecting the downstream from bursts. A synchronized client fleet turns the reset boundary into a thundering herd."},
+        {k:"fix",label:"The fix — O(1) smooth limiting",text:"Add an **algorithm engine** that defaults to token bucket or sliding-window-counter. Multi-step math still runs as one Redis Lua script, so refill, check, decrement, and TTL update stay atomic.",pill:"smooth"},
+        {k:"gotcha",label:"Avoid the exact log trap",text:"Sliding-window-log is exact but stores one timestamp per request. At 10M active keys and ~1000 entries/key, that is ~10B live entries. The counter form keeps 1–2 integers per key and is accurate enough for load protection."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The decision becomes smooth while per-key state stays O(1).",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Boundary burst","up to **2×**","controlled burst only"],hi:1,tag:"fixed"},
+          {c:["Per-key state","1 fixed counter","2 counters or token bucket"]},
+          {c:["Bad exact option","~10B timestamps","avoided"],tag:"waste"},
+          {c:["Atomicity","INCR only","Lua single op"],hi:1},
+        ]}]}},
+    {node:"config",stage:"Stage 2 · Runtime rules",title:"One hard-coded limit cannot serve tiers &rarr; add config",
+      live:["client","gw","limiter","store","algo","config"],
+      edges:[["limiter","config","cached rules"],["limiter","algo","rule selects algorithm"]],
+      narrate:"Now the product grows: free, pro, enterprise, per-route limits, emergency blocks, and live raises for customers in production. A redeploy to change `1000/min` is too slow and too dangerous.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"The full rule set is tiny — about **1MB** for tiers plus ~10K overrides — but it must be cached by ~80 gateway and limiter nodes and propagate fleet-wide in ~1–2s."},
+        {k:"pain",label:"What breaks without it",text:"Hard-coded limits mean every tier change is a deploy, nodes can disagree for minutes, and a bad default like `0/min` can lock out an entire tier before anyone sees it."},
+        {k:"fix",label:"The fix — versioned config service",text:"Add **Rules / config** as a versioned control plane. Nodes subscribe, hot-swap immutable rule sets in memory, boot from last-known-good, and report the version they enforce so convergence is visible.",pill:"control plane"},
+        {k:"key",label:"Rule shape",text:"A request resolves by precedence: per-key override &rarr; tier default &rarr; safe built-in default. The rule names limit, window, cost, and algorithm, so config chooses both the number and the counting method."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Config is not sized by QPS; it is sized by safe change propagation.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Rule-set size","~1MB","cache everywhere"],hi:1},
+          {c:["Caching nodes","~80","microsecond lookup"]},
+          {c:["Propagation","~1–2s","fast enough"],hi:1,tag:"fixed"},
+          {c:["Risk","bad push = global outage","canary + rollback"]},
+        ]}]}},
+    {node:"sync",stage:"Stage 3 · Local budgets",title:"Redis round-trips cap latency &rarr; add cluster sync",
+      live:["client","gw","limiter","store","algo","config","sync"],
+      edges:[["store","sync","authoritative totals"],["sync","limiter","budget leases"]],
+      narrate:"At the highest-volume tiers, exact central counting spends one network round-trip on every request and pins hot keys to one Redis owner. Keep strict-central for small contractual limits, but let huge limits spend short-lived local budgets and reconcile asynchronously.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Strict-central limiter instances handle roughly **25K decisions/s** each because the store round-trip dominates. Local budget checks move toward ~**200K decisions/s** per instance and keep the p99 safely below 5 ms."},
+        {k:"pain",label:"What breaks without it",text:"One Redis hop per request makes the limiter a latency tax on the hot path, and one abusive or massive enterprise key can hotspot its shard before edge denial catches up."},
+        {k:"fix",label:"The fix — leased local budgets",text:"Add **Cluster sync**. It reads authoritative counters, allocates short-lived per-node token slices proportional to recent traffic, and folds deltas back every ~500ms. On sync loss, leases expire and the node falls back to strict-central or a conservative floor.",pill:"latency trade"},
+        {k:"gotcha",label:"Exactness vs availability",text:"This is deliberately approximate. Overshoot is bounded by lease size and sync interval; for billing-grade or tiny limits, config keeps the key on strict-central so the limit remains exact."},
+      ],
+      snap:{title:"Load & capacity — Stage 3 (full design)",cap:"The final design chooses strict or local per tier instead of pretending one accuracy mode fits all traffic.",
+        tables:[{name:"signals",cols:["concern","strict-central","local + sync"],rows:[
+          {c:["Per-instance throughput","~25K/s","~200K/s"],hi:1,tag:"fixed"},
+          {c:["Sync report load","none","~50 nodes × 2/s = ~100 reports/s"]},
+          {c:["Aggregator state","none","~500MB for 10M active budgets"]},
+          {c:["Correctness","exact","bounded overshoot"],hi:1},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

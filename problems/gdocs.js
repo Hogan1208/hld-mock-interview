@@ -882,3 +882,77 @@ window.DATA['gdocs'] = {
     {q:"How do you size and place the collab-owner processes across 50M docs, and does a hot doc break the per-node budget?",a:"Size on <strong>concurrent live sessions, not total docs</strong> — an idle doc owns no process. At ~2M concurrent editing sessions and ~10K sessions per node that is ~200 nodes (with headroom, a few hundred). Placement is <strong>consistent hashing on doc id</strong>, so each doc maps to exactly one owner and the sequencer is per-doc, not global — no central bottleneck. A single 500-editor doc does not break the budget: it is only ~1-2.5K tiny ops/s and fan-out is offloaded to gateways + pub/sub, so the owner's real work (transform + append + publish) fits one core. The budget breaks only on session <em>count</em>, so I shard by doc id, keep ~30% headroom, and split a pathologically hot doc into per-section owners only if measurement ever demands it."},
   ],
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['gdocs'];
+var scaling={id:"scaling",name:"From whole-doc saves to real-time collaboration",kind:"scale",
+  live:["client","gw","collab","doc"],
+  summary:"Start from the simplest document editor that saves state, then let concurrency, awareness, and replay cost force the real collaborative architecture one component at a time.",
+  steps:[
+    {node:"doc",stage:"Stage 0 · Baseline",title:"Whole-doc saves — correct for one writer, fragile for many",
+      live:["client","gw","collab","doc"],
+      narrate:"Draw the honest MVP first: the browser opens a document, edits a local copy, and the service saves the full current document back to the store. For one author it is perfectly legible. The moment two editors type at once, last-writer-wins stops being a collaboration model and starts being data loss.",
+      details:[
+        {k:"win",label:"Why start here",text:"It proves the basic shape: client, socket or HTTP edge, a document service, and durable storage. No transform engine, no cursors, no snapshot policy. That is fine for solo edits and useful as the baseline to beat."},
+        {k:"query",label:"Naive save",code:"-- one current-state row, overwritten on save\nUPDATE documents\n   SET content = :whole_doc, current_version = current_version + 1\n WHERE doc_id = :doc_id\n   AND current_version = :base_version;\n-- without the version guard this becomes pure last-writer-wins"},
+        {k:"scale",label:"Working numbers",text:"Most docs have 1-3 editors, so whole-doc save can survive launch traffic. The hot case in this file is different: a 500-editor doc emits ~1-2.5K tiny ops/s and needs everyone to converge."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The skeleton is easy to reason about, but the collaboration invariant is not met yet.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Solo document","1 editor","ok"]},
+          {c:["Hot document","500 editors · ~1-2.5K ops/s","risk"],hi:1,tag:"risk"},
+          {c:["Conflict policy","last save wins","loses intent"],hi:1},
+          {c:["Open path","read current blob","bounded for now"]},
+        ]}]}},
+    {node:"engine",stage:"Stage 1 · Conflict engine",title:"Concurrent edits overwrite &rarr; add OT or CRDT",
+      live:["client","gw","collab","doc","engine"],
+      narrate:"The first forced upgrade is correctness, not QPS. Two users inserting at the same position are not two whole-doc blobs to pick between; they are two intents that must both survive. The collab owner orders ops, and the engine transforms or merges them before durable append.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A 500-editor doc can generate ~1-2.5K ops/s. At that rate, concurrent edits are the common case, not an edge case."},
+        {k:"pain",label:"What breaks without it",text:"Last-writer-wins silently drops one user's paragraph, undo can erase someone else's work, and offline replay becomes a clobber. The saved document may be durable, but it is not the document users intended."},
+        {k:"fix",label:"The fix — ordered ops plus OT or CRDT",text:"Represent each keystroke as an op with a base version. The collab service assigns one per-doc order; the engine transforms OT positions or merges CRDT ids against the accepted prefix, then appends the accepted op. Every client folds the same ordered stream.",pill:"correctness"},
+        {k:"gotcha",label:"Why the central owner helps",text:"A central per-doc order keeps transforms bounded to the known accepted prefix. CRDTs still work, but pay with per-element ids and tombstones; with a server already present, OT stays compact and proven."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"The write shape changes from blob overwrite to tiny ordered appends.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Conflict behavior","overwrite or reject","preserve both intents"],hi:1,tag:"fixed"},
+          {c:["Hot-doc rate","~1-2.5K ops/s","one owner + cheap transforms"],hi:1},
+          {c:["Op size","whole doc blob","~50 B operation"]},
+          {c:["Convergence","not guaranteed","same ordered op stream"]},
+        ]}]}},
+    {node:"presence",stage:"Stage 2 · Presence",title:"Cursor churn pollutes edits &rarr; split ephemeral presence",
+      live:["client","gw","collab","doc","engine","presence"],
+      narrate:"Once editing is correct, the product still feels broken if collaborators cannot see cursors, selections, and typing awareness. But cursor motion is high-frequency and disposable. It should ride the socket, then branch to an ephemeral presence service instead of entering the durable op log.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Presence can be ~5-10 cursor updates/s per user. Naively fanning every move in a 500-editor doc is ~2.5M messages/s before coalescing, far above the edit stream."},
+        {k:"pain",label:"What breaks without it",text:"If cursors go through the edit log, the correctness path drowns in throwaway state. Snapshots bloat, replay slows, and a cosmetic outage can stall real edits."},
+        {k:"fix",label:"The fix — separate live-state channel",text:"Store presence as last-write-wins values keyed by doc and user with short TTLs. Gateways coalesce updates every ~100-200 ms and broadcast snapshots. Lost presence updates self-heal on the next tick.",pill:"ephemeral"},
+        {k:"gotcha",label:"Different guarantees by design",text:"Edits need total order and durability. Presence needs freshness and can be dropped. Mixing them gives the cursor path guarantees it does not need and steals capacity from the text path."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"High-churn awareness leaves the durable edit budget alone.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Per-user cursor rate","~5-10 /s","coalesce"],hi:1},
+          {c:["Naive hot-doc fan-out","~2.5M msg/s","too high"],tag:"risk"},
+          {c:["Coalesced fan-out","few thousand batched msg/s","ok"],hi:1,tag:"fixed"},
+          {c:["Durability need","none","TTL state"]},
+        ]}]}},
+    {node:"persist",stage:"Stage 3 · Snapshots",title:"Full replay grows unbounded &rarr; snapshot and compact",
+      live:["client","gw","collab","doc","engine","presence","persist"],
+      narrate:"The final forced upgrade is open and recovery time. An append-only op log is the right source of truth, but replaying from op zero for a 500-page document or a 2M-op history freezes clients and slows owner recovery. Periodic snapshots bound the tail that must be folded.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"This file budgets ~10B ops/day, about ~500 GB/day of raw log, with individual large docs reaching millions of historical ops. Open must be O(recent), not O(full history)."},
+        {k:"pain",label:"What breaks without it",text:"Cold-open and failover replay get slower forever. A collab owner restart on a large doc can take tens of seconds, and clients wait while the system folds ancient history."},
+        {k:"fix",label:"The fix — snapshots plus compaction",text:"Every ~1,000 ops or ~60 seconds, fold the current document into an immutable snapshot blob and store its fold version. Opens read the latest snapshot plus the short op tail; old hot-log segments before a durable snapshot can be archived.",pill:"bounded replay"},
+        {k:"key",label:"Keep the log as truth",text:"Do not replace the op log with snapshots. The log preserves version history, offline replay, audit, and undo; snapshots are acceleration points that make the log practical at scale."},
+      ],
+      snap:{title:"Load & capacity — Stage 3 (full design)",cap:"Open, recovery, and storage growth are now bounded without giving up the ordered log.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Open a large doc","snapshot + tail","sub-second target"],hi:1,tag:"fixed"},
+          {c:["Raw log growth","~500 GB/day","archive compacted segments"]},
+          {c:["Snapshot cadence","~1,000 ops or 60 s","bounded tail"],hi:1},
+          {c:["Acked durability","quorum log before broadcast","no disappearing edits"]},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();

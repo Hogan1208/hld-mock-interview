@@ -879,3 +879,93 @@ window.DATA['ticketmaster'] = {
     {q:"The inventory write-primary crashes mid on-sale and you promote a replica. How do you avoid double-selling on failover?",a:"The danger is split-brain: if the old primary rejoins still believing it's leader, two nodes could each sell seat 14A. Prevent it with consensus-based promotion — leader election (Raft/Paxos or a fencing coordinator) grants a monotonically increasing epoch, and replicas reject writes carrying a stale epoch (fencing token), so the old primary is demoted and re-syncs. During the few-second election you choose consistency over availability: reserves on that shard pause (the waiting room holds users gracefully) while reads stay up from replicas. A short pause beats selling one seat twice."},
   ]
 };
+
+/* ---- scaling journey ---- */
+(function(){
+var d=window.DATA['ticketmaster'];
+var scaling={id:"scaling",name:"From row locks to on-sale scale",kind:"scale",
+  live:["client","gw","booking","db"],
+  summary:"Start with the one-seat-one-order database invariant, then let checkout time, on-sale stampedes, read firehoses, and discovery traffic force each additional tier.",
+  steps:[
+    {node:"db",stage:"Stage 0 · Baseline",title:"One inventory DB — conditional reserve is the truth",
+      live:["client","gw","booking","db"],
+      narrate:"Draw the correct core first: the client asks to reserve a seat, the gateway routes to booking, and booking performs one conditional write against the inventory database. Browse can also read events from the same store at this scale. The important part is where the invariant lives: the DB row for the seat decides the winner.",
+      details:[
+        {k:"win",label:"Why start here",text:"It is the smallest design that never double-sells. The client and cache are only hints; a seat becomes real only when the strongly consistent inventory row moves from available to held or sold."},
+        {k:"query",label:"Atomic reserve",code:"UPDATE seats\n   SET status = 'held', held_by = :user_id,\n       hold_expires_at = now() + interval '10 minutes'\n WHERE event_id = :event_id\n   AND seat_id = :seat_id\n   AND status = 'available';\n-- row_count 1 wins, row_count 0 returns 409"},
+        {k:"scale",label:"Working numbers",text:"Steady browse is ~10K req/s and the inventory write ceiling is ~5-10K conditional writes/s. Data is tiny at ~100MB per event; correctness, not storage, is the scarce resource."},
+      ],
+      snap:{title:"Load & capacity — Stage 0",cap:"The invariant is correct, but payment and on-sale pressure have not arrived yet.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["Seat data","~100MB/event","tiny"]},
+          {c:["Conditional writes","~5-10K/s ceiling","ok if paced"],hi:1},
+          {c:["Steady browse","~10K req/s","ok early"]},
+          {c:["Checkout lock risk","payment not modeled","next bottleneck"],hi:1,tag:"risk"},
+        ]}]}},
+    {node:"payment",stage:"Stage 1 · Two-phase checkout",title:"Payment cannot hold a row lock &rarr; hold, then confirm",
+      live:["client","gw","booking","db","payment"],
+      narrate:"The first upgrade is the same lesson as hotel reservations: never hold the scarce inventory lock while a human and a card network take seconds or minutes. Reserve writes a durable TTL'd hold quickly, payment runs out-of-band, and confirm performs a second short transaction.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"A hold countdown is ~10 minutes and a payment round trip is commonly ~1-2 seconds with timeouts. A DB row lock must be held for milliseconds, not through checkout."},
+        {k:"pain",label:"What breaks without it",text:"Charge-inside-transaction serializes buyers behind slow payment. One stuck gateway call can hold a hot seat row while everyone else queues, turning scarce inventory into a lock convoy."},
+        {k:"fix",label:"The fix — reserve, pay, confirm",text:"Reserve atomically flips available&rarr;held with an expiry and pending order, then releases the lock. Payment uses an idempotency key outside the DB lock. On success, confirm held&rarr;sold; on failure or timeout, the hold expires.",pill:"two phase"},
+        {k:"note",label:"Why TTL matters",text:"Abandoned carts are normal. The expiry field makes the hold self-releasing, and the reaper only improves seat-map freshness. Correct reserve logic treats expired held rows as claimable."},
+      ],
+      snap:{title:"Load & capacity — Stage 1",cap:"Checkout time no longer determines inventory lock time.",
+        tables:[{name:"signals",cols:["signal","before","after"],rows:[
+          {c:["Lock hold time","seconds to minutes","milliseconds"],hi:1,tag:"fixed"},
+          {c:["Payment latency","~1-2 s, sometimes timeout","outside DB lock"]},
+          {c:["Abandoned checkout","seat stuck","TTL releases"]},
+          {c:["Retry safety","duplicate risk","idempotency key"]},
+        ]}]}},
+    {node:"queue",stage:"Stage 2 · Waiting room",title:"Million-user on-sale &rarr; admit at backend capacity",
+      live:["client","gw","booking","db","payment","queue"],
+      narrate:"Now the famous Ticketmaster pressure arrives. A stadium has ~100K seats, but ~1M users can hit Buy at the same second. The backend should see the rate it can safely process, not the rate the internet can produce.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"The file's on-sale scenario is ~1M users at once, while booking is sized around ~2-3K short ops/s and ~5K admitted checkouts. The raw stampede is not a capacity target; it is load to shed."},
+        {k:"pain",label:"What breaks without it",text:"Without admission control, gateway, booking, payment, and DB all see a burst unrelated to their safe write ceilings. Retries amplify the spike and real fans time out before a seat can be fairly attempted."},
+        {k:"fix",label:"The fix — virtual waiting room",text:"Queue arrivals cheaply, maintain positions, and issue signed admission tokens at a steady rate tied to DB and payment capacity. Only admitted tokens reach booking; everyone else polls a cheap queue status.",pill:"load shedder"},
+        {k:"gotcha",label:"Fairness is not correctness",text:"The queue can degrade fairness if it fails, but it must never own seat truth. Losing queue state should not corrupt inventory; the DB remains the only authority on sold seats."},
+      ],
+      snap:{title:"Load & capacity — Stage 2",cap:"Demand becomes a controlled admission stream instead of a backend stampede.",
+        tables:[{name:"signals",cols:["signal","value","verdict"],rows:[
+          {c:["On-sale demand","~1M users in the same second","queued"],hi:1},
+          {c:["Queue joins","~100K/s","cheap append"]},
+          {c:["Active pool","~5K admitted","bounded backend"],hi:1,tag:"fixed"},
+          {c:["Booking rate","~2-3K ops/s","sized to admission"]},
+        ]}]}},
+    {node:"cache",stage:"Stage 3 · Seat-map cache",title:"Read firehose threatens writes &rarr; cache availability",
+      live:["client","gw","booking","db","payment","queue","cache"],
+      narrate:"After writes are paced, reads are the next problem. Seat maps and event pages are viewed by hundreds of thousands of people while only a small admitted pool can reserve. Those reads are display hints, so serve them from a derived cache and protect the inventory primary for writes.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Peak seat-map polling is ~500K/s, with a hot event around ~450K reads/s and read:write near ~100:1. The DB write path cannot also be the display read path."},
+        {k:"pain",label:"What breaks without it",text:"If every green-seat repaint hits inventory, read traffic starves the exact conditional writes that prevent double-selling. A cache miss storm can make reserves fail even though write volume is bounded."},
+        {k:"fix",label:"The fix — cache the read model",text:"Serve event and seat availability from Redis plus CDN with a 1-2 second TTL and event-driven updates after holds, releases, and sales. Reserve still re-checks the DB row, so stale green only causes a clean 409.",pill:"display hint"},
+        {k:"gotcha",label:"Stale is acceptable here",text:"A cached map can be briefly optimistic or pessimistic. It cannot double-sell because it never commits a seat. Exactness belongs to reserve; freshness belongs to the read model."},
+      ],
+      snap:{title:"Load & capacity — Stage 3",cap:"The huge read path is now isolated from the scarce write path.",
+        tables:[{name:"signals",cols:["signal","before cache","after cache"],rows:[
+          {c:["Seat-map reads","~500K/s to origin risk","edge + Redis absorb"],hi:1,tag:"fixed"},
+          {c:["Hot event key","~450K reads/s","replicate + CDN"]},
+          {c:["TTL","live DB read","1-2 s display hint"]},
+          {c:["Reserve correctness","competes with reads","DB remains authority"],hi:1},
+        ]}]}},
+    {node:"search",stage:"Stage 4 · Search",title:"Discovery queries grow &rarr; split a search index",
+      live:["client","gw","booking","db","payment","queue","cache","search"],
+      narrate:"The final addition separates discovery from booking. Users search by artist, venue, city, and date; that is a relevance and facet workload, not a seat-inventory transaction. A dedicated index can lag by seconds because buying still flows through the event page, cache, and DB reserve.",
+      details:[
+        {k:"scale",label:"The number that forces it",text:"Search is ~50K queries/s steady for marquee traffic, while the event catalog is only a few GB. It needs query replicas and relevance features, not stronger inventory locks."},
+        {k:"pain",label:"What breaks without it",text:"Running faceted discovery on the transactional database couples a browse spike to the on-sale core. Expensive text queries steal CPU from inventory reads, cache fills, and booking metadata."},
+        {k:"fix",label:"The fix — replicated inverted index",text:"Feed catalog and availability hints into an Elasticsearch-style index by CDC. Search scales by sharding and replicas, popular pages sit behind CDN, and direct event links still work if search is down.",pill:"decoupled"},
+        {k:"note",label:"Lag contract",text:"Search can say an event has availability a few seconds after it sold out. That is a discovery hint; the seat map and reserve flow correct it before money changes hands."},
+      ],
+      snap:{title:"Load & capacity — Stage 4 (full design)",cap:"Discovery, display, admission, payment, and inventory now scale on separate axes.",
+        tables:[{name:"signals",cols:["concern","mechanism","result"],rows:[
+          {c:["Discovery QPS","~50K/s","search replicas"],hi:1,tag:"fixed"},
+          {c:["Index size","few GB","cheap to replicate"]},
+          {c:["Freshness","seconds of lag","safe for browse"]},
+          {c:["Buying invariant","conditional DB write","no double-sell"]},
+        ]}]}},
+  ]};
+d.deepFlows=[scaling].concat(d.deepFlows);
+})();
