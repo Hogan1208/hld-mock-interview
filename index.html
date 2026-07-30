@@ -335,6 +335,11 @@
   .wt-ask .out{display:none;margin-top:11px;font-size:12.5px;line-height:1.62;color:#cdd8e3;border-top:1px solid var(--line);padding-top:11px}
   .wt-ask .out strong{color:#fff}.wt-ask .out code{background:#0e1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:11.5px;color:#b8c7d6}
   .wt-ask .out .typing{display:flex;gap:4px}
+  .wt-ask .out .qa{padding-top:13px;margin-top:13px;border-top:1px dashed var(--line)}
+  .wt-ask .out .qa:first-child{padding-top:0;margin-top:0;border-top:none}
+  .wt-ask .out .qa .q{display:flex;gap:7px;align-items:flex-start;font-size:12px;font-weight:600;color:#e9dcff;background:#1a1430;border:1px solid #3a2d63;border-radius:8px;padding:7px 10px;margin-bottom:9px}
+  .wt-ask .out .qa .q i{color:#c9a6ff;font-size:14px;margin-top:1px;flex:none}
+  .wt-ask .out .qa .a{color:#cdd8e3}
 
   .transcript{padding:16px;max-height:74vh;overflow-y:auto;scroll-behavior:smooth}
   .bubble{margin-bottom:16px;animation:fade .35s ease}
@@ -796,7 +801,7 @@ function wtRender(){
           ${cards}
           ${step.snap?wtStateHTML(step.snap):''}
           <div class="wt-ask">
-            <div class="lbl"><i class="ti ti-help-circle"></i> Stuck on this step? <b>Ask a doubt</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live':'<i class="ti ti-book"></i> offline'}</span> — grounded on exactly what's on screen now.</div>
+            <div class="lbl"><i class="ti ti-help-circle"></i> Stuck on this step? <b>Ask a doubt</b> <span class="ask-live">${state._llm?'<i class="ti ti-sparkles"></i> live':'<i class="ti ti-book"></i> offline'}</span> — ask as many follow-ups as you need; each is grounded on exactly what's on screen now.</div>
             <div class="row"><textarea id="wtAskText" placeholder="e.g. why 3 read replicas here and not 2? what exactly overflows first?"></textarea><button id="wtAskGo">Ask &#8599;</button></div>
             <div id="wtAskOut" class="out"></div>
           </div>
@@ -823,15 +828,27 @@ function wtRender(){
     var stepCtx='Scaling-journey step: "'+(step.title||'')+'"'+(step.stage?' ('+stripTags(step.stage)+')':'')+'.\n'+stripTags(step.narrate||'');
     (step.details||[]).forEach(function(d){ stepCtx+='\n- '+(d.label||d.k||'note')+': '+stripTags(d.text||d.code||''); });
     if(step.snap){ if(step.snap.cap) stepCtx+='\nState note: '+stripTags(step.snap.cap); (step.snap.tables||[]).forEach(function(tb){ stepCtx+='\nTable '+tb.name+(tb.note?' ('+stripTags(tb.note)+')':'')+'.'; }); (step.snap.queues||[]).forEach(function(q){ stepCtx+='\nQueue '+q.name+' ('+(q.kind||'kafka')+').'; }); }
-    var run=function(){ var ta=document.getElementById('wtAskText'); var v=(ta.value||'').trim(); if(!v)return; var out=document.getElementById('wtAskOut'); out.style.display='block'; out.innerHTML='<div class="typing"><span></span><span></span><span></span></div>';
-      aiAnswer(v, studyCtx('the "'+f.name+'" scaling journey', stepCtx)).then(function(txt){ out.innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> live answer</div>'+mdToHtml(txt); }).catch(function(){ out.innerHTML=localAnswer('system', v); }); };
+    var ta=document.getElementById('wtAskText'), out=document.getElementById('wtAskOut'), thread=[];
+    var esc=function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+    var run=function(){ var v=(ta.value||'').trim(); if(!v)return;
+      out.style.display='block';
+      var qa=document.createElement('div'); qa.className='qa';
+      qa.innerHTML='<div class="q"><i class="ti ti-message-2"></i><span>'+esc(v)+'</span></div><div class="a"><div class="typing"><span></span><span></span><span></span></div></div>';
+      out.appendChild(qa); var aEl=qa.querySelector('.a');
+      ta.value=''; ta.focus(); qa.scrollIntoView({behavior:'smooth',block:'center'});
+      var convo=stepCtx;
+      if(thread.length){ convo+='\n\nEarlier on THIS step the learner already asked (this is a running thread \u2014 build on it, do not repeat what you already said):'; thread.forEach(function(t,i){ convo+='\nQ'+(i+1)+': '+t.q+'\nA'+(i+1)+': '+stripTags(t.a); }); }
+      var qText=v;
+      aiAnswer(qText, studyCtx('the "'+f.name+'" scaling journey', convo)).then(function(txt){ aEl.innerHTML='<div class="ai-tag"><i class="ti ti-sparkles"></i> live answer</div>'+mdToHtml(txt); thread.push({q:qText,a:txt}); }).catch(function(){ var lt=localAnswer('system', qText); aEl.innerHTML=lt; thread.push({q:qText,a:stripTags(lt)}); }); };
     wg.onclick=run;
-    document.getElementById('wtAskText').addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') run(); });
+    ta.addEventListener('keydown',function(e){ if((e.metaKey||e.ctrlKey)&&e.key==='Enter') run(); });
   })();
   if(fromId&&activeId&&fromId!==activeId) setTimeout(()=>wtPulse(fromId,activeId),260);
 }
 document.addEventListener('keydown',(e)=>{
   if(!state.wt||!state.wt.open) return;
+  var t=e.target, tn=(t&&t.tagName||'').toLowerCase();
+  if(tn==='textarea'||tn==='input'||tn==='select'||(t&&t.isContentEditable)) return;
   if(e.key==='Escape') closeWalk();
   else if(e.key==='ArrowRight'||e.key===' '){ e.preventDefault(); wtStopPlay(); wtGo(1); }
   else if(e.key==='ArrowLeft'){ e.preventDefault(); wtStopPlay(); wtGo(-1); }
